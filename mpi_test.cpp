@@ -33,14 +33,22 @@ int main(int argc, char **argv) {
     if (rank == 0) {
         constexpr std::size_t KN = 4096;          /* 自检用较小环维，快速 */
         VecOps<double, KN> ops;
-        Plaintext<double, KN> pt;  pt.fill(2.0);
-        Ciphertext<double, KN> ct; ct.fill(3.0);
-        Ciphertext<double, KN> s = ops.add_cp(ct, pt);   /* 期望逐元素 5.0 */
-        Ciphertext<double, KN> p = ops.mul_cp(ct, pt);   /* 期望逐元素 6.0 */
-        ops.rescale(p);     /* 桩：仅打印 */
-        ops.modswitch(p);   /* 桩：仅打印 */
+        VecData<double, KN> pt;  pt.fill(2.0);
+        VecData<double, KN> ct;  ct.fill(3.0);
+        VecData<double, KN> s = ops.add_cp(ct, pt);      /* 期望逐元素 5.0 */
+        VecData<double, KN> p = ops.mul_cp(ct, pt);      /* 期望逐元素 6.0 */
+        VecData<double, KN> rs = ops.rescale(p);         /* 模拟后端 no-op copy */
+        VecData<double, KN> ms = ops.modswitch(p);       /* 模拟后端 no-op copy */
+        VecData<double, KN> bt = ops.boot(p);            /* 模拟后端 no-op copy */
+
+        VecData<double, KN> seq;
+        seq[0] = 10.0;
+        seq[1] = 20.0;
+        VecData<double, KN> rot = ops.rotate(seq, 1);
         bool ok = (s[0] == 5.0) && (p[0] == 6.0) &&
-                  (s[KN - 1] == 5.0) && (p[KN - 1] == 6.0);
+                  (rs[0] == 6.0) && (ms[0] == 6.0) && (bt[0] == 6.0) &&
+                  (s[KN - 1] == 5.0) && (p[KN - 1] == 6.0) &&
+                  (rot[0] == 20.0) && (rot[KN - 1] == 10.0);
         if (!ok) {
             fprintf(stderr, "[rank 0] VecOps self-check FAILED\n");
             MPI_Abort(MPI_COMM_WORLD, 3);
