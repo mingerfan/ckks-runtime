@@ -2,39 +2,39 @@
 
 ## 1. 定位
 
-Runtime 是 executable plan 的纯执行器：
+Runtime 是可执行计划的纯执行器。它不做这些事：
 
-- 不做 device/Place placement；
-- 不读取完整 TopologyModel；
+- 不做设备分配；
+- 不读取完整的拓扑模型；
 - 不选择通信路由；
-- 不选择 MPI、NCCL 或 CUDA；
-- 不决定 fallback；
+- 不选择用 MPI、NCCL 还是 CUDA；
+- 不决定实现降级；
 - 不修复非法计划；
-- 不实现 retry、cancel 或恢复。
+- 不做重试、取消或恢复。
 
-Runtime 负责验证计划、管理 Ready/Pending Value、按顺序调用 Api，并在任何错误发生时打印上下文后终止整个 execution group。
+它做的事只有：验证计划、管理值的 Ready/Pending 状态、按顺序调用 Api，任何错误发生时打印上下文然后终止整个执行组。
 
 ## 2. 依赖关系
 
 ~~~text
-Executable Plan
+可执行计划
     |
     v
 Runtime<Api>
-├── PlanVerifier
-├── ValueStore
-└── SequentialExecutor
+├── PlanVerifier        计划验证器
+├── ValueStore          值存储
+└── SequentialExecutor  顺序执行器
         |
         v
 Api
-├── Value
-├── compute functions
-├── communicate_async
-├── wait
-└── abort_all
+├── Value               值类型
+├── 计算函数
+├── communicate_async   发起异步通信
+├── wait                等待通信完成
+└── abort_all           终止整个执行组
 ~~~
 
-Runtime 通过模板使用 Api：
+Runtime 通过模板使用 Api，不理解值的内部结构：
 
 ~~~cpp
 template <class Api>
@@ -45,23 +45,11 @@ public:
 };
 ~~~
 
-Runtime 不理解 Value 的内部结构。
+## 3. Runtime 的输入
 
-## 3. Runtime 输入
+可执行计划已经包含：固定的计划/版本 ID、每条指令的稳定序号、纯计算指令、通信动作、来源/目标的物理 Place、输出的值类型、可选的通信 hint、初始化/执行/收尾三个阶段的划分、编译目标要求的节点数和本地设备数。
 
-Executable plan 已经包含：
-
-- 固定 plan/version ID；
-- 每个 op 的稳定 ordinal；
-- PureCompute op；
-- CommAction；
-- source/destination 物理 Place；
-- output ValueType；
-- 可选 CommHint；
-- Initialization、Execution、Finalization 阶段；
-- 编译目标的 world size 和本地设备要求。
-
-Runtime 只需要运行时身份：
+Runtime 自己只需要一个运行时身份：
 
 ~~~cpp
 struct LocalIdentity {
@@ -69,20 +57,20 @@ struct LocalIdentity {
 };
 ~~~
 
-实际 rank 数量或本地设备不符合编译目标时直接 panic。
+启动时如果实际节点数或本地设备数和编译目标不符，直接报错终止。
 
-## 4. ValueStore
+## 4. ValueStore（值存储）
 
 首期只维护两种状态：
 
 ~~~cpp
 enum class ValueState {
-    Ready,
-    Pending
+    Ready,    // 数据已就绪，可以直接用
+    Pending   // 通信还没完成
 };
 ~~~
 
-概念结构：
+概念上的数据结构：
 
 ~~~cpp
 struct ReadyEntry {
@@ -94,8 +82,8 @@ using PendingGroupId = std::uint64_t;
 
 struct PendingEntry {
     Place place;
-    PendingGroupId group_id;
-    std::size_t output_slot;
+    PendingGroupId group_id;   // 属于哪一次通信
+    std::size_t output_slot;   // 是那次通信的第几个输出
 };
 
 struct PendingGroup {
@@ -104,46 +92,38 @@ struct PendingGroup {
 };
 ~~~
 
-ValueStore 严格按 ValueId 寻址：
+值存储严格按 ValueId 寻址：一个 ValueId 对应一个 ReadyEntry 或 PendingEntry，每个条目只有一个 Place。一次通信可能在本 rank 产生多个输出，这些输出共享同一个通信句柄，但各自通过 `output_slot` 对应到唯一的位置。等待这次通信时，runtime 一次性把它在本 rank 的全部输出安装成 Ready。
 
-~~~text
-ValueId -> ReadyEntry or PendingEntry
-~~~
-
-每个 ReadyEntry/PendingEntry 只包含一个 Place。一个多输出 CommHandle 可以由多个不同 ValueId 的 PendingEntry 共享，但每个 PendingEntry 通过 output_slot 映射到唯一输出；同一个 ValueId 不得表示多个 Place。等待该 group 时，Runtime 一次安装它在本 rank 上的全部结果。
-
-不存在的 Value 属于 fatal plan/runtime error。异步失败由 Api.wait 抛出并立即终止，不需要长期 Failed 状态。
+查一个不存在的值属于致命错误。异步通信失败由 `Api.wait` 抛异常并立即终止，所以不需要一个长期存在的 Failed 状态。
 
 ## 5. 加载与验证
 
-执行前检查：
+执行前的检查清单：
 
-- schema/version；
-- ValueId 唯一定义；
-- 每个 ValueId 恰好绑定一个 Place；
-- use-before-def；
-- op arity 和 ValueType；
-- compute op 必须是 PureCompute；
-- compute op 只有一个执行 Place；
-- compute input 已在该 Place 物化；
-- CommKind 的 input/output 关系合法；
-- Replicate 的每个 destination 对应一个不同 output ValueId；
-- source/destination Place 属于编译目标；
-- TransferId 唯一；
-- world size 和本地设备符合目标；
-- 外部 input 已绑定；
-- 所有 rank 加载同一个 plan。
+- 格式/版本；
+- ValueId 唯一定义，且每个 ValueId 恰好绑定一个 Place；
+- 不允许"先用后定义"；
+- 指令的参数个数和值类型正确；
+- 计算指令必须是纯计算，且只有一个执行 Place；
+- 计算指令的输入已在该 Place 上物化；
+- 通信动作的输入输出关系符合其类型；
+- Replicate 的每个目标对应一个不同的输出 ValueId；
+- 来源/目标 Place 属于编译目标；
+- 传输 ID 唯一；
+- 节点数和本地设备数符合目标；
+- 外部输入都已绑定；
+- 所有 rank 加载的是同一份计划。
 
-Verifier 只拒绝非法计划，不插入传输或重新 placement。
+验证器只拒绝非法计划，不会插入传输或重新分配。
 
-## 6. Compute 执行
+## 6. 计算指令的执行
 
 伪代码：
 
 ~~~cpp
 execute_compute(op):
-    assert op is PureCompute
-    assert op.place belongs to local rank
+    assert op 是纯计算
+    assert op.place 属于本 rank
 
     inputs = []
     for input in op.inputs:
@@ -153,133 +133,122 @@ execute_compute(op):
     value_store.define_ready(op.output, op.place, output)
 ~~~
 
-Api 首期契约：
+计算函数的完成契约（详见架构文档第 13 节）：
 
-> compute 返回后，输出已经可以安全交给 communicate_async。
+> 计算函数返回后，输出对同一个 Api 实例上后续发起的调用保证可见（包括交给 `communicate_async`）。真正阻塞到 host 的同步点只有 `wait`。
 
-如果 Poseidon 内部异步启动 GPU kernel，由 Poseidon Api 自己处理同步或 stream/event 连接。
+也就是说，Api 内部可以异步地启动 GPU kernel，用 stream/event 保证调用之间的先后顺序，而不必每个算子都同步一次。Runtime 不接触 CUDA event，也感知不到这层异步。
 
-Runtime 不接触 CUDA event。
+## 7. 通信动作的执行
 
-## 7. CommAction 执行
-
-所有 rank 以相同顺序解释同一个 CommAction：
+所有 rank 按相同顺序解释同一个通信动作：
 
 ~~~cpp
 execute_comm(action):
-    local_inputs = collect_sources_owned_by_local_rank(action)
+    local_inputs = 收集本 rank 拥有的源值
 
     group = register_pending_group(
         api.communicate_async(action, local_inputs))
-    register_each_local_output_by_value_id(action, group)
-    retain_group_until_finalization(group)
+    把本 rank 的每个输出 ValueId 登记到这个 group
+    group 保留到收尾阶段
 ~~~
 
-对于 Replicate，Runtime 按位置建立映射：`action.outputs[i]` 属于 `action.destinations[i]`。同一个 handle 可以完成多个输出，但不会让一个 output ValueId 对应多个 destination。
+对 Replicate，runtime 按位置建立映射：`action.outputs[i]` 属于 `action.destinations[i]`。同一个句柄可以完成多个输出，但一个输出 ValueId 不会对应多个目标。
 
-角色由物理 Place 和 local rank 直接确定：
+每个 rank 在这条指令里扮演什么角色，由物理 Place 和本地 rank 直接算出：
 
-- source 在本 rank：提供 source Value；
-- destination 在本 rank：Api 准备本地接收和输出；
-- source/destination 都在本 rank：Api 可以直接本地 copy；
-- 与本 rank 无关：Api 返回 no-op handle。
+- 源在本 rank：提供源值；
+- 目标在本 rank：Api 准备本地接收和输出；
+- 源和目标都在本 rank：Api 可以直接本地拷贝；
+- 都不在本 rank：Api 返回一个空句柄（什么都不做）。
 
-Runtime 不知道 communicate_async 最终调用了 send、recv、broadcast、gather、memcpy、MPI 或 NCCL。
+Runtime 不知道 `communicate_async` 底下调的是 send、recv、broadcast、gather、memcpy、MPI 还是 NCCL。
 
-## 8. ensure_ready
+## 8. ensure_ready（用前等待）
 
-consumer 使用输入时：
+消费一个输入时：
 
 ~~~cpp
 Value &ensure_ready(ValueId id, Place expected_place):
     entry = value_store.lookup(id)
     assert entry.place == expected_place
 
-    if entry is Ready:
+    if entry 是 Ready:
         return entry.value
 
-    if entry is Pending:
+    if entry 是 Pending:
         group = pending_groups.lookup(entry.group_id)
         outputs = api.wait(group.handle)
-        install_ready_outputs_by_slot(group, outputs)
+        按 slot 把这批输出安装成 Ready
         return value_store.lookup_ready(id).value
 
-    panic("missing value")
+    panic("值不存在")
 ~~~
 
-`expected_place` 只用于检查 consumer 的本地性，不参与 ValueStore 寻址。等待只发生在真正消费数据时；一次 wait 可以同时把同一 action 的多个独立 output ValueId 变为 Ready。独立 op 可以继续执行，直到遇到自己的 Pending input。
+`expected_place` 只用来检查消费方的本地性，不参与寻址。等待只发生在真正要用数据的时候；一次 `wait` 可以同时把同一个通信动作的多个输出变成 Ready。不依赖这个值的指令可以继续执行，直到碰上自己的 Pending 输入。
 
-首期不暴露 test、progress 或 cancel。Api 可以在 communicate_async/wait 内部使用 progress thread、MPI_Test、CUDA event 或其他机制。
+首期不提供"探测是否完成""推进进度""取消"这类接口。Api 内部想用进度线程、`MPI_Test`、CUDA event 都可以，对 runtime 不可见。
+
+**关于单 rank 多卡的并行性**：runtime 单线程地**发起**指令，但这不等于执行是串行的。异步实现的 Api（GPU 后端）在 `compute` 里提交任务即返回，多张卡的任务同时执行——发起串行、执行并行。真正会损失重叠的只有两种情况：`wait` 阻塞了 host 线程、挡住了后面本可独立发起的指令（靠编译器排序解决：通信早发起、消费晚安排）；以及 Api 本身是同步实现（VecApi 的默认同步模式就是，多卡在它之下纯串行，但不影响正确性验证；VecApi 另提供每设备一个工作线程的异步模式来模拟真实并行时序，接口不变，见测试文档 2.1 节）。详见架构文档第 13 节。
 
 ## 9. 三个执行阶段
 
-### Initialization
+### 初始化
 
-- 绑定 Host input；
-- 绑定 plaintext/ciphertext 常量；
-- 执行编译器生成的 HostToDevice Transfer；
-- 上传 Api 需要的 context/key；
-- 等待初始化所需 Value Ready。
+- 绑定 Host 上的输入和明文/密文常量；
+- 执行编译器生成的 Host 到 Device 的 Transfer；
+- 上传 Api 需要的上下文和密钥；
+- 等待初始化涉及的值全部就绪。
 
-首期采用 eager preload：执行阶段需要的外部值和 plaintext 全部预加载，并保留到 run 结束。
+首期采用一次性预加载：执行阶段需要的外部值和明文全部提前搬好，并保留到运行结束。
 
-### Execution
+### 执行
 
-- 顺序解释 compute 和 communication action；
-- 根据 rank/Place mask；
-- consumer 前 ensure_ready。
+- 顺序解释计算和通信指令；
+- 按 rank/Place 决定本地要不要动手；
+- 消费前调用 `ensure_ready`。
 
-### Finalization
+### 收尾
 
-- 执行 DeviceToHost output action；
-- wait 所有 outstanding source CommHandle；
+- 执行 Device 到 Host 的输出搬运；
+- 等待所有还没收尾的发送句柄；
 - 返回或打印结果；
-- `AllValuesAfterRun` 测试模式额外 wait 本 rank 的所有 diff-point Pending output；
-- 测试模式可在全部相关通信完成后、释放前导出 test-only RunArtifact；
-- 统一释放 Value。
+- 若开启了"运行后逐指令对比"模式，额外等待本 rank 所有对比点的 Pending 输出；
+- 测试模式可以在通信全部完成后、释放之前，导出仅供测试用的运行产物（RunArtifact）；
+- 统一释放所有值。
 
 ## 10. 生命周期
 
-为避免过度设计，首期不做 last-use 回收：
+为避免过度设计，首期不做"最后一次使用后回收"：
 
-- 所有 Ready Value 保留到 Finalization；
-- 所有 source CommHandle 保留到 Finalization；
-- Finalization 完成全部 wait 后统一释放。
+- 所有 Ready 的值保留到收尾阶段；
+- 所有发送句柄保留到收尾阶段；
+- 收尾完成全部等待后统一释放。
 
-这会增加内存占用，但能直接保证 source 不会在异步发送完成前被释放。
+这会增加内存占用，但直接保证了发送源不会在异步发送完成前被释放。
 
-逐指令 difftest 利用这个首期生命周期，在所有 plan action 已发起后完成必要的 finalization wait，复制仍然存活的 Value，并在 Runtime 停止后离线比较。Runtime 正常执行路径不插入逐 op observer 或 barrier；未开启该测试选项时不生成 RunArtifact。RunArtifact 是测试设施，不属于 Runtime/Api 的稳定 ABI，开启它的测试不用于性能计时。
+逐指令对比正是利用了这个特性：所有指令发起完之后，做完收尾等待，把还活着的值拷贝出来，等 runtime 停止后离线比较。正常执行路径不插入逐指令的观察点或同步；不开这个测试选项就没有任何额外开销。RunArtifact 是测试设施，不属于 Runtime/Api 的稳定接口，开启它的测试不用于性能计时。
 
-未来 plaintext/显存规模要求更高时，由编译器 memory planning 插入 Prefetch 和 Release/Evict。Runtime 只执行显式 action。
+未来数据规模上去后，由编译器的内存规划插入 Prefetch 和 Release/Evict，runtime 依旧只执行显式动作。
 
-## 11. 同一全局计划
+## 11. 同一份全局计划
 
-本 demo 采用 SPMD 解释方式：
+本 demo 采用 SPMD 方式（Single Program Multiple Data，所有节点跑同一个程序，各自处理自己的部分）：
 
-- 所有 rank 读取同一 plan；
-- op ordinal 顺序一致；
-- compute 根据 op.place.rank mask；
-- CommAction 在所有 rank 上都被解释；
-- Api 根据本地角色执行或 no-op；
-- collective 顺序由全局 plan 保证。
+- 所有 rank 读同一份计划，指令顺序完全一致；
+- 计算指令按 `op.place.rank` 决定本 rank 是否执行；
+- 通信动作在所有 rank 上都会被解释，Api 按本地角色执行或跳过；
+- 集合通信的顺序由全局计划保证一致。
 
-一个 rank 对应一个 Runtime 实例。真实 MPI 部署通常是一个 process/rank 内一个 Runtime；Mock 多 rank 测试则在同一进程内使用多个 host thread，每个线程运行一个独立 Runtime。每个实例拥有自己的 LocalIdentity、ValueStore 和 Api，只共享 MockCluster 的 mailbox/abort 状态，不共享 Api::Value。
+一个 rank 对应一个 Runtime 实例。真实 MPI 部署是一个进程一个 runtime；模拟多 rank 测试则在同一进程里开多个线程，每个线程跑一个独立 runtime。每个实例有自己的 LocalIdentity、ValueStore 和 Api，只共享 MockCluster 的消息队列和终止状态，不共享任何 `Api::Value`。
 
-多个 Runtime 之间不设置逐 op barrier。它们可以以不同速度推进，仅通过 CommAction 和最终测试 join 协调，从而覆盖 destination/source 到达顺序、并发 wait 和 execution-group abort。
+多个 runtime 之间不加逐指令同步，它们可以以不同速度推进，只通过通信动作和最终的测试汇合点协调。这样才能测出"接收方先到/发送方先到""并发等待""全组终止"这些真实场景。
 
-Runtime 启动时至少检查：
-
-- world size；
-- local rank；
-- plan ID/version；
-- 本地设备数量；
-- 编译目标标识。
-
-不设计复杂 capability 协商。
+Runtime 启动时至少检查：节点总数、本地 rank、计划 ID/版本、本地设备数、编译目标标识。不设计复杂的能力协商。
 
 ## 12. Fail-fast
 
-Api 或 Runtime 发现任何错误时抛出异常。顶层只捕获一次：
+Api 或 runtime 发现任何错误就抛异常，顶层只捕获一次：
 
 ~~~cpp
 try {
@@ -291,58 +260,32 @@ try {
 }
 ~~~
 
-错误上下文至少包括：
+错误上下文至少包括：计划 ID、指令序号和类型、输入输出 ValueId、传输 ID、来源/目标 Place、本地 rank、Api 名称、原始错误原因。
 
-- plan ID；
-- op ordinal/kind；
-- input/output ValueId；
-- TransferId；
-- source/destination Place；
-- local rank；
-- Api 名称；
-- 原始错误原因。
+MPI 版 Api 用 `MPI_Abort`；Vec/Mock 版抛出 ClusterPanic 或终止模拟执行组。
 
-MPI Api 使用 MPI_Abort。Vec/Mock Api 抛出 ClusterPanic 或终止模拟 execution group。
+不设计：出错后继续执行、重试、回滚、取消、超时恢复、节点恢复、返回部分结果。
 
-不设计：
-
-- Failed value 后继续执行；
-- retry；
-- rollback；
-- cancel；
-- timeout recovery；
-- rank recovery；
-- 部分结果返回。
-
-## 13. Runtime 类建议
+## 13. 类结构建议
 
 首期只需要：
 
 ~~~text
-RuntimePlan
-PlanVerifier
-ValueStore<Api>
-SequentialRuntime<Api>
-VecApi
-MockCommunicationApi
+RuntimePlan                  可执行计划
+PlanVerifier                 计划验证器
+ValueStore<Api>              值存储
+SequentialRuntime<Api>       顺序执行 runtime
+VecApi                       明文计算参考实现
+MockCommunicationApi         模拟通信实现
 ~~~
 
-测试侧另外需要：
+测试侧另外需要（不进入 Runtime 对外接口）：
 
 ~~~text
-MockCluster
-MultiRuntimeHarness
-SequentialReferenceExecutor
-DiffMap / RunArtifact
+MockCluster                  模拟集群（消息队列 + 终止状态）
+MultiRuntimeHarness          多 runtime 测试驱动
+SequentialReferenceExecutor  单设备顺序参考执行器
+DiffMap / RunArtifact        对比映射 / 运行产物
 ~~~
 
-这些类型不进入 Runtime-facing Api。
-
-如果计算和通信由同一 Api bundle 提供，可以进一步简化为：
-
-~~~text
-VecApi
-PoseidonApi
-~~~
-
-不要求在 Runtime ABI 中拆出 ObjectAdapter、BufferTransport 或 Topology。
+如果计算和通信由同一个 Api 打包提供，可以进一步简化为 `VecApi` 和 `PoseidonApi` 两个实现。不要求在 Runtime 接口层拆出对象适配器、传输层或拓扑这类抽象。

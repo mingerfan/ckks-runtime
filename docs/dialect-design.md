@@ -2,21 +2,21 @@
 
 ## 1. 文档范围
 
-本仓库暂不实现 MLIR dialect。本设计用于约束：
+本仓库暂不实现 MLIR dialect，但 C++ demo 里的 SSA 类型、算子分类、位置分配、通信和验证器，必须和未来 MLIR 下降（lowering）的结果保持一致。本文档约束：
 
-- 未来 logical CKKS dialect 的语义；
-- Place placement 和 communication materialization pass；
-- executable SSA 的输入格式；
-- 当前 C++ demo 中 ssa_ops_def.hpp 的演化方向；
-- runtime verifier 应当依赖的稳定不变量。
+- 未来逻辑 CKKS dialect 的语义；
+- 设备分配和通信显式化这两个编译步骤；
+- 可执行 SSA 的输入格式；
+- 当前 `ssa_ops_def.hpp` 的演化方向；
+- runtime 验证器依赖的稳定不变量。
 
-设计重点是保持逻辑计算图纯净，同时生成足够明确、可验证的物理执行计划。
+设计重点：让逻辑计算图保持纯净，同时生成足够明确、可验证的物理执行计划。
 
-## 2. 表示阶段
+## 2. 三个表示阶段
 
-### 2.1 Logical CKKS
+### 2.1 逻辑 CKKS
 
-Logical CKKS 只表达 CKKS 数学语义：
+只表达 CKKS 的数学语义：
 
 ~~~mlir
 %2 = ckks.add %0, %1
@@ -24,17 +24,11 @@ Logical CKKS 只表达 CKKS 数学语义：
       -> !ckks.ciphertext
 ~~~
 
-在这一阶段：
+这一阶段：指令没有通信副作用；Place 尚未确定；值表示数学对象而不是具体 buffer；CKKS 的 level、scale、参数上下文等语义必须可验证；rescale、relinearize、rotate、bootstrap 等必要算子已显式存在，或可由语义合法化步骤确定。
 
-- op 没有通信副作用；
-- Place 可以尚未确定；
-- value 表示数学对象，不表示具体 buffer；
-- CKKS level、scale、parameter context 等语义必须能够验证；
-- rescale、relinearize、rotate 和 boot 等必要 op 已经显式或可由 semantic legalization 确定。
+### 2.2 已分配 CKKS
 
-### 2.2 Placed CKKS
-
-Device placement pass 在同一 CKKS op 上增加 placement：
+设备分配 Pass 在同一个算子上加位置属性：
 
 ~~~mlir
 %2 = ckks.add %0, %1 {
@@ -49,17 +43,16 @@ Device placement pass 在同一 CKKS op 上增加 placement：
 
 属性语义：
 
-- compute_place：执行该 op 的唯一物理 Place；
-- result_places：结果必须可用的 Place 集合；
-- compute_place 必须属于 result_places；
-- result_places 是 correctness requirement，不是可随意忽略的性能 hint；
-- 可选 placement_hint 应使用独立属性表示。
+- `compute_place`：执行这条指令的唯一物理位置；
+- `result_places`：结果必须可用的位置集合，`compute_place` 必须包含在内；
+- `result_places` 是正确性要求，不是可以随意忽略的性能提示；
+- 如果还想给调度器留优化建议，用独立的 `placement_hint` 属性表示。
 
-Placed CKKS 中的 add 仍然是纯计算。result_places 不表示 add 在执行时自行调用通信，也不表示同一个物理 ValueId 同时位于多个 Place。它只存在于通信物化之前，是编译器需要满足的中间层 requirement。
+注意：这时的 add 仍然是纯计算。`result_places` 不表示 add 会自己去通信，也不表示同一个 ValueId 同时存在于多个位置——它只是编译器在下一步需要满足的中间要求，通信显式化之后就消失了。
 
-### 2.3 Executable CKKS
+### 2.3 可执行 CKKS
 
-Communication materialization pass 将远端物化显式化：
+通信显式化 Pass 把"结果要出现在远端"变成显式的通信指令：
 
 ~~~mlir
 %2 = ckks.add %0, %1 {
@@ -76,281 +69,140 @@ Communication materialization pass 将远端物化显式化：
 }
 ~~~
 
-Executable CKKS 的约束：
+可执行 CKKS 的约束：
 
-- 严格采用单位置物理 SSA：每个 ValueId 恰好属于一个 Place；
-- compute op 只有一个 Place；
-- compute result 初始只存在于该 Place；
-- 所有远端物化由 dist.transfer 或 dist.replicate 产生，并使用新的 ValueId；
-- Replicate 的第 i 个结果属于 destinations[i]；
-- 不存在跨 Place compute operand；
-- runtime 不再推导 placement 或补传输。
+- 严格单位置：每个 ValueId 恰好属于一个 Place；
+- 计算指令只有一个 Place，结果初始只存在于该处；
+- 所有远端副本由 `dist.transfer` 或 `dist.replicate` 产生，并使用新的 ValueId；
+- Replicate 的第 i 个结果属于 `destinations[i]`；
+- 不存在跨 Place 的操作数；
+- runtime 不再推导位置或补传输。
 
 ## 3. Dialect 划分
 
-推荐初期只建立两个语义域：
+初期只需要两个语义域：
 
-### CKKS dialect
+**CKKS dialect**：明文和密文类型；add、sub、mul、negate；rotate、rescale、modswitch；relinearize、boot；CKKS 元信息和语义验证。
 
-负责：
+**Dist（或 Comm）dialect**：transfer、replicate、可选的集合通信；位置效果；可选的异步 token。
 
-- plaintext 和 ciphertext 类型；
-- add、sub、mul、negate；
-- rotate、rescale、modswitch；
-- relinearize、boot；
-- CKKS metadata 和语义验证。
-
-### Dist 或 Comm dialect
-
-负责：
-
-- transfer；
-- replicate；
-- 可选 collective；
-- placement effect；
-- 可选异步 token。
-
-Device placement pass 不需要新 dialect。它只是为 CKKS op 增加属性并生成 placement analysis。
-
-如果最终 runtime plan 以后需要稳定序列化、独立版本和多个消费者，再引入 ckks-runtime dialect。首期可以把 executable CKKS 与 dist op 直接翻译为 C++ schedule。
+设备分配 Pass 不需要新 dialect，它只是给 CKKS 算子加属性。如果最终的执行计划以后需要稳定的序列化格式、独立版本和多个消费者，再引入一个 ckks-runtime dialect；首期直接把可执行 CKKS 翻译成 C++ 执行序列即可。
 
 ## 4. 类型设计
 
 ### 4.1 CKKS 语义类型
 
-逻辑类型至少需要区分：
+逻辑类型至少区分明文（Plaintext）和密文（Ciphertext）。可选的静态描述包括：参数/上下文标识、多项式阶数、level 或参数层标识、scale、是否 NTT 形式、密文分量个数、编码方式。
+
+**不建议把 Place 编进 CKKS 数学类型。** Place 是执行属性，不是密文数学性质的一部分；混在一起会产生大量的位置转换 cast 和类型组合爆炸。静态类型放不下的元信息，放在值描述符、算子属性或分析结果里。
+
+### 4.2 单位置物理 SSA
+
+逻辑 SSA 的 ValueId 表示数学值。已分配 CKKS 可以在数学值上暂时记录 `result_places` 要求，但还没把每个物理副本展开成独立的 SSA 值。
+
+可执行计划则严格遵守：
 
 ~~~text
-Plaintext
-Ciphertext
+一个 ValueId -> 恰好一个 Place
 ~~~
 
-可选的静态描述包括：
-
-- parameter/context identifier；
-- polynomial degree；
-- level 或 parms identifier；
-- scale 或 log2 scale；
-- NTT form；
-- ciphertext component count；
-- element/encoding kind。
-
-不建议把 Place placement 编入 CKKS 数学类型。Place 是执行属性，而不是密文数学类型的一部分，否则会产生大量 placement cast 和类型组合。
-
-静态类型无法表达或不适合表达的 metadata，可以保存在 value descriptor、op attribute 或分析结果中。
-
-### 4.2 Value 与单位置物理 SSA
-
-Logical SSA ValueId 表示数学值。Placed CKKS 可以在这个数学值上暂时记录 result_places requirement，但它还没有把每个物理 materialization 展开成独立 SSA value。
-
-Executable plan 严格采用单位置物理 SSA：
+Transfer/Replicate 必须产生新的 ValueId 来表示新的物理副本：
 
 ~~~text
-ValueId -> exactly one Place
+%3 = dist.transfer %2 { source=..., destination=... }
 ~~~
 
-Transfer/Replicate 必须产生新的 ValueId，用来表示新的物理 materialization：
+`%3` 和 `%2` 数学上相同，但来历和位置不同。一发多收时，N 个目标对应 N 个不同的结果 ValueId：
 
 ~~~text
-%3 = dist.transfer %2 {
-  source=#place.device<rank=0,index=0>,
-  destination=#place.device<rank=1,index=0>
-}
+%3, %4, %5 = dist.replicate %2 { destinations=[d0, d1, d2] }
 ~~~
 
-其中 value(%3) 与 value(%2) 数学等价，但 provenance 和 placement 不同。
+通信显式化 Pass 必须把每个远端使用者的操作数改写成它所在 Place 对应的那个 ValueId。Runtime 只按 ValueId 建立状态，不把 Place 当作第二重身份；同一个数学值要出现在另一个位置，计划里就必须再定义一个新的 ValueId。
 
-对于一对多复制，N 个 destination 必须对应 N 个不同的结果 ValueId：
+## 5. 算子分类
 
-~~~text
-%3, %4, %5 = dist.replicate %2 {
-  source=#place.device<rank=0,index=0>,
-  destinations=[
-    #place.device<rank=0,index=1>,
-    #place.device<rank=1,index=0>,
-    #place.device<rank=1,index=1>
-  ]
-}
-~~~
-
-这里 `%3`、`%4`、`%5` 分别属于 destinations[0]、destinations[1]、destinations[2]。它们与 `%2` 数学等价，但 SSA identity、Place 和 provenance 均独立。
-
-Communication materialization pass 必须把每个远端 consumer 改写为其所在 Place 对应的结果 ValueId。Runtime 仅按 ValueId 建立一个状态项，不使用 Place 作为第二重物理身份；如果同一数学值还需要出现在另一个 Place，计划必须再定义一个新的 ValueId。
-
-## 5. Op 分类与 effect
-
-建议为每个 op 建立静态 trait：
+给每个算子一个静态类别：
 
 ~~~cpp
 enum class OpClass {
-    PureCompute,
-    Communication,
-    ExternalIO
+    PureCompute,     // 纯计算
+    Communication,   // 通信
+    ExternalIO       // 外部输入输出
 };
 ~~~
 
-### PureCompute
+**纯计算**：AddCC、AddCP、SubCC、SubCP、MulCC、MulCP、Negate、Rotate、Rescale、ModSwitch、Relinearize、Boot。逻辑上引用透明：`outputs = f(inputs)`。Api 在物理上分配和写入输出 buffer 不算逻辑副作用；计算函数本身不得主动发起通信。
 
-包括：
+**通信**：Transfer、Replicate、Gather，将来可能加 Scatter、AllGather 或分片转换。Transfer/Replicate 对数学值是原样搬运，但在位置、资源、错误和完成状态上有实际效果，不能被当成可随意删除的空操作。Gather 等必须单独定义输入输出的数学关系。
 
-- AddCC、AddCP；
-- SubCC、SubCP；
-- MulCC、MulCP；
-- Negate；
-- Rotate；
-- Rescale；
-- ModSwitch；
-- Relinearize；
-- Boot。
+**外部输入输出**：运行时的输入绑定、上传/下载、结果发布。
 
-纯计算表示逻辑引用透明：
+## 6. 提示与强制指令的区别
 
-~~~text
-outputs = f(inputs)
-~~~
+必须区分三样东西：
 
-Api 在物理上分配和写入输出 buffer 不属于逻辑副作用。计算函数本身不应主动发起通信。
+- `placement_hint`：优化建议，调度器可以改；
+- `result_places`：已分配阶段的正确性要求，通信显式化前必须全部满足；
+- TransferOp：定义新值的强制指令，有执行语义。
 
-### Communication
-
-包括：
-
-- Transfer；
-- Replicate；
-- Gather；
-- 将来可能增加的 Scatter、AllGather 或 shard conversion。
-
-Transfer/Replicate 在数学值上是 identity，在 placement、资源、错误和完成状态上有 effect。Gather 等操作必须单独定义 input/output 数学关系。通信 op 不能被声明成普通可删除的 NullOp。
-
-### ExternalIO
-
-包括：
-
-- runtime input binding；
-- upload/download；
-- external result publication。
-
-## 6. 逻辑 hint 与强制 op
-
-必须区分：
-
-- placement_hint：优化建议，可以被 scheduler 修改；
-- result_places requirement：placed CKKS 中、通信物化前的目标 Place 集合；
-- TransferOp：定义新值的强制执行语义。
-
-一旦 transfer 的结果被后续 op 使用，它就不能只是 hint：
+一旦某条 transfer 的结果被后续指令使用，它就不再是建议：
 
 ~~~mlir
-%3 = dist.transfer %2 {
-  source=#place.device<rank=0,index=0>,
-  destination=#place.device<rank=1,index=0>
-}
-%4 = ckks.mul %3, %x {
-  place=#place.device<rank=1,index=0>
-}
+%3 = dist.transfer %2 { source=..., destination=... }
+%4 = ckks.mul %3, %x { place=... }
 ~~~
 
-Planner 可以尊重用户已经插入的 TransferOp，并只补充尚未满足的 result_places requirement。规范化后，每个物理结果都必须具有独立 ValueId，且不得发生重复传输。
+规划器可以尊重用户手工插入的 TransferOp，只补充尚未满足的 `result_places`。规范化之后，每个物理结果都有独立 ValueId，且不发生重复传输。
 
 ## 7. Pass 设计
 
-### 7.1 CKKS Semantic Legalization
+### 7.1 CKKS 语义合法化
 
-在 placement 前完成：
+在设备分配之前完成：算子类型合法化、scale 和 level 规划、rescale 插入、relinearize 插入、rotate 分解、bootstrap 决策、密钥需求分析、目标 Api 能力预检查。这些步骤会改变图结构和密文大小，所以要放在分配之前。
 
-- op 类型合法化；
-- scale 和 level 规划；
-- rescale 插入；
-- relinearize 插入；
-- rotate decomposition；
-- bootstrap 决策；
-- key requirement 分析；
-- 目标 Api 能力预检查。
+### 7.2 设备分配
 
-这些 pass 会改变图结构和 ciphertext 大小，应尽量先于 placement。
+输入逻辑 CKKS，输出已分配 CKKS。职责：为每条计算指令选唯一的 `compute_place`；算出各结果需要出现的位置集合；使用编译期已知的固定拓扑；校验位置和目标 Api 能力；权衡 Host/Device、延迟、带宽、显存和密钥位置；**不插入实际通信**。
 
-### 7.2 Device Placement
+### 7.3 通信显式化
 
-输入：logical CKKS。
+输入已分配 CKKS，输出可执行 CKKS。职责：
 
-输出：placed CKKS。
+- 把计算输出规范化到计算位置；
+- 对跨位置的使用插入 Transfer/Replicate；
+- 同一个目标位置只物化一次，复用已有的 ValueId；
+- Replicate 的每个目标生成不同的输出 ValueId；
+- 把每个使用者的操作数改写成其所在位置对应的 ValueId；
+- 生成稳定的传输来历信息；
+- 保证传输插入点支配（dominate）所有相关使用；
+- 生成 CommKind 和可选的 CommHint；
+- 不把具体的 MPI/NCCL/CUDA 调用写进通用 IR。
 
-职责：
+### 7.4 可执行验证
 
-- 为 compute op 选择唯一 compute_place；
-- 计算 compiler-only 的 required materialization set；
-- 使用编译时已知的固定目标拓扑；
-- 验证 Place 与目标 Api 能力；
-- 考虑 Host/Device、延迟、带宽、显存和 key placement；
-- 不插入实际通信。
+检查：所有计算指令有唯一 Place；每个 ValueId 恰好属于一个 Place；所有计算操作数都在本地；不再有未满足的 `result_places`；transfer 的源已定义且位置合法；结果类型和源的数学类型一致；来源/目标属于编译目标；通信动作的输入输出关系合法；Replicate 的输出数等于目标数且一一对应；不允许一个输出 ValueId 对应多个目标。
 
-### 7.3 Communication Materialization
+### 7.5 翻译
 
-输入：placed CKKS。
+把可执行 CKKS 转成 C++ 的 RuntimePlan。首期不需要新 dialect。
 
-输出：executable CKKS。
+## 8. 等待与异步的表示
 
-职责：
+首期可执行 SSA 只包含 Transfer/Replicate，runtime 在消费前检查值状态（Pending 就等，Ready 就用，缺失就报错），所以不需要显式的 WaitOp。
 
-- 将 compute output 规范化到 compute Place；
-- 对跨 Place use 插入 Transfer/Replicate；
-- 为相同 destination 复用已有的单位置 materialization ValueId；
-- 为 Replicate 的每个 destination 生成不同的 output ValueId；
-- 将每个 consumer operand 重写为其执行 Place 对应的 ValueId；
-- 生成稳定的 transfer provenance；
-- 保证 transfer 插入点支配所有相关 use；
-- 生成 CommKind 和可选 CommHint；
-- 不把具体 MPI/NCCL/CUDA 调用写入通用 IR。
-
-### 7.4 Executable Verification
-
-检查：
-
-- 所有 compute op 都有唯一 Place；
-- 每个 executable ValueId 恰好属于一个 Place；
-- 所有 compute operand 都在本地物化；
-- 不再存在未解决的 result_places requirement；
-- Transfer source 已定义且 placement 合法；
-- result 类型与 source 数学类型一致；
-- source/destination 属于编译目标；
-- CommKind 与 input/output 类型关系合法；
-- Replicate 的 output 数量等于 destination 数量，且 output[i] 属于 destinations[i]；
-- 不允许一个 output ValueId 对应多个 destination。
-
-### 7.5 Translation
-
-把 executable CKKS 转换成 C++ RuntimePlan。首期不要求增加新 dialect。
-
-## 8. 等待与异步表示
-
-首期 executable SSA 可以只包含：
-
-~~~text
-Transfer/Replicate
-~~~
-
-Runtime 在 consumer 执行前检查对应 Value 状态：
-
-~~~text
-Pending -> Api.wait
-Ready   -> 直接执行
-Error   -> 立即 panic
-~~~
-
-因此首期不必显式加入 WaitOp。
-
-如果以后需要编译器精确控制 overlap、prefetch 或 host synchronization，可以降低到：
+如果以后编译器要精确控制通信计算重叠、预取或 host 同步，可以下降为：
 
 ~~~mlir
 %pending, %token = dist.transfer_async %2
 %ready = async.await %pending
 ~~~
 
-MLIR async dialect 可以承担 token 和 await 语义，避免自建重复机制。
+MLIR 的 async dialect 可以承担 token 和 await 的语义，不必自建一套。
 
 ## 9. C++ Demo 类型映射
 
-ssa_ops_def.hpp 建议最终演化到类似：
+`ssa_ops_def.hpp` 建议演化为（现有"一个值绑多个设备"的 `id_devices_pair` 写法与单位置原则冲突，重写时删除）：
 
 ~~~cpp
 using ValueId = std::uint64_t;
@@ -372,46 +224,31 @@ struct Place {
 };
 
 enum class OpKind {
-    AddCC,
-    AddCP,
-    SubCC,
-    SubCP,
-    MulCC,
-    MulCP,
-    Negate,
-    Rotate,
-    Rescale,
-    ModSwitch,
-    Relinearize,
-    Boot,
-    Transfer,
-    Replicate,
-    Gather,
-    Input,
-    Output
+    AddCC, AddCP,
+    SubCC, SubCP,
+    MulCC, MulCP,
+    Negate, Rotate,
+    Rescale, ModSwitch,
+    Relinearize, Boot,
+    Transfer, Replicate, Gather,
+    Input, Output
 };
 
-// 仅用于 compiler-side placed CKKS；不会进入 RuntimePlan。
+// 仅编译器内部（已分配阶段）使用，不进入 RuntimePlan。
 struct PlacedComputeAttrs {
     Place compute_place;
     std::vector<Place> required_result_places;
 };
 
 struct ComputeAttrs {
-    // executable compute result 只位于此 Place。
+    // 可执行阶段：计算结果只位于这一个 Place。
     Place place;
-    // rotate step、target level 等 op-specific attributes
+    // rotate 步数、目标 level 等算子专属属性
 };
 
 enum class CommHint {
-    Auto,
-    PointToPoint,
-    Collective,
-    Broadcast,
-    GatherPrimitive,
-    Tree,
-    Ring,
-    HostStaged
+    Auto, PointToPoint, Collective, Broadcast,
+    GatherPrimitive, Tree, Ring, HostStaged
 };
 
 struct CommunicationAttrs {
@@ -437,32 +274,18 @@ struct ExecutableValueDesc {
 };
 
 struct RuntimePlan {
-    // Verifier 保证每个 id 只出现一次，因此只对应一个 place。
+    // 验证器保证每个 id 只出现一次，因此只对应一个 place。
     std::vector<ExecutableValueDesc> values;
     std::vector<SsaOp> ops;
 };
 ~~~
 
-对于 Replicate，`outputs.size()` 必须等于 `destinations.size()`，并且 `outputs[i]` 的 Value descriptor 必须指向 `destinations[i]`。实际实现可以采用模板或更严格的 typed op，但必须避免所有 op 共享一组含义不明确的平铺字段。
+对 Replicate，`outputs.size()` 必须等于 `destinations.size()`，且 `outputs[i]` 的值描述符必须指向 `destinations[i]`。实现可以用模板或更严格的分类型算子，但要避免所有算子共用一组含义不明的平铺字段。
 
-## 10. 编译困难与首期限制
+这套类型与 poseidon::mgpu 的 `MgpuOp`（ops + device_id + 整数属性表）语义兼容：`Place{rank=0, index=d}` 退化后就是 mgpu 的 `device_id = d`，Transfer 对应 mgpu 的 CopyCipher/CopyPlain。迁移对接时可以写一个 MgpuSchedule 到 RuntimePlan 的直接翻译。
 
-首期需要明确拒绝：
+## 10. 编译难点与首期限制
 
-- 一般控制流；
-- loop-carried ciphertext；
-- 动态未知的 ValueType 或通信结果布局；
-- backend 运行时动态改变 ciphertext shape；
-- 同一 executable compute op 的多 execution Place；
-- 隐式跨 Place operand；
-- 未知 effect op。
+首期明确拒绝：一般控制流；跨循环迭代的密文；运行时才能确定的值类型或通信结果布局；后端动态改变密文形状；同一条计算指令有多个执行 Place；隐式跨 Place 操作数；效果未知的算子。
 
-后续需要重点处理：
-
-- placement 与通信成本的联合优化；
-- block argument 和 phi-like value；
-- loop iteration 的 transfer identity；
-- liveness 与异步 source 生命周期；
-- stable schedule/channel ID；
-- 目标 Api 支持范围的编译期 legalization；
-- 所有 rank 的 executable plan 一致性。
+后续需要重点处理：位置分配与通信成本的联合优化；块参数和 phi 类值；循环迭代中的传输身份；活跃性分析与异步发送的生命周期；稳定的调度/通道 ID；目标 Api 支持范围的编译期合法化；所有 rank 的计划一致性。

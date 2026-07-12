@@ -2,20 +2,20 @@
 
 ## 1. 设计目标
 
-Runtime-facing 通信接口应当尽量小，只表达编译器已经确定的通信语义。具体对象布局、buffer、MPI/NCCL/CUDA 调用、fallback 和格式转换都由 Api 兼容层处理。
+面向 runtime 的通信接口应当尽量小，只表达编译器已经确定的通信语义。具体的对象布局、buffer、MPI/NCCL/CUDA 调用、实现降级和格式转换，都由 Api 兼容层处理。
 
-本设计面向：
+本设计的前提：
 
-- 编译期固定拓扑；
+- 拓扑在编译期固定；
 - 所有 rank 执行同一份物理计划；
 - Runtime 只解释计划；
 - Api 可以由 Vec、Poseidon 或其他实现提供；
-- 错误直接暴露并终止整个集群；
-- 不追求 retry、cancel、恢复或动态调优。
+- 错误直接暴露并终止整个执行组；
+- 不追求重试、取消、恢复或动态调优。
 
 ## 2. 编译期拓扑与物理 Place
 
-编译器知道完整目标拓扑，并把通信 source/destination 固化到 executable plan。
+编译器知道完整的目标拓扑，并把通信的来源和目标写死在可执行计划里：
 
 ~~~cpp
 enum class PlaceKind {
@@ -30,21 +30,13 @@ struct Place {
 };
 ~~~
 
-示例：
+Host 是一等 Place，不允许用 `Device(rank=0, index=0)` 冒充。Api 必须能区分 Host→Device、Device→Host、Device→Device、Host→Host 四种搬运。
 
-~~~text
-Host(rank=0)
-Device(rank=0, index=0)
-Device(rank=1, index=3)
-~~~
-
-Host 是一等 Place，但不能使用 Device(rank=0,index=0) 来代替 Host。Api 必须能够区分 HostToDevice、DeviceToHost、DeviceToDevice 和 HostToHost。
-
-Runtime 不需要 TopologyModel，也不选择路由。它只读取物理 Place，并根据 local rank 判断当前通信角色。
+Runtime 不需要拓扑模型，也不选路由。它只读取计划里的物理 Place，并根据本地 rank 判断自己在这次通信里的角色。
 
 ## 3. 通信语义
 
-建议 executable plan 使用通用通信 action：
+可执行计划使用通用的通信动作：
 
 ~~~cpp
 enum class CommKind {
@@ -56,35 +48,26 @@ enum class CommKind {
 };
 ~~~
 
-语义：
+语义定义：
 
 ~~~text
-Transfer:
-    一个输入 ValueId -> 一个目标位置上的新 ValueId
-
-Replicate:
-    一个输入 ValueId -> N 个数学等价但身份不同的输出 ValueId
-    outputs[i] 位于 destinations[i]
-
-Gather:
-    多个输入 ValueId -> 一个目标位置上的组合结果 ValueId
-
-Scatter:
-    一个输入 ValueId -> N 个位于各自目标位置的切片 ValueId
-
-AllGather:
-    多个输入 ValueId -> 每个目标获得一个独立的组合结果 ValueId
+Transfer:   一个输入 -> 目标位置上的一个新 ValueId
+Replicate:  一个输入 -> N 个数学上相同、身份不同的输出 ValueId，
+            outputs[i] 位于 destinations[i]
+Gather:     多个输入 -> 一个目标位置上的合并结果
+Scatter:    一个输入 -> N 个切片，各自位于自己的目标位置
+AllGather:  多个输入 -> 每个目标各得一份独立的合并结果
 ~~~
 
-每种 CommKind 必须先定义明确的 input/output 数学关系。Api fallback 只能改变实现方式，不能改变结果。
+每种通信动作必须先定义清楚输入到输出的数学关系。Api 的实现降级只能改变"怎么传"，不能改变"传出来是什么"。
 
-Executable plan 严格采用单位置物理 SSA：每个 output ValueId 恰好属于一个 Place。数学等价的多个物理 materialization 必须使用不同 ValueId，不能让同一个 ValueId 同时对应多个 destination。
+计划严格遵守单位置规则：每个输出 ValueId 恰好属于一个 Place。同一份数据出现在多个位置时，必须用多个不同的 ValueId。
 
-首期只要求实现 Transfer 和 Replicate。Gather 等操作等其 result layout 明确后再加入。
+首期只要求实现 Transfer 和 Replicate。Gather 等操作等其结果布局定义清楚后再加。
 
-## 4. 编译器 Hint
+## 4. 编译器 hint
 
-通信 action 可以携带实现 hint：
+通信动作可以携带实现提示：
 
 ~~~cpp
 enum class CommHint {
@@ -99,29 +82,11 @@ enum class CommHint {
 };
 ~~~
 
-例如：
+例如 `Replicate + Broadcast` 表示编译器建议用广播实现，但不强制具体的库函数。Api 可以用 NCCL Broadcast、`MPI_Ibcast`、多个 MPI 点对点、多个 CUDA 点对点拷贝、经 Host 中转，或任何数学等价的方式。首选方式不可用时 Api 自行降级；不存在等价实现时抛出致命错误。
 
-~~~text
-CommKind = Replicate
-CommHint = Broadcast
-~~~
+首期只需要 Auto、PointToPoint、Broadcast 三种；Tree/Ring/HostStaged 等枚举值保留但暂不实现。
 
-表示编译器建议使用 broadcast，但不强制具体库函数。
-
-Api 可以：
-
-- 使用 NCCL Broadcast；
-- 使用 MPI_Ibcast；
-- 使用多个 MPI point-to-point；
-- 使用多个 CUDA P2P；
-- 经 Host staging；
-- 使用其他数学等价实现。
-
-如果首选方式不可用，Api 自行 fallback。若不存在等价实现，则抛出 fatal error。
-
-例如语义为 Gather 时，编译器可以给出 GatherPrimitive hint；Api 不支持原生 gather 时，可以退化为多个 point-to-point receive 加本地组装。
-
-为了分析实验结果，Api 可以在 debug trace 中记录实际采用的实现，但 Runtime 不参与选择。
+为了方便分析实验结果，Api 可以在调试日志里记录实际采用的实现方式，但 runtime 不参与选择。
 
 ## 5. CommAction
 
@@ -143,39 +108,26 @@ struct CommAction {
 };
 ~~~
 
-CommAction 来自编译器，Runtime 不修改。
+CommAction 来自编译器，runtime 不修改。`output_types` 是 SSA 层的类型信息，供 Api 在目标端分配或构造值时使用，不是底层的 buffer 描述。
 
-output_types 是 SSA 类型信息，用于 Api 在 destination 分配或构造 Value。它不是底层 buffer descriptor。
+所有通信动作都满足：
 
-所有 CommKind 都遵守以下物理结果约束：
+- `inputs[i]` 位于 `sources[i]`；
+- `outputs[i]` 位于 `destinations[i]`；
+- outputs、destinations、output_types 三者数量一致；
+- 每个输出 ValueId 唯一，且只绑定一个目标。
 
-- inputs[i] 位于 sources[i]；
-- outputs[i] 位于 destinations[i]；
-- outputs、destinations 和 output_types 数量一致；
-- 每个 output ValueId 唯一，且只能绑定一个 destination。
-
-因此 Replicate 到 N 个 destination 时必须定义 N 个 output ValueId。一个底层 collective request 可以共同完成这些输出，但不能合并它们的 SSA identity。
+所以 Replicate 到 N 个目标必须定义 N 个输出 ValueId。底层一次集合通信可以同时完成这些输出，但不能合并它们的 SSA 身份。
 
 ## 6. 最小 Api
 
-Runtime 模板化在 Api 上：
-
-~~~cpp
-template <class Api>
-class Runtime {
-public:
-    using Value = typename Api::Value;
-    using CommHandle = typename Api::CommHandle;
-};
-~~~
-
-通信接口只要求：
+通信接口只要求三个函数：
 
 ~~~cpp
 class Api {
 public:
-    using Value = /* Api-defined */;
-    using CommHandle = /* Api-defined */;
+    using Value = /* Api 自己定义 */;
+    using CommHandle = /* Api 自己定义 */;
 
     CommHandle communicate_async(
         const CommAction &action,
@@ -187,259 +139,165 @@ public:
 };
 ~~~
 
-所有 rank 在解释到同一个 CommAction 时调用 communicate_async：
+所有 rank 解释到同一个 CommAction 时都调用 `communicate_async`：
 
-- source rank 的 local_inputs 包含本地 source Value，顺序与该 rank 在 `action.inputs` 中对应的 input index 顺序一致；
-- destination rank 的 local_inputs 可以为空；
-- 同一 rank 同时管理 source 和 destination 时，Api 可以直接执行本地 copy；
-- 无关 rank 得到一个空/no-op handle；
-- Api 根据 action 和本地 rank 发布实际 send、receive、copy 或 collective。
+- 源在本 rank：`local_inputs` 里放本地的源值，顺序和该 rank 在 `action.inputs` 中的下标顺序一致；
+- 目标在本 rank：`local_inputs` 可以为空，Api 准备本地接收；
+- 源和目标都在本 rank：Api 可以直接本地拷贝；
+- 都不在本 rank：返回一个空句柄；
+- 具体发 send、recv、broadcast、gather、memcpy 还是集合通信，由 Api 根据 action 和本地角色决定。
 
-wait 返回当前 rank 上由该 action 产生的本地 output Values，顺序与该 rank 在 `action.outputs` 中对应的 output index 顺序一致。Runtime 使用这些 index 把结果安装到各自独立的 ValueId；返回数量、类型、Place 或顺序不匹配都属于 fatal error。
+`wait` 返回本 rank 上由这次通信产生的输出值，顺序和该 rank 在 `action.outputs` 中的下标顺序一致。Runtime 用这些下标把结果安装到各自的 ValueId；数量、类型、位置或顺序不匹配都是致命错误。
 
-Source 侧没有 output 时，handle 仍用于保证异步发送在 run 结束前完成。
+发送侧没有输出时，句柄仍然要保留——用来保证异步发送在运行结束前真正完成。
 
-## 7. 为什么不公开 Object 抽象
+## 7. 为什么不公开对象抽象
 
-Runtime 不需要知道实际对象结构。Api::Value 已经是 backend 自己定义的类型：
+Runtime 不需要知道数据对象的内部结构。`Api::Value` 已经是各后端自己定义的类型：
 
 ~~~text
-VecApi:
-    variant<VecPlaintext, VecCiphertext>
-
-PoseidonApi:
-    variant<GpuPlaintextData, GpuCiphertextData>
+VecApi:      variant<VecPlaintext, VecCiphertext>
+PoseidonApi: variant<GpuPlaintextData, GpuCiphertextData>
 ~~~
 
-Poseidon Api 可以在内部：
+Poseidon 的 Api 可以在内部展开密文的多段 buffer、在目标端分配、复制元信息、转换 CPU/GPU 表示、调 MPI/NCCL/CUDA、管理锁页内存——这些都不进 runtime 的公共接口。poseidon::mgpu 现有的 `GpuObjectCopyMaterializer` 已经实现了"把不透明对象拆成一组分段 buffer 拷贝"这件事，迁移对接时可以直接复用在 Api 内部。
 
-- 展开多个 ciphertext buffer；
-- 分配 destination；
-- 复制 metadata；
-- 转换 CPU/GPU residue；
-- 使用 MPI/NCCL/CUDA；
-- 管理 pinned host buffer。
-
-这些都不是 Runtime 公共接口的一部分。
-
-因此首期不引入：
-
-- ObjectHandle；
-- ObjectDescriptor；
-- ObjectAdapter；
-- BufferView；
-- MemoryKind；
-- 通用序列化接口。
-
-如果未来确实需要让一个通用 MPI transport 独立复用多种对象布局，再把 ObjectAdapter 作为 Api 内部模块加入，而不是提前进入 Runtime ABI。
+因此首期不引入 ObjectHandle、ObjectDescriptor、ObjectAdapter、BufferView、MemoryKind 或通用序列化接口。如果未来确实要让一个通用的 MPI 传输层独立复用多种对象布局，再把对象适配器作为 Api 的内部模块加进去，而不是提前进入 Runtime 接口。
 
 ## 8. Host 与 Device 传输
 
-HostToDevice、DeviceToHost 等都使用同一个 CommAction：
+Host→Device、Device→Host 等都用同一个 CommAction 表达：
 
 ~~~text
 Transfer:
   source = Host(rank=0)
-  destination = Device(rank=0,index=0)
+  destination = Device(rank=0, index=0)
 ~~~
 
-Runtime 不根据 ValueKind 自动判断是否上传。判断依据始终是编译后的 source/destination Place。
+Runtime 不根据值的类型（明文/密文）自动判断要不要上传，判断依据始终是计划里的来源/目标 Place。
 
-Api 可以在一次 HostToDevice 中完成：
+Api 可以在一次 Host→Device 里顺便完成：目标端分配、普通内存到锁页内存的暂存、CPU/GPU 表示转换、cudaMemcpy、元信息物化。只要输出的数学值和类型符合计划，就是合法实现。
 
-- destination allocation；
-- pageable -> pinned staging；
-- CPU/GPU 表示转换；
-- cudaMemcpy；
-- metadata materialization。
+## 9. 初始化、执行和收尾
 
-只要输出数学值和 ValueType 符合计划，就属于合法实现。
+计划分三个逻辑阶段（与 runtime 文档一致，这里从通信视角复述）：
 
-## 9. 初始化、执行和结束
+**初始化**：绑定 Host 输入和常量；把本次运行需要的值预加载到设备；上传上下文和密钥；等初始化通信完成。
 
-Executable plan 建议划分三个逻辑阶段。
+**执行**：执行计算；执行中间的 Transfer/Replicate；消费 Pending 输出前调用 `wait`。
 
-### Initialization
+**收尾**：下载要求的结果；等待所有未完成的发送句柄；打印或返回结果；释放对象。
 
-- 绑定 Host 输入和常量；
-- 把本次 run 需要的值预加载到 Device；
-- 上传 API 所需 context/key；
-- 等待初始化通信完成。
+## 10. 大型明文与未来的内存规划
 
-首期采用 eager preload：所有需要的 plaintext 和输入对象在执行前搬到目标 Device，并保留到 run 结束。
-
-### Execution
-
-- 执行 compute；
-- 执行中间 Transfer/Replicate；
-- consumer 使用 Pending output 前调用 wait。
-
-### Finalization
-
-- 下载要求的结果；
-- wait 所有 outstanding source handles；
-- 打印或返回结果；
-- 释放对象。
-
-## 10. 大型 Plaintext 与未来 Memory Planning
-
-大量 plaintext 可能无法全部驻留 GPU。后续由编译器增加 memory planning：
+大量明文可能装不下显存。后续由编译器增加内存规划：
 
 ~~~text
-Topology-aware placement
-  -> communication materialization
-  -> memory planning
-  -> prefetch/release insertion
+拓扑感知的设备分配
+  -> 通信显式化
+  -> 内存规划
+  -> 插入预取和释放
 ~~~
 
-未来 action：
+未来的动作：
 
 ~~~text
-Prefetch:
-    提前执行 Host -> Device materialization
-
-Release/Evict:
-    释放某个 Device ValueId 的物理 materialization；数学等价的 Host 或其他 Place ValueId 仍可保留
+Prefetch:       提前执行 Host -> Device 的物化
+Release/Evict:  释放某个 Device ValueId 的物理数据；
+                数学上相同的 Host 副本（另一个 ValueId）可以保留
 ~~~
 
-Runtime 不实现动态缓存。它只按计划执行 Prefetch 和 Release。
+Runtime 不做动态缓存，只按计划执行这些动作。这样编译器可以统筹显存容量、最后使用时间、传输带宽、明文复用次数和通信计算重叠。
 
-这使编译器可以利用：
+## 11. Api 的实现降级
 
-- 显存容量；
-- last-use；
-- HostToDevice 带宽；
-- plaintext 重用次数；
-- 多 Device 物理 materialization 成本；
-- 通信与计算 overlap。
-
-## 11. Api Fallback
-
-Fallback 完全由 Api 处理：
+降级完全由 Api 处理：
 
 ~~~text
-Replicate + Broadcast
+Replicate + Broadcast 提示
     -> NCCL Broadcast
     -> MPI_Ibcast
-    -> 多个 point-to-point
-    -> Host staging
+    -> 多个点对点
+    -> 经 Host 中转
 
-Gather + Collective
+Gather + Collective 提示
     -> 原生 gather
-    -> 多个 receive + 本地组装
+    -> 多个接收 + 本地组装
 ~~~
 
 约束：
 
-1. fallback 必须数学等价；
-2. output ValueType 必须一致；
-3. source/destination Place 不得被悄悄改变；
-4. 若无等价 fallback，立即报错；
-5. debug 模式可记录实际实现，方便解释性能结果。
+1. 降级后的结果必须数学等价；
+2. 输出的值类型必须一致；
+3. 来源/目标 Place 不得被悄悄改变；
+4. 没有等价实现时立即报错；
+5. 调试模式可以记录实际用了哪种实现。
 
-Runtime 不需要 capability query，也不参与 fallback。
+Runtime 不需要能力查询，也不参与降级。
 
 ## 12. 异步与等待
 
-communicate_async 必须在不等待远端完成的情况下返回，具体 request/event 隐藏在 CommHandle 中。
+`communicate_async` 必须在不等待远端完成的情况下返回，具体的 request/event 都藏在 CommHandle 里。
 
-Runtime 保存：
-
-~~~text
-ValueId -> Ready Value
-ValueId -> Pending (CommHandle, output slot)
-~~~
-
-同一 CommHandle 可以被多个不同 output ValueId 引用，但每个 ValueId 都只对应一个 Place 和一个 output slot。
-
-当 compute consumer 需要某个 output 时：
+Runtime 维护：
 
 ~~~text
-Pending
-  -> Api.wait
-  -> Ready Value
+ValueId -> Ready 的值
+ValueId -> Pending（通信句柄 + 输出下标）
 ~~~
 
-为保持接口简单，Compute Api 首期采用以下契约：
+同一个句柄可以被多个输出 ValueId 引用，但每个 ValueId 只对应一个 Place 和一个输出下标。消费方需要某个输出时：Pending → `Api.wait` → Ready。
 
-> 计算函数返回后，输出已经可以安全交给 communicate_async。
+计算与通信之间的顺序契约（详见架构文档第 13 节）：
 
-Poseidon 兼容层如果内部使用异步 GPU kernel，应自行同步或连接内部 stream/event。
+> 计算函数返回后，输出对同一个 Api 实例上后续发起的调用可见（包括 `communicate_async`）。唯一阻塞 host 的同步点是 `wait`。
 
-## 13. Source 生命周期
+Poseidon 兼容层内部使用异步 GPU kernel 时，用 stream/event 保证这个可见性即可，不必每个算子后都做全局同步。
 
-Runtime 首期不做精细 last-use 回收：
+## 13. 发送侧的生命周期
 
-- 所有 Value 保留到 run 结束；
-- 所有 source CommHandle 保留到 Finalization；
-- Finalization 逐个 wait；
-- 完成后统一释放。
+首期不做精细回收：
 
-这会增加内存占用，但能够避免 source 在异步发送完成前被释放。后续 memory planning 再加入精细回收。
+- 所有值保留到运行结束；
+- 所有发送句柄保留到收尾阶段；
+- 收尾时逐个等待，全部完成后统一释放。
 
-## 14. 无死锁约束
+这会增加内存占用，但避免了"数据还在异步发送、源就被释放了"的问题。后续内存规划再加精细回收。
 
-正常路径满足：
+## 14. 无死锁论证
 
-1. 所有 rank 执行相同 CommAction 顺序；
-2. 每个 action 的物理 source/destination 在编译时确定；
-3. communicate_async 不等待远端完成；
-4. destination 在 action 被解释时立即发布接收；
-5. consumer 只等待之前已经启动的 handle；
-6. collective 的参与者和顺序一致；
-7. compute mask 不跳过通信 action；
-8. 任意错误调用 abort_all。
+正常路径下满足以下条件即可无死锁：
 
-具体 MPI/NCCL 的匹配、group 和 progress 由 Api 兼容层负责。
+1. 所有 rank 按相同顺序执行相同的通信动作；
+2. 每个动作的物理来源/目标在编译期确定；
+3. `communicate_async` 不等待远端完成；
+4. 接收方在解释到这条动作时立即发布接收；
+5. 消费方只等待之前已经启动的句柄；
+6. 集合通信的参与者和顺序全局一致；
+7. 计算的按 rank 跳过不会跳过通信动作；
+8. 任意错误调用 `abort_all`。
+
+具体 MPI/NCCL 的消息匹配、分组和进度推进由 Api 兼容层负责。
 
 ## 15. Fail-fast
 
-Api 的 compute、communicate_async 或 wait 失败时直接抛出异常。
+Api 的计算、`communicate_async` 或 `wait` 失败时直接抛异常，runtime 顶层统一处理（见 runtime 文档第 12 节）。诊断信息至少包含：指令序号和类型、ValueId、传输 ID、来源/目标 Place、本地 rank、Api 名称、底层错误。
 
-Runtime 顶层：
+不设计重试、取消、超时恢复、回滚、节点恢复或部分继续执行。
 
-~~~cpp
-try {
-    runtime.run(plan);
-} catch (const std::exception &error) {
-    print_runtime_context(error);
-    flush_logs();
-    api.abort_all(EXIT_FAILURE);
-}
-~~~
+## 16. 现有 comm_interface.hpp 的替换方向
 
-诊断至少包含：
+现在的 `send_async`、`broadcast_async`、`gather_async`、`recive_async` 和 `recive_fence` 表达了早期想法，但有这些问题：
 
-- op ordinal 和 kind；
-- ValueId；
-- TransferId；
-- source/destination Place；
-- local rank；
-- Api 名称；
-- 底层错误。
+- 模板参数 T 和 size 的语义不清；
+- 接收端怎么分配没有定义；
+- 传输 ID 用输出引用传递，容易出错；
+- `recive_fence` 返回 `optional<T>`，把"没等到"变成了一个可以被忽略的状态；
+- Host 被当成 0 号设备，违反本设计的 Place 原则；
+- 底层 API 细节会不断泄漏进接口；
+- 无法统一表达未来的通信动作和 hint。
 
-不设计：
-
-- retry；
-- cancel；
-- timeout recovery；
-- rollback；
-- rank recovery；
-- 部分继续执行。
-
-## 16. 当前 comm_interface.hpp 的调整方向
-
-当前 send_async、broadcast_async、gather_async、receive_async 和 receive_fence 能表达早期想法，但存在：
-
-- T 与 size 的语义不清；
-- destination 分配未定义；
-- transfer_id 输出引用；
-- receive_fence 返回 optional<T>；
-- Host 被当成 device 0；
-- API 细节会不断泄漏进接口；
-- 不能统一表达未来通信 action 和 hint。
-
-建议替换为：
+建议整体替换为三个函数：
 
 ~~~text
 communicate_async(CommAction, local_inputs)
@@ -447,22 +305,22 @@ wait(CommHandle)
 abort_all(exit_code)
 ~~~
 
-send、receive、broadcast、gather、MPI request、CUDA event 等都留在 Api 实现内部。
+send、receive、broadcast、gather、MPI request、CUDA event 全部留在 Api 实现内部。
 
 ## 17. Mock Api
 
-每个模拟 rank 使用独立的 MockCommunicationApi 和 Runtime。Api 实例只共享线程安全的 MockCluster 传输状态，不共享 ValueStore 或 Api::Value。
+每个模拟 rank 使用独立的 MockCommunicationApi 和 runtime。各 Api 实例只共享一个线程安全的 MockCluster（消息队列 + 终止状态），不共享值存储或 `Api::Value`。
 
-MockCommunicationApi 实现同一接口：
+MockCommunicationApi 实现同一套接口：
 
 - Host 和 Device 都是逻辑 Place；
-- communicate_async 在线程安全的 mailbox 中发布 send/receive，并创建 pending handle；
-- wait 推进模拟事件并返回输出；
+- `communicate_async` 在消息队列里登记发送/接收，创建 Pending 句柄；
+- `wait` 推进模拟事件并返回输出；
 - 支持 Transfer 和 Replicate；
-- 支持 Broadcast hint fallback 到 point-to-point；
-- 支持固定或 seeded delay，以改变各 Runtime 的到达顺序；
-- 支持指定 action 失败；
-- 传输时复制 payload/metadata，禁止通过共享 C++ 对象完成“零通信”传值；
-- abort_all 设置集群终止状态、唤醒所有 wait，并使所有模拟 Runtime 停止。
+- 支持 Broadcast 提示降级为多个点对点；
+- 支持固定或随机（带种子）的延迟，用来改变各 runtime 的到达顺序；
+- 支持指定某次通信失败；
+- 传输时必须复制数据和元信息，禁止通过共享 C++ 对象"零通信"传值——否则会掩盖真正的通信错误;
+- `abort_all` 设置集群终止状态、唤醒所有等待中的 `wait`，让所有模拟 runtime 停下。
 
-多 rank 测试需要一个 host thread 对应一个 Runtime，但不要求真实网络、独立 progress thread 或复杂 progress engine。所有 Runtime 只在测试开始和结束处汇合，不增加逐 CommAction barrier。
+多 rank 测试用一个线程跑一个 runtime，只在测试开始和结束处汇合，不加逐指令同步。不需要真实网络、独立进度线程或复杂的进度引擎。
