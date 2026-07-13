@@ -40,7 +40,7 @@ using VecValue =
     std::variant<VecPlaintext<double>, VecCiphertext<double>>;
 ~~~
 
-VecApi 实现：add/sub/mul、add_plain/sub_plain/mul_plain、negate、rotate、rescale、modswitch、relinearize、boot，以及 communicate_async、wait、abort_all。
+VecApi 实现：add/sub/mul、add_plain/sub_plain/mul_plain、negate、rotate、rescale、modswitch、relinearize、boot，以及 communicate_async、wait、最终输出 synchronize、abort_all。
 
 数值部分逐元素模拟即可，但元信息不能全部空转，否则非法的计算图也能通过测试：
 
@@ -111,7 +111,7 @@ wait
 
 支持：Transfer、Replicate；Host→Device、Device→Host、Device→Device；Auto/PointToPoint/Broadcast 提示；Broadcast 降级为多个点对点；接收方先到或发送方先到；延迟完成；指定某次通信失败；输出数量或类型的错误注入；`abort_all` 转换为 ClusterPanic。
 
-多 rank 测试用一个线程（建议 `std::jthread`）跑一个 runtime。所有线程只在测试开始和结束处汇合，不加逐指令的全局同步；不同 runtime 可以以不同速度到达同一条通信指令。MockCluster 支持固定延迟、指定到达顺序或带固定种子的随机延迟，用来重复覆盖不同的交错情况。
+多 rank 测试用一个 `std::thread` 跑一个 runtime，并显式 join。所有线程只在测试开始和结束处汇合，不加逐指令的全局同步；不同 runtime 可以以不同速度到达同一条通信指令。MockCluster 支持固定延迟或带固定种子的确定性延迟，用来重复覆盖不同的交错情况。
 
 首期不需要独立进度线程、真实网络、重试、取消或资源恢复。
 
@@ -291,7 +291,7 @@ DiffMode::AllValuesAfterRun  // 运行后逐指令对比
 
 核心的明文多 rank 测试**不**通过 MPI 实现，而是在同一进程里并发跑多个独立 runtime——这样才能方便地注入乱序、延迟和错误。但只靠 Mock 测试不够：有些问题只有真实多进程才能暴露，所以首期还包含一个明文的 MPI 集成测试。
 
-**MpiVecApi**：计算部分直接复用 VecApi，通信部分用 MPI 非阻塞收发实现 `communicate_async`/`wait`，`abort_all` 用 `MPI_Abort`。Value 就是向量加元信息，序列化是平凡的。它和 MockCommunicationApi 是同一接口的两个实现，顺带验证了"换 Api 不需要改 runtime"这个核心承诺。
+**MpiVecApi**：计算部分直接复用 VecApi，通信部分用 MPI 非阻塞收发实现 `communicate_async`/`wait`，最终输出通过 `synchronize` 发布，`abort_all` 用 `MPI_Abort`。Value 就是向量加元信息，序列化是平凡的。它和 MockCommunicationApi 是同一接口的两个实现，顺带验证了"换 Api 不需要改 runtime"这个核心承诺。
 
 它要验证 Mock 测试覆盖不到的东西：
 
@@ -312,7 +312,7 @@ mpiexec -n N
 
 MPI 集成测试至少复用最终结果对比。逐指令对比仍应在运行结束后由测试驱动汇总各 rank 产物，不能在每条指令后加 `MPI_Barrier`。测试矩阵上的分工：Mock 测试负责覆盖面（交错、延迟、故障注入），MpiVecApi 测试负责真实性（多进程冒烟 + 端到端结果对比），后者不要求复刻前者的全部注入场景。
 
-现有的 `mpi_test.cpp` 和 `mpi_test_comm.cpp` 只验证 MPI 初始化、rank/size、Allreduce、Sendrecv、主机内存的延迟和带宽，它们不证明可执行计划、Api 降级或 fail-fast 的正确性，仅作为环境自检保留。
+`tools/mpi_env_check.cpp` 和 `benchmarks/mpi_comm_benchmark.cpp` 只负责 MPI 环境与基础通信自检；可执行计划、Api 降级和 fail-fast 由 `tests/mpi_runtime_test.cpp` 验证。
 
 ## 11. 首期完成标准
 

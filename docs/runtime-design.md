@@ -135,7 +135,7 @@ execute_compute(op):
 
 计算函数的完成契约（详见架构文档第 13 节）：
 
-> 计算函数返回后，输出对同一个 Api 实例上后续发起的调用保证可见（包括交给 `communicate_async`）。真正阻塞到 host 的同步点只有 `wait`。
+> 计算函数返回后，输出对同一个 Api 实例上后续发起的调用保证可见（包括交给 `communicate_async`）。指令执行期间阻塞 host 的同步点只有 `wait`；发布最终输出前调用 `synchronize`。
 
 也就是说，Api 内部可以异步地启动 GPU kernel，用 stream/event 保证调用之间的先后顺序，而不必每个算子都同步一次。Runtime 不接触 CUDA event，也感知不到这层异步。
 
@@ -212,6 +212,7 @@ Value &ensure_ready(ValueId id, Place expected_place):
 
 - 执行 Device 到 Host 的输出搬运；
 - 等待所有还没收尾的发送句柄；
+- 在发布本 rank 的最终输出前调用 Api 的 `synchronize`，暴露尚未完成的异步计算错误；
 - 返回或打印结果；
 - 若开启了"运行后逐指令对比"模式，额外等待本 rank 所有对比点的 Pending 输出；
 - 测试模式可以在通信全部完成后、释放之前，导出仅供测试用的运行产物（RunArtifact）；

@@ -51,6 +51,7 @@ Poseidon 仓库里已有一套单机多卡的静态调度代码（`src/poseidon/
 - [通信设计](communication-design.md)：通信动作、实现提示（hint）、Host/Device 搬运和无死锁论证。
 - [合法性验证与错误处理](validation-and-errors.md)：各层检查清单和错误诊断格式。
 - [明文测试方案](plaintext-testing.md)：VecApi、MockCommunicationApi 和测试矩阵。
+- [实现状态](implementation-status.md)：代码路径、构建命令、首期验收项和明确未实现范围。
 - [架构设计 v0.1 归档](archive/architecture-v0.1.md)：最初草案，仅作历史记录。
 
 ## 当前核心决策
@@ -63,7 +64,7 @@ Poseidon 仓库里已有一套单机多卡的静态调度代码（`src/poseidon/
 6. 一个 ValueId 恰好属于一个 Place；数据要到多个位置，就有多个 ValueId。
 7. 数据搬运一律用显式的通信动作表达，编译器可以附带实现方式的建议（hint）。
 8. Runtime 只验证和执行计划，不做分配、选路或实现方式的降级（fallback）。
-9. Api 层定义实际的值类型、计算函数、`communicate_async`、`wait`、fallback 和 `abort_all`。
+9. Api 层定义实际的值类型、计算函数、`communicate_async`、`wait`、最终输出 `synchronize`、fallback 和 `abort_all`。
 10. 首期不引入对象描述符、拓扑查询、取消或重试这类接口。
 11. VecApi 与 MockCommunicationApi 是本仓库的参考实现；PoseidonApi 是未来接入目标。
 12. 多 rank 测试中每个 rank 有独立的 runtime 和值存储，并发执行，不加逐指令同步。
@@ -72,16 +73,19 @@ Poseidon 仓库里已有一套单机多卡的静态调度代码（`src/poseidon/
 
 ## 代码对应关系
 
-当前源码仍处于概念验证阶段，后续按下表演化：
-
-| 当前文件 | 目标职责 |
+| 路径 | 职责 |
 | --- | --- |
-| ../ssa_ops_def.hpp | SSA、值、指令、Place 与通信动作的类型定义（现有"一值多设备"的旧写法将按新设计重写） |
-| ../operations.hpp | VecApi 的明文计算实现与计算接口约定 |
-| ../comm_interface.hpp | CommAction、communicate_async、wait 与 abort_all 约定（替换现有 send/receive 风格接口） |
-| ../seq_interpreter.hpp | 计划验证器、值存储与顺序执行器 |
-| ../mpi_test.cpp | MPI 环境自检 |
-| ../mpi_test_comm.cpp | MPI 主机内存收发基准，不作为 runtime 正确性测试 |
+| `runtime/plan.*` | 单位置 RuntimePlan、强类型算子/通信动作、稳定 fingerprint 与计划打印 |
+| `runtime/verifier.*` | SSA、Place、类型、目标配置和 Transfer/Replicate 合法性检查 |
+| `runtime/runtime.hpp` | ValueStore、Ready/Pending、SequentialRuntime 和 RunArtifact |
+| `api/vec_*` | VecValue 元信息语义及同步/异步计算 |
+| `api/mock_api.*` | MockCluster、多 runtime 通信、延迟/故障注入和全组终止 |
+| `api/mpi_api.*` | MPI 非阻塞通信、序列化、fingerprint preflight 与 MPI_Abort |
+| `testing/` | 计划构造器、顺序参考执行器、DiffMap、比较和 Mock 测试驱动 |
+| `tests/` | 普通测试与 MPI 端到端测试 |
+| `tools/`、`benchmarks/` | MPI 环境自检与通信基准 |
+
+旧的多位置 SSA、`CommInterface` send/receive 接口和空解释器已经删除，不提供兼容层。
 
 ## 设计旁注
 
