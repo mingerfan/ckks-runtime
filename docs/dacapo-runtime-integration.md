@@ -6,7 +6,7 @@
 
 - **Dacapo**(`utils/dacapo`,即 hecate 编译器的 fork):把上层程序编译成 CKKS 程序,自带一套 HEVM 字节码和两个解释器(`lib/Runtime` 里的 SEAL/HEAAN 版本);
 - **Poseidon**(FHE GPU 库):`src/poseidon/mgpu` 里长出了一整套独立的执行系统——自己的调度中间表示、设备分配、拷贝插入、验证器、执行器,外加 `frontends/dacapo` 里的 HEVM 导入和第三套执行器;
-- **本仓库**(Runtime demo):一套干净的"照计划执行"框架,有验证器、值状态管理和明文参考实现,但还没接真实 GPU。
+- **本仓库**(CKKS Runtime):一套干净的"照计划执行"框架,有验证器、值状态管理和明文参考实现,但还没接真实 GPU。
 
 三套执行逻辑长期并存,每改一处要同步三处,谁也不敢删谁。本方案的目标是收敛成一条链,每个仓库只干一件事:
 
@@ -39,10 +39,10 @@ Runtime 不反向依赖 Dacapo 或 Poseidon。Poseidon 只依赖 Runtime;Dacapo 
 
 ## 2. 仓库怎么摆
 
-建议把本仓库更名为能表达实际职责的名字(远程已经叫 `mgpu-runtime-demo`),结构如下:
+本仓库命名为 `ckks-runtime`,结构如下:
 
 ~~~text
-mgpu-runtime/
+ckks-runtime/
 |- docs/runtime-plan/           # 计划文件格式的规范文档
 |- runtime/                     # 计划类型、验证器、执行器
 |- api/                         # VecApi、Mock、MPI 等接口实现
@@ -55,7 +55,7 @@ poseidon/
 |  |- poseidon_cpu_api.*
 |  |- poseidon_gpu_api.*
 |  `- poseidon_communication.*
-`- third_party/mgpu-runtime/    # submodule
+`- third_party/ckks-runtime/    # submodule
 ~~~
 
 这样形成一条确定的版本链:Poseidon 的每个 commit 固定一个 Runtime 版本,Runtime 的每个 commit 固定一个 Dacapo 版本。任何时刻检出 Poseidon,都能精确复现出配套的整套工具链。

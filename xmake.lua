@@ -1,7 +1,7 @@
 add_rules("mode.release", "mode.debug")
 add_rules("plugin.compile_commands.autoupdate", {outputdir = ".", lsp = "clangd"})
 
-set_project("fhe_gpu_runtime_demo")
+set_project("ckks_runtime")
 set_languages("cxx17")
 set_warnings("all", "extra", "pedantic")
 set_targetdir("$(builddir)")

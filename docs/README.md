@@ -1,4 +1,4 @@
-# Runtime Demo 设计文档
+# CKKS Runtime 设计文档
 
 本目录是多设备 CKKS 推理 runtime 的设计基线。这里的 runtime 指的是"拿到一份编译器已经排好的执行计划，在多个设备上把它跑完"的那部分程序。
 
