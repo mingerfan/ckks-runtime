@@ -1,0 +1,191 @@
+{
+  "format_version": 1,
+  "plan_id": "2",
+  "target": {
+    "target_id": "poseidon-ckks-gpu",
+    "capability_version": 1,
+    "operator_spec": {
+      "id": "poseidon-ckks-gpu-v1",
+      "version": 1,
+      "fingerprint": "sha256:6d78861376555678db29a3ac21ce5275a7118c98addf298e9ad8b1f4579da71c"
+    },
+    "rescale_mode": "lazy",
+    "boot_mode": "native",
+    "world_size": 1,
+    "device_counts": [
+      2
+    ],
+    "required_capabilities": [
+      "transfer"
+    ]
+  },
+  "values": [
+    {
+      "id": "1",
+      "kind": "ciphertext",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "context": "ctx-main",
+      "level": 5,
+      "scale_log2": 40,
+      "ntt": true,
+      "components": 2
+    },
+    {
+      "id": "2",
+      "kind": "ciphertext",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "context": "ctx-main",
+      "level": 5,
+      "scale_log2": 80,
+      "ntt": true,
+      "components": 3
+    },
+    {
+      "id": "3",
+      "kind": "ciphertext",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "context": "ctx-main",
+      "level": 5,
+      "scale_log2": 80,
+      "ntt": true,
+      "components": 2
+    },
+    {
+      "id": "4",
+      "kind": "ciphertext",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "context": "ctx-main",
+      "level": 4,
+      "scale_log2": 40,
+      "ntt": true,
+      "components": 2
+    },
+    {
+      "id": "5",
+      "kind": "ciphertext",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 1
+      },
+      "context": "ctx-main",
+      "level": 4,
+      "scale_log2": 40,
+      "ntt": true,
+      "components": 2
+    }
+  ],
+  "external_inputs": [
+    "1"
+  ],
+  "required_keys": [
+    {
+      "kind": "relin",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      }
+    }
+  ],
+  "initialization": [],
+  "execution": [
+    {
+      "ordinal": 0,
+      "kind": "compute",
+      "op": "mul_cc",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "inputs": [
+        "1",
+        "1"
+      ],
+      "output": "2"
+    },
+    {
+      "ordinal": 1,
+      "kind": "compute",
+      "op": "relinearize",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "inputs": [
+        "2"
+      ],
+      "output": "3"
+    },
+    {
+      "ordinal": 2,
+      "kind": "compute",
+      "op": "rescale",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "inputs": [
+        "3"
+      ],
+      "output": "4",
+      "attrs": {
+        "target_level": 4,
+        "target_scale_log2": 40
+      }
+    },
+    {
+      "ordinal": 3,
+      "kind": "transfer",
+      "transfer_id": "100",
+      "hint": "auto",
+      "inputs": [
+        "4"
+      ],
+      "outputs": [
+        "5"
+      ],
+      "sources": [
+        {
+          "kind": "device",
+          "rank": 0,
+          "index": 0
+        }
+      ],
+      "destinations": [
+        {
+          "kind": "device",
+          "rank": 0,
+          "index": 1
+        }
+      ],
+      "output_kinds": [
+        "ciphertext"
+      ]
+    }
+  ],
+  "finalization": [],
+  "final_outputs": [
+    "5"
+  ],
+  "fingerprint": "sha256:84683e6b6c1843bdb6aaf138629437cd982174292469b1c820fa654402e6f165"
+}

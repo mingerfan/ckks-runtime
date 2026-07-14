@@ -24,7 +24,7 @@
 
 ## 与 poseidon::mgpu 的关系
 
-Poseidon 仓库里已有一套单机多卡的静态调度代码（`src/poseidon/mgpu`，包含 schedule IR、placement、copy 插入、verifier、对象级 GPU 拷贝）。**本框架是它的演进目标**：mgpu 目前只覆盖单节点、同步拷贝、无 rank 概念，后续会把其中有价值的部分（GPU 对象拷贝层、verifier 不变量、Dacapo 前端产物）迁移过来，作为本框架下的一个 Api 实现接入；冗余部分会删除。因此本文档中的 SSA 不变量刻意与 mgpu 的做法保持兼容，细节见[总体架构](architecture.md)最后一节。
+Poseidon 仓库里已有一套单机多卡的静态调度代码（`src/poseidon/mgpu`，包含 schedule IR、placement、copy 插入、verifier、对象级 GPU 拷贝）。**本框架是它的演进目标**：mgpu 目前只覆盖单节点、同步拷贝、无 rank 概念，后续会把其中有价值的部分（GPU 对象拷贝层、verifier 不变量、Dacapo 前端产物）迁移过来，作为本框架下的一个 Api 实现接入；冗余部分会删除。因此本文档中的 SSA 不变量刻意与 mgpu 的做法保持兼容，细节见[总体架构](overview-design/architecture.md)最后一节。
 
 ## 常用术语
 
@@ -47,15 +47,24 @@ Poseidon 仓库里已有一套单机多卡的静态调度代码（`src/poseidon/
 
 ## 文档导航
 
-- [总体架构](architecture.md)：目标、分层、编译流水线、核心约束、与 poseidon::mgpu 的对接。
-- [Dialect 与 SSA 设计](dialect-design.md)：逻辑算子、目标合法化、设备分配、通信显式化和 RuntimePlan 映射。
-- [Runtime 设计](runtime-design.md)：执行流程、值状态管理、异步等待和错误终止。
-- [通信设计](communication-design.md)：通信动作、实现提示（hint）、Host/Device 搬运和无死锁论证。
-- [合法性验证与错误处理](validation-and-errors.md)：各层检查清单和错误诊断格式。
-- [明文测试方案](plaintext-testing.md)：VecApi、MockCommunicationApi 和测试矩阵。
-- [Dacapo、Runtime 与 Poseidon 集成方案](dacapo-runtime-integration.md)：仓库关系、RuntimePlan/OperatorSpec、lazy-rescale、CPU boot 模拟、集成测试与迁移顺序。
-- [实现状态](implementation-status.md)：代码路径、构建命令、首期验收项和明确未实现范围。
-- [架构设计 v0.1 归档](archive/architecture-v0.1.md)：最初草案，仅作历史记录。
+### 协议规范(权威,机器可检查)
+
+- [RuntimePlan V1 规范](runtime-plan/v1/specification.md):计划文件的字段语义、编码规则、SSA/元信息不变量和指纹计算。配套 [schema.json](runtime-plan/v1/schema.json)、[版本兼容规则](runtime-plan/v1/compatibility.md) 和 [合法/非法样例集](runtime-plan/v1/testdata/README.md)。
+- [CKKS OperatorSpec V1 规范](operator-spec/v1/specification.md):目标后端的算子能力、level/`scale_log2` 边界、boot profile 和代价模型。配套 [schema.json](operator-spec/v1/schema.json) 和 [占位 profile](operator-spec/v1/profiles/README.md)(CPU eager / GPU lazy)。
+
+协议实现(JSON 读取器、验证器扩展)以规范为准;实现与样例集冲突时,先怀疑实现。
+
+### 总体设计(背景与决策)
+
+- [总体架构](overview-design/architecture.md):目标、分层、编译流水线、核心约束、与 poseidon::mgpu 的对接。
+- [Dialect 与 SSA 设计](overview-design/dialect-design.md):逻辑算子、目标合法化、设备分配、通信显式化和 RuntimePlan 映射。
+- [Runtime 设计](overview-design/runtime-design.md):执行流程、值状态管理、异步等待和错误终止。
+- [通信设计](overview-design/communication-design.md):通信动作、实现提示（hint）、Host/Device 搬运和无死锁论证。
+- [合法性验证与错误处理](overview-design/validation-and-errors.md):各层检查清单和错误诊断格式。
+- [明文测试方案](overview-design/plaintext-testing.md):VecApi、MockCommunicationApi 和测试矩阵。
+- [Dacapo、Runtime 与 Poseidon 集成方案](overview-design/dacapo-runtime-integration.md):仓库关系、RuntimePlan/OperatorSpec、lazy-rescale、CPU boot 模拟、集成测试与迁移顺序。
+- [实现状态](overview-design/implementation-status.md):代码路径、构建命令、首期验收项和明确未实现范围。
+- [架构设计 v0.1 归档](overview-design/archive/architecture-v0.1.md):最初草案，仅作历史记录。
 
 ## 当前核心决策
 

@@ -1,0 +1,77 @@
+{
+  "format_version": 1,
+  "plan_id": "1",
+  "target": {
+    "target_id": "poseidon-ckks-cpu",
+    "capability_version": 1,
+    "operator_spec": {
+      "id": "poseidon-ckks-cpu-v1",
+      "version": 1,
+      "fingerprint": "sha256:3df4bd521e4c6bdbbdf9a6f923d301c02cc73760673b6e4e24ec2d1c3b31a8cf"
+    },
+    "rescale_mode": "eager",
+    "boot_mode": "native",
+    "world_size": 1,
+    "device_counts": [
+      1
+    ],
+    "required_capabilities": []
+  },
+  "values": [
+    {
+      "id": "1",
+      "kind": "ciphertext",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "context": "ctx-main",
+      "level": 5,
+      "scale_log2": 40.5,
+      "ntt": true,
+      "components": 2
+    },
+    {
+      "id": "2",
+      "kind": "ciphertext",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "context": "ctx-main",
+      "level": 5,
+      "scale_log2": 40,
+      "ntt": true,
+      "components": 2
+    }
+  ],
+  "external_inputs": [
+    "1"
+  ],
+  "required_keys": [],
+  "initialization": [],
+  "execution": [
+    {
+      "ordinal": 0,
+      "kind": "compute",
+      "op": "add_cc",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "inputs": [
+        "1",
+        "1"
+      ],
+      "output": "2"
+    }
+  ],
+  "finalization": [],
+  "final_outputs": [
+    "2"
+  ],
+  "fingerprint": "sha256:c4d4c259c9366058872c13b2335eaef00fcf89cb53dbc85fa64bf1caaac1a74c"
+}
