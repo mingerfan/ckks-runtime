@@ -13,6 +13,11 @@ Instruction instruction(std::size_t ordinal, InstructionBody body) {
     return Instruction{ordinal, std::move(body)};
 }
 
+ValueDesc value_desc(ValueId id, ValueKind kind, Place place, int scale_log2 = 1) {
+    return ValueDesc{id, kind, place, "ctx", 3, scale_log2, true,
+                     kind == ValueKind::Plaintext ? 1 : 2};
+}
+
 } // namespace
 
 BuiltPlan make_fanout_plan(const std::vector<int> &device_counts) {
@@ -28,18 +33,24 @@ BuiltPlan make_fanout_plan(const std::vector<int> &device_counts) {
     BuiltPlan built;
     auto &plan = built.plan;
     plan.plan_id = 0x46504750554c4cULL;
-    plan.target = TargetConfig{"vec-fixed-target", static_cast<int>(device_counts.size()), device_counts};
+    plan.target.target_id = "vec-fixed-target";
+    plan.target.world_size = static_cast<int>(device_counts.size());
+    plan.target.device_counts = device_counts;
+    plan.target.capability_version = 1;
+    plan.target.operator_spec = {"vec-operator-spec", 1,
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000"};
+    plan.target.required_capabilities = {RequiredCapability::Transfer};
     ValueId next_value = 0;
     TransferId next_transfer = 100;
     std::size_t ordinal = 0;
     const ValueId cipher_host = next_value++;
     const ValueId plain_host = next_value++;
-    plan.values.push_back({cipher_host, ValueKind::Ciphertext, {PlaceKind::Host, 0, 0}});
-    plan.values.push_back({plain_host, ValueKind::Plaintext, {PlaceKind::Host, 0, 0}});
+    plan.values.push_back(value_desc(cipher_host, ValueKind::Ciphertext, {PlaceKind::Host, 0, 0}));
+    plan.values.push_back(value_desc(plain_host, ValueKind::Plaintext, {PlaceKind::Host, 0, 0}));
     plan.external_inputs = {cipher_host, plain_host};
 
     const ValueId cipher_device = next_value++;
-    plan.values.push_back({cipher_device, ValueKind::Ciphertext, devices.front()});
+    plan.values.push_back(value_desc(cipher_device, ValueKind::Ciphertext, devices.front()));
     plan.initialization.push_back(instruction(ordinal++, CommAction{next_transfer++, CommKind::Transfer, CommHint::PointToPoint,
         {cipher_host}, {cipher_device}, {{PlaceKind::Host, 0, 0}}, {devices.front()}, {ValueKind::Ciphertext}}));
     built.diff_map.push_back({0, cipher_device, cipher_host});
@@ -50,14 +61,18 @@ BuiltPlan make_fanout_plan(const std::vector<int> &device_counts) {
         const ValueId id = next_value++;
         plains.push_back(id);
         plain_types.push_back(ValueKind::Plaintext);
-        plan.values.push_back({id, ValueKind::Plaintext, place});
+        plan.values.push_back(value_desc(id, ValueKind::Plaintext, place));
     }
-    plan.initialization.push_back(instruction(ordinal++, CommAction{next_transfer++, CommKind::Replicate, CommHint::Broadcast,
+    const bool replicate_plain = devices.size() > 1;
+    if (replicate_plain) plan.target.required_capabilities.push_back(RequiredCapability::Replicate);
+    plan.initialization.push_back(instruction(ordinal++, CommAction{
+        next_transfer++, replicate_plain ? CommKind::Replicate : CommKind::Transfer,
+        replicate_plain ? CommHint::Broadcast : CommHint::PointToPoint,
         {plain_host}, plains, {{PlaceKind::Host, 0, 0}}, devices, plain_types}));
     for (ValueId id : plains) built.diff_map.push_back({1, id, plain_host});
 
     const ValueId product = next_value++;
-    plan.values.push_back({product, ValueKind::Ciphertext, devices.front()});
+    plan.values.push_back(value_desc(product, ValueKind::Ciphertext, devices.front(), 2));
     plan.execution.push_back(instruction(ordinal++, ComputeOp{ComputeKind::MulCP, {cipher_device, plains.front()}, product, devices.front(), {}}));
 
     std::vector<ValueId> products(devices.size());
@@ -70,7 +85,7 @@ BuiltPlan make_fanout_plan(const std::vector<int> &device_counts) {
             const ValueId id = next_value++;
             outputs.push_back(id); types.push_back(ValueKind::Ciphertext);
             products[outputs.size()] = id;
-            plan.values.push_back({id, ValueKind::Ciphertext, place});
+            plan.values.push_back(value_desc(id, ValueKind::Ciphertext, place, 2));
         }
         plan.execution.push_back(instruction(ordinal++, CommAction{next_transfer++, CommKind::Replicate, CommHint::Broadcast,
             {product}, outputs, {devices.front()}, destinations, types}));
@@ -80,13 +95,13 @@ BuiltPlan make_fanout_plan(const std::vector<int> &device_counts) {
     for (std::size_t i = 0; i < devices.size(); ++i) {
         const ValueId id = next_value++;
         branches.push_back(id);
-        plan.values.push_back({id, ValueKind::Ciphertext, devices[i]});
+        plan.values.push_back(value_desc(id, ValueKind::Ciphertext, devices[i], 2));
         plan.execution.push_back(instruction(ordinal++, ComputeOp{ComputeKind::Negate, {products[i]}, id, devices[i], {}}));
     }
 
     const Place output_host{PlaceKind::Host, devices.back().rank, 0};
     const ValueId final = next_value++;
-    plan.values.push_back({final, ValueKind::Ciphertext, output_host});
+    plan.values.push_back(value_desc(final, ValueKind::Ciphertext, output_host, 2));
     plan.finalization.push_back(instruction(ordinal++, CommAction{next_transfer++, CommKind::Transfer, CommHint::Auto,
         {branches.back()}, {final}, {devices.back()}, {output_host}, {ValueKind::Ciphertext}}));
     plan.final_outputs = {final};

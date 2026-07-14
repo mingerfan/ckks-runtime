@@ -31,15 +31,15 @@ int main(int argc, char **argv) {
     auto built = make_fanout_plan(std::vector<int>(static_cast<std::size_t>(world), 1));
     if (inject_large_transfer_id)
         std::get<CommAction>(built.plan.initialization.at(1).body).id = std::numeric_limits<TransferId>::max();
-    const VecValue cipher = make_cipher({1, 2, 3, 4}, "mpi-ctx", 16384, 3, 2.0);
-    const VecValue plain = make_plain({2, 3, 4, 5}, "mpi-ctx", 16384, 3, 2.0);
+    const VecValue cipher = make_cipher({1, 2, 3, 4}, "mpi-ctx", 16384, 3, 1);
+    const VecValue plain = make_plain({2, 3, 4, 5}, "mpi-ctx", 16384, 3, 1);
     const auto reference = run_fanout_reference(cipher, plain);
 
     MpiVecApi api;
     SequentialRuntime<MpiVecApi> runtime(rank, world, 1, api);
     std::unordered_map<ValueId, VecValue> inputs;
     if (rank == 0) {
-        inputs.emplace(0, inject_error ? make_plain({1, 2, 3, 4}, "mpi-ctx", 16384, 3, 2.0) : cipher.deep_copy());
+        inputs.emplace(0, inject_error ? make_plain({1, 2, 3, 4}, "mpi-ctx", 16384, 3, 1) : cipher.deep_copy());
         inputs.emplace(1, plain.deep_copy());
     }
     const auto artifact = runtime.run(built.plan, inputs, DiffMode::FinalOnly);

@@ -1,6 +1,5 @@
 #include "runtime/verifier.hpp"
 
-#include <cmath>
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
@@ -42,7 +41,7 @@ void check_attrs(const ComputeOp &op) {
         return;
     case ComputeKind::Rescale: {
         const auto *a = std::get_if<RescaleAttrs>(&op.attrs);
-        if (!a || a->target_level < 0 || !std::isfinite(a->scale_divisor) || a->scale_divisor <= 0.0) fail("invalid RescaleAttrs");
+        if (!a || a->target_level < 0 || a->target_scale_log2 < 0) fail("invalid RescaleAttrs");
         return;
     }
     case ComputeKind::ModSwitch: {
@@ -52,7 +51,9 @@ void check_attrs(const ComputeOp &op) {
     }
     case ComputeKind::Boot: {
         const auto *a = std::get_if<BootAttrs>(&op.attrs);
-        if (!a || a->level < 0 || !std::isfinite(a->scale) || a->scale <= 0.0 || a->components < 2) fail("invalid BootAttrs");
+        if (!a || a->target_level < 0 || a->target_scale_log2 < 0 ||
+            a->target_components < 1 || a->operator_profile.empty())
+            fail("invalid BootAttrs");
         return;
     }
     default:
@@ -64,7 +65,6 @@ void check_attrs(const ComputeOp &op) {
 
 void PlanVerifier::verify(const RuntimePlan &plan) {
     if (plan.format_version != 1) fail("unsupported format version");
-    if (plan.plan_id == 0) fail("plan id must be nonzero");
     if (plan.target.target_id.empty()) fail("target id is empty");
     if (plan.target.world_size <= 0) fail("world size must be positive");
     if (plan.target.device_counts.size() != static_cast<std::size_t>(plan.target.world_size)) fail("device count table does not match world size");
@@ -73,6 +73,12 @@ void PlanVerifier::verify(const RuntimePlan &plan) {
     DescMap desc;
     for (const auto &v : plan.values) {
         check_place(plan, v.place);
+        if (v.context.empty() || v.level < 0 || v.scale_log2 < 0 || v.components < 1)
+            fail("invalid metadata for ValueId " + std::to_string(v.id));
+        if (v.kind == ValueKind::Plaintext && v.components != 1)
+            fail("plaintext components must be one for ValueId " + std::to_string(v.id));
+        if (v.kind == ValueKind::Ciphertext && v.components < 2)
+            fail("ciphertext components must be at least two for ValueId " + std::to_string(v.id));
         if (!desc.values.emplace(v.id, &v).second) fail("duplicate ValueId " + std::to_string(v.id));
     }
 

@@ -51,6 +51,44 @@ std::string to_string(Phase p) {
     throw std::runtime_error("unknown phase");
 }
 
+std::string to_string(RescaleMode mode) {
+    switch (mode) { case RescaleMode::Eager: return "eager"; case RescaleMode::Lazy: return "lazy"; }
+    throw std::runtime_error("unknown rescale mode");
+}
+
+std::string to_string(BootMode mode) {
+    switch (mode) { case BootMode::Native: return "native"; case BootMode::DecryptReencrypt: return "decrypt_reencrypt"; }
+    throw std::runtime_error("unknown boot mode");
+}
+
+std::string to_string(BootImplementation implementation) {
+    switch (implementation) {
+    case BootImplementation::Native: return "native";
+    case BootImplementation::DecryptReencrypt: return "decrypt_reencrypt";
+    }
+    throw std::runtime_error("unknown boot implementation");
+}
+
+std::string to_string(RequiredCapability capability) {
+    switch (capability) {
+    case RequiredCapability::Transfer: return "transfer";
+    case RequiredCapability::Replicate: return "replicate";
+    case RequiredCapability::HostCompute: return "host_compute";
+    case RequiredCapability::BootNative: return "boot_native";
+    case RequiredCapability::BootDecryptReencrypt: return "boot_decrypt_reencrypt";
+    }
+    throw std::runtime_error("unknown required capability");
+}
+
+std::string to_string(KeyKind kind) {
+    switch (kind) { case KeyKind::Secret: return "secret"; case KeyKind::Relin: return "relin"; case KeyKind::Galois: return "galois"; }
+    throw std::runtime_error("unknown key kind");
+}
+
+static void append_string(std::ostringstream &os, const std::string &value) {
+    os << value.size() << ':' << value;
+}
+
 static void append_place(std::ostringstream &os, const Place &p) {
     os << static_cast<int>(p.kind) << ':' << p.rank << ':' << p.index;
 }
@@ -62,9 +100,13 @@ static void append_instruction(std::ostringstream &os, const Instruction &inst) 
         append_place(os, op->place);
         for (auto id : op->inputs) os << ':' << id;
         if (const auto *a = std::get_if<RotateAttrs>(&op->attrs)) os << ":r" << a->steps;
-        if (const auto *a = std::get_if<RescaleAttrs>(&op->attrs)) os << ":s" << a->target_level << ':' << std::setprecision(17) << a->scale_divisor;
+        if (const auto *a = std::get_if<RescaleAttrs>(&op->attrs)) os << ":s" << a->target_level << ':' << a->target_scale_log2;
         if (const auto *a = std::get_if<ModSwitchAttrs>(&op->attrs)) os << ":m" << a->target_level;
-        if (const auto *a = std::get_if<BootAttrs>(&op->attrs)) os << ":b" << a->level << ':' << std::setprecision(17) << a->scale << ':' << a->components;
+        if (const auto *a = std::get_if<BootAttrs>(&op->attrs)) {
+            os << ":b" << a->target_level << ':' << a->target_scale_log2 << ':'
+               << a->target_components << ':' << static_cast<int>(a->implementation) << ':';
+            append_string(os, a->operator_profile);
+        }
     } else {
         const auto &a = std::get<CommAction>(inst.body);
         os << 'M' << a.id << ':' << static_cast<int>(a.kind) << ':' << static_cast<int>(a.hint);
@@ -79,10 +121,28 @@ static void append_instruction(std::ostringstream &os, const Instruction &inst) 
 
 std::uint64_t RuntimePlan::fingerprint() const {
     std::ostringstream os;
-    os << format_version << ':' << plan_id << ':' << target.target_id << ':' << target.world_size;
+    os << format_version << ':' << plan_id << ':';
+    append_string(os, fingerprint_sha256);
+    append_string(os, target.target_id);
+    os << ':' << target.capability_version << ':' << target.world_size << ':';
+    append_string(os, target.operator_spec.id);
+    os << ':' << target.operator_spec.version << ':';
+    append_string(os, target.operator_spec.fingerprint);
+    os << ':' << static_cast<int>(target.rescale_mode) << ':' << static_cast<int>(target.boot_mode);
     for (int n : target.device_counts) os << ':' << n;
-    for (const auto &v : values) { os << "|v" << v.id << ':' << static_cast<int>(v.kind) << ':'; append_place(os, v.place); }
+    for (auto capability : target.required_capabilities) os << ":c" << static_cast<int>(capability);
+    for (const auto &v : values) {
+        os << "|v" << v.id << ':' << static_cast<int>(v.kind) << ':';
+        append_place(os, v.place);
+        os << ':';
+        append_string(os, v.context);
+        os << ':' << v.level << ':' << v.scale_log2 << ':' << v.ntt << ':' << v.components;
+    }
     for (auto id : external_inputs) os << "|e" << id;
+    for (const auto &key : required_keys) {
+        os << "|k" << static_cast<int>(key.kind) << ':';
+        append_place(os, key.place);
+    }
     for (const auto &i : initialization) { os << "|I"; append_instruction(os, i); }
     for (const auto &i : execution) { os << "|E"; append_instruction(os, i); }
     for (const auto &i : finalization) { os << "|F"; append_instruction(os, i); }
@@ -95,9 +155,17 @@ std::uint64_t RuntimePlan::fingerprint() const {
 
 void RuntimePlan::print(std::ostream &out) const {
     out << "RuntimePlan(version=" << format_version << ", id=" << plan_id
-        << ", target=" << target.target_id << ", world=" << target.world_size
+        << ", target=" << target.target_id << ", capability=" << target.capability_version
+        << ", operator_spec=" << target.operator_spec.id << '@' << target.operator_spec.version
+        << ", rescale=" << to_string(target.rescale_mode)
+        << ", boot=" << to_string(target.boot_mode) << ", world=" << target.world_size
         << ", fingerprint=0x" << std::hex << fingerprint() << std::dec << ")\n";
-    for (const auto &v : values) out << "  %" << v.id << " : " << to_string(v.kind) << " @ " << to_string(v.place) << '\n';
+    for (const auto &v : values) {
+        out << "  %" << v.id << " : " << to_string(v.kind) << " @ " << to_string(v.place)
+            << " context=" << v.context << " level=" << v.level
+            << " scale_log2=" << v.scale_log2 << " ntt=" << v.ntt
+            << " components=" << v.components << '\n';
+    }
     const auto print_phase = [&](const char *name, const std::vector<Instruction> &list) {
         out << name << ":\n";
         for (const auto &inst : list) {

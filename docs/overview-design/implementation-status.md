@@ -12,9 +12,13 @@
 - 顺序参考执行、DiffMap、最终/运行后全部值差分比较。
 - MpiVecApi：元信息头与槽数组分离的非阻塞点对点通信、request/缓冲区生命周期、tag 上限、计划 fingerprint 集合检查和 MPI_Abort。
 - MPI 环境自检和主机内存通信基准。
+- RuntimePlan V1 独立 JSON 读取器：严格拒绝 BOM、重复 key、未知/缺失字段、浮点数、非法枚举和错误的 64 位 ID 编码，并用仓库内 SHA-256 实现重算指纹；nlohmann-json 固定在 `third_party/`，不依赖 OpenSSL。
+- `ValueDesc` 已包含 context、level、整数 `scale_log2`、NTT 和分量数；Rescale/Boot、Vec 和 MPI 元信息也已改用整数 `scale_log2`。
+- `TargetConfig` 已能保存 capability、OperatorSpec 引用、rescale/boot 模式、能力声明和密钥声明。
 
 ## 测试覆盖
 
+- RuntimePlan V1 四份合法样例、结构类非法样例、重复 JSON key、BOM 和错误 ID 类型。
 - 合法代表计划、稳定 fingerprint 和非法计划注入。
 - Vec 算子、元信息、rotate 规范化和非法组合。
 - 1/2/4/6/8 个逻辑设备，1/2/4 个独立 rank，同步与异步模式。
@@ -30,6 +34,7 @@
 xmake f -m debug
 xmake
 ./build/runtime_tests
+./build/runtime_plan_json_tests
 mpiexec -n 2 ./build/mpi_runtime_test
 mpiexec -n 4 ./build/mpi_runtime_test
 mpiexec -n 2 ./build/mpi_runtime_test --inject-error  # 预期非零
@@ -41,10 +46,8 @@ xmake
 
 ## 设计已定但尚未实现
 
-- RuntimePlan V1 JSON 读取器、Schema 和合法/非法协议样例；
-- `ValueDesc` 中完整的 context、level、`scale_log2`、NTT 和分量数；
-- 用整数 `scale_log2` 替换 `RescaleAttrs`、`BootAttrs` 和 Vec/MPI 元信息里的浮点 scale；
-- OperatorSpec 的 id/版本/指纹和 CPU eager、GPU lazy profile；
+- PlanVerifier 尚未覆盖 V1 的全部语义检查，包括完整元信息变化、能力/密钥声明精确匹配和无孤儿 ValueDesc；
+- OperatorSpec 文件读取、id/版本/指纹匹配、level/rescale/boot profile 检查；
 - Runtime 对 Host compute 的支持。当前验证器仍把计算写死在 Device；
 - `Boot(implementation=decrypt_reencrypt)` 及显式的 Device→Host、Host→Device 流程；
 - PoseidonGpuApi 内部组合 Poseidon CPU 能力来执行 Host boot 模拟。

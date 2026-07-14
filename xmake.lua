@@ -21,10 +21,23 @@ target("runtime_core")
         "testing/testing.cpp")
     add_syslinks("pthread")
 
+target("runtime_plan_json")
+    set_kind("static")
+    add_includedirs(".", {public = true})
+    add_includedirs("third_party")
+    add_files("runtime/json_plan_reader.cpp", "runtime/utils/sha256.cpp")
+    add_deps("runtime_core")
+
 target("runtime_tests")
     set_kind("binary")
     add_files("tests/runtime_tests.cpp")
     add_deps("runtime_core")
+
+target("runtime_plan_json_tests")
+    set_kind("binary")
+    add_files("tests/runtime_plan_json_tests.cpp")
+    add_deps("runtime_plan_json")
+    add_defines("CKKS_RUNTIME_SOURCE_DIR=\"$(projectdir)\"")
 
 target("mpi_runtime_test")
     set_kind("binary")

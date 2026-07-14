@@ -2,7 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace fhegpu {
@@ -13,7 +13,7 @@ void require_compatible(const VecPayload &a, const VecPayload &b, bool check_sca
     if (a.metadata.context != b.metadata.context || a.metadata.degree != b.metadata.degree ||
         a.metadata.level != b.metadata.level || a.metadata.ntt != b.metadata.ntt)
         throw std::runtime_error("incompatible VecValue metadata");
-    if (check_scale && a.metadata.scale != b.metadata.scale) throw std::runtime_error("scale mismatch");
+    if (check_scale && a.metadata.scale_log2 != b.metadata.scale_log2) throw std::runtime_error("scale mismatch");
 }
 
 VecPayload unary_cipher(const std::vector<VecValue> &inputs) {
@@ -86,8 +86,9 @@ VecPayload VecExecutor::compute_now(const ComputeOp &op, const std::vector<VecVa
         require_compatible(a, b, !multiply);
         for (std::size_t i = 0; i < a.slots.size(); ++i) a.slots[i] = fn(a.slots[i], b.slots[i]);
         if (multiply) {
-            a.metadata.scale *= b.metadata.scale;
-            if (!std::isfinite(a.metadata.scale)) throw std::runtime_error("multiplication scale overflow");
+            if (b.metadata.scale_log2 > std::numeric_limits<int>::max() - a.metadata.scale_log2)
+                throw std::runtime_error("multiplication scale overflow");
+            a.metadata.scale_log2 += b.metadata.scale_log2;
             if (rhs_kind == ValueKind::Ciphertext) a.metadata.components += b.metadata.components - 1;
         }
         return a;
@@ -113,8 +114,9 @@ VecPayload VecExecutor::compute_now(const ComputeOp &op, const std::vector<VecVa
     case ComputeKind::Rescale: {
         auto a = unary_cipher(inputs); const auto attrs = std::get<RescaleAttrs>(op.attrs);
         if (attrs.target_level >= a.metadata.level) throw std::runtime_error("rescale must lower level");
-        a.metadata.level = attrs.target_level; a.metadata.scale /= attrs.scale_divisor;
-        if (!std::isfinite(a.metadata.scale) || a.metadata.scale <= 0.0) throw std::runtime_error("invalid rescaled scale");
+        if (attrs.target_scale_log2 < 0) throw std::runtime_error("invalid rescaled scale");
+        a.metadata.level = attrs.target_level;
+        a.metadata.scale_log2 = attrs.target_scale_log2;
         return a;
     }
     case ComputeKind::ModSwitch: {
@@ -128,7 +130,10 @@ VecPayload VecExecutor::compute_now(const ComputeOp &op, const std::vector<VecVa
     }
     case ComputeKind::Boot: {
         auto a = unary_cipher(inputs); const auto attrs = std::get<BootAttrs>(op.attrs);
-        a.metadata.level = attrs.level; a.metadata.scale = attrs.scale; a.metadata.components = attrs.components; return a;
+        a.metadata.level = attrs.target_level;
+        a.metadata.scale_log2 = attrs.target_scale_log2;
+        a.metadata.components = attrs.target_components;
+        return a;
     }
     }
     throw std::runtime_error("unsupported compute operation");

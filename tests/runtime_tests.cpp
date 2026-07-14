@@ -96,27 +96,28 @@ void test_verifier_rejections() {
 void test_vec_operations() {
     const Place p{PlaceKind::Device, 0, 0};
     VecExecutor executor;
-    const VecValue ct = make_cipher({1, 2, 3, 4}, "ctx", 8192, 4, 8.0, true, 2);
-    const VecValue ct2 = make_cipher({4, 3, 2, 1}, "ctx", 8192, 4, 8.0, true, 2);
-    const VecValue pt = make_plain({2, 2, 2, 2}, "ctx", 8192, 4, 8.0, true);
+    const VecValue ct = make_cipher({1, 2, 3, 4}, "ctx", 8192, 4, 3, true, 2);
+    const VecValue ct2 = make_cipher({4, 3, 2, 1}, "ctx", 8192, 4, 3, true, 2);
+    const VecValue pt = make_plain({2, 2, 2, 2}, "ctx", 8192, 4, 3, true);
     auto op = [&](ComputeKind kind, std::vector<VecValue> inputs, ComputeAttrs attrs = {}) {
         return executor.compute(ComputeOp{kind, {}, 9, p, std::move(attrs)}, inputs);
     };
     require(op(ComputeKind::AddCC, {ct, ct2}).materialize().slots[0] == 5, "AddCC failed");
     require(op(ComputeKind::SubCP, {ct, pt}).materialize().slots[0] == -1, "SubCP failed");
     auto mul = op(ComputeKind::MulCC, {ct, ct2}).materialize();
-    require(mul.metadata.scale == 64.0 && mul.metadata.components == 3, "MulCC metadata failed");
+    require(mul.metadata.scale_log2 == 6 && mul.metadata.components == 3, "MulCC metadata failed");
     auto relin = op(ComputeKind::Relinearize, {VecValue::ready(mul)}).materialize();
     require(relin.metadata.components == 2, "Relinearize failed");
-    auto rescale = op(ComputeKind::Rescale, {ct}, RescaleAttrs{3, 4.0}).materialize();
-    require(rescale.metadata.level == 3 && rescale.metadata.scale == 2.0, "Rescale metadata failed");
+    auto rescale = op(ComputeKind::Rescale, {ct}, RescaleAttrs{3, 1}).materialize();
+    require(rescale.metadata.level == 3 && rescale.metadata.scale_log2 == 1, "Rescale metadata failed");
     require(op(ComputeKind::ModSwitch, {ct}, ModSwitchAttrs{2}).materialize().metadata.level == 2, "ModSwitch failed");
-    auto boot = op(ComputeKind::Boot, {ct}, BootAttrs{7, 16.0, 2}).materialize();
-    require(boot.metadata.level == 7 && boot.metadata.scale == 16.0, "Boot failed");
+    auto boot = op(ComputeKind::Boot, {ct},
+                   BootAttrs{7, 4, 2, "test-native-boot", BootImplementation::Native}).materialize();
+    require(boot.metadata.level == 7 && boot.metadata.scale_log2 == 4, "Boot failed");
     require(op(ComputeKind::Rotate, {ct}, RotateAttrs{-1}).materialize().slots[0] == 4, "negative rotate failed");
     require(op(ComputeKind::Rotate, {ct}, RotateAttrs{5}).materialize().slots[0] == 2, "normalized rotate failed");
     expect_throw([&] { op(ComputeKind::AddCC, {ct, pt}).materialize(); }, "type mismatch");
-    expect_throw([&] { op(ComputeKind::Rescale, {ct}, RescaleAttrs{4, 2.0}).materialize(); }, "lower level");
+    expect_throw([&] { op(ComputeKind::Rescale, {ct}, RescaleAttrs{4, 2}).materialize(); }, "lower level");
 
     VecExecutor async({VecExecMode::Async, 42, 2});
     VecValue pending = async.compute(ComputeOp{ComputeKind::AddCP, {}, 10, p, {}}, {ct, pt});
@@ -125,8 +126,8 @@ void test_vec_operations() {
 
 void validate_layout(const std::vector<int> &layout, VecExecMode mode) {
     const auto built = make_fanout_plan(layout);
-    const VecValue cipher = make_cipher({1, 2, 3, 4}, "ctx", 8192, 3, 2.0);
-    const VecValue plain = make_plain({2, 3, 4, 5}, "ctx", 8192, 3, 2.0);
+    const VecValue cipher = make_cipher({1, 2, 3, 4}, "ctx", 8192, 3, 1);
+    const VecValue plain = make_plain({2, 3, 4, 5}, "ctx", 8192, 3, 1);
     const auto reference = run_fanout_reference(cipher, plain);
     MockClusterConfig cluster_config;
     cluster_config.world_size = static_cast<int>(layout.size());
@@ -165,8 +166,8 @@ void test_mock_matrix() {
 
 void test_mock_fail_fast() {
     const auto built = make_fanout_plan({1, 1});
-    const VecValue cipher = make_cipher({1, 2}, "ctx", 8192, 3, 2.0);
-    const VecValue plain = make_plain({2, 3}, "ctx", 8192, 3, 2.0);
+    const VecValue cipher = make_cipher({1, 2}, "ctx", 8192, 3, 1);
+    const VecValue plain = make_plain({2, 3}, "ctx", 8192, 3, 1);
     const TransferId failed = std::get<CommAction>(built.plan.execution.at(1).body).id;
     const TransferId init_transfer = std::get<CommAction>(built.plan.initialization.front().body).id;
     MockClusterConfig config;
@@ -190,17 +191,23 @@ void test_mock_fail_fast() {
 
     RuntimePlan async_error_plan;
     async_error_plan.plan_id = 77;
-    async_error_plan.target = {"async-final-error", 1, {1}};
+    async_error_plan.target.target_id = "async-final-error";
+    async_error_plan.target.world_size = 1;
+    async_error_plan.target.device_counts = {1};
+    async_error_plan.target.capability_version = 1;
+    async_error_plan.target.operator_spec = {"test-operator-spec", 1,
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000"};
+    async_error_plan.target.required_capabilities = {RequiredCapability::Transfer};
     const Place host{PlaceKind::Host, 0, 0};
     const Place device{PlaceKind::Device, 0, 0};
-    async_error_plan.values = {{0, ValueKind::Ciphertext, host},
-                               {1, ValueKind::Ciphertext, device},
-                               {2, ValueKind::Ciphertext, device}};
+    async_error_plan.values = {{0, ValueKind::Ciphertext, host, "ctx", 3, 1, true, 2},
+                               {1, ValueKind::Ciphertext, device, "ctx", 3, 1, true, 2},
+                               {2, ValueKind::Ciphertext, device, "ctx", 3, 0, true, 2}};
     async_error_plan.external_inputs = {0};
     async_error_plan.initialization = {{0, CommAction{1, CommKind::Transfer, CommHint::Auto,
         {0}, {1}, {host}, {device}, {ValueKind::Ciphertext}}}};
     async_error_plan.execution = {{1, ComputeOp{ComputeKind::Rescale, {1}, 2, device,
-                                                RescaleAttrs{3, 2.0}}}};
+                                                RescaleAttrs{3, 0}}}};
     async_error_plan.final_outputs = {2};
     expect_throw([&] {
         run_mock_cluster(async_error_plan, {{0, cipher}}, {},

@@ -43,7 +43,7 @@ MpiVecApi::WireHeader MpiVecApi::encode_header(const VecPayload &payload) {
     header.degree = payload.metadata.degree;
     header.kind = static_cast<int>(payload.kind);
     header.level = payload.metadata.level;
-    header.scale = payload.metadata.scale;
+    header.scale_log2 = payload.metadata.scale_log2;
     header.ntt = payload.metadata.ntt ? 1 : 0;
     header.components = payload.metadata.components;
     std::copy(payload.metadata.context.begin(), payload.metadata.context.end(), header.context.begin());
@@ -56,7 +56,7 @@ VecValue MpiVecApi::decode_value(const WireHeader &header, std::vector<double> s
     const auto end = std::find(header.context.begin(), header.context.end(), '\0');
     const std::string context(header.context.begin(), end);
     VecPayload payload{static_cast<ValueKind>(header.kind), std::move(slots),
-                       VecMetadata{context, header.degree, header.level, header.scale,
+                       VecMetadata{context, header.degree, header.level, header.scale_log2,
                                    header.ntt != 0, header.components}};
     return VecValue::ready(std::move(payload));
 }

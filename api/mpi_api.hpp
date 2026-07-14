@@ -20,7 +20,7 @@ public:
         std::uint64_t degree = 0;
         int kind = 0;
         int level = 0;
-        double scale = 1.0;
+        int scale_log2 = 0;
         int ntt = 0;
         int components = 1;
         std::array<char, 64> context{};

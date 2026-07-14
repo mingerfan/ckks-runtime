@@ -15,7 +15,7 @@ struct VecMetadata {
     std::string context;
     std::uint64_t degree = 0;
     int level = 0;
-    double scale = 1.0;
+    int scale_log2 = 0;
     bool ntt = true;
     int components = 1;
 };
@@ -57,9 +57,9 @@ private:
 
 VecValue make_plain(std::vector<double> slots, std::string context = "ctx",
                     std::uint64_t degree = 8192, int level = 3,
-                    double scale = 1.0, bool ntt = true);
+                    int scale_log2 = 0, bool ntt = true);
 VecValue make_cipher(std::vector<double> slots, std::string context = "ctx",
                      std::uint64_t degree = 8192, int level = 3,
-                     double scale = 1.0, bool ntt = true, int components = 2);
+                     int scale_log2 = 0, bool ntt = true, int components = 2);
 
 } // namespace fhegpu
