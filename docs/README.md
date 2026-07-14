@@ -51,6 +51,7 @@ Poseidon 仓库里已有一套单机多卡的静态调度代码（`src/poseidon/
 - [通信设计](communication-design.md)：通信动作、实现提示（hint）、Host/Device 搬运和无死锁论证。
 - [合法性验证与错误处理](validation-and-errors.md)：各层检查清单和错误诊断格式。
 - [明文测试方案](plaintext-testing.md)：VecApi、MockCommunicationApi 和测试矩阵。
+- [Dacapo、Runtime 与 Poseidon 集成方案](dacapo-runtime-integration.md)：仓库关系、RuntimePlan 协议所有权、独立实现、集成测试与迁移顺序。
 - [实现状态](implementation-status.md)：代码路径、构建命令、首期验收项和明确未实现范围。
 - [架构设计 v0.1 归档](archive/architecture-v0.1.md)：最初草案，仅作历史记录。
 
