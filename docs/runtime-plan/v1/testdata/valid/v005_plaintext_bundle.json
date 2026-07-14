@@ -1,6 +1,6 @@
 {
   "format_version": 1,
-  "plan_id": "1",
+  "plan_id": "5",
   "target": {
     "target_id": "poseidon-ckks-cpu",
     "capability_version": 1,
@@ -22,6 +22,19 @@
   "values": [
     {
       "id": "1",
+      "kind": "plaintext",
+      "place": {
+        "kind": "host",
+        "rank": 0
+      },
+      "context": "ctx-main",
+      "level": 5,
+      "scale_log2": 40,
+      "ntt": true,
+      "components": 1
+    },
+    {
+      "id": "2",
       "kind": "ciphertext",
       "place": {
         "kind": "host",
@@ -34,7 +47,21 @@
       "components": 2
     },
     {
-      "id": "2",
+      "id": "3",
+      "kind": "plaintext",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "context": "ctx-main",
+      "level": 5,
+      "scale_log2": 40,
+      "ntt": true,
+      "components": 1
+    },
+    {
+      "id": "4",
       "kind": "ciphertext",
       "place": {
         "kind": "device",
@@ -48,7 +75,7 @@
       "components": 2
     },
     {
-      "id": "3",
+      "id": "5",
       "kind": "ciphertext",
       "place": {
         "kind": "device",
@@ -57,13 +84,14 @@
       },
       "context": "ctx-main",
       "level": 5,
-      "scale_log2": 40,
+      "scale_log2": 80,
       "ntt": true,
       "components": 2
     }
   ],
   "external_inputs": [
-    "1"
+    "1",
+    "2"
   ],
   "required_keys": [],
   "initialization": [
@@ -76,7 +104,35 @@
         "1"
       ],
       "outputs": [
+        "3"
+      ],
+      "sources": [
+        {
+          "kind": "host",
+          "rank": 0
+        }
+      ],
+      "destinations": [
+        {
+          "kind": "device",
+          "rank": 0,
+          "index": 0
+        }
+      ],
+      "output_kinds": [
+        "plaintext"
+      ]
+    },
+    {
+      "ordinal": 1,
+      "kind": "transfer",
+      "transfer_id": "2",
+      "hint": "auto",
+      "inputs": [
         "2"
+      ],
+      "outputs": [
+        "4"
       ],
       "sources": [
         {
@@ -98,24 +154,29 @@
   ],
   "execution": [
     {
-      "ordinal": 1,
+      "ordinal": 2,
       "kind": "compute",
-      "op": "add_cc",
+      "op": "mul_cp",
       "place": {
         "kind": "device",
         "rank": 0,
         "index": 0
       },
       "inputs": [
-        "2",
-        "2"
+        "4",
+        "3"
       ],
-      "output": "3"
+      "output": "5"
     }
   ],
   "finalization": [],
   "final_outputs": [
-    "3"
+    "5"
   ],
-  "fingerprint": "sha256:dd2356f68c399b53e55ba09b3a8b20e4e9135e407521e6b7c1c3662f0b71d9e0"
+  "plaintext_bundle": {
+    "id": "v005-demo-weights",
+    "version": 1,
+    "fingerprint": "sha256:881ece04a4184592d106493a781bc6b5afe3b647f39de9befceb13a6a26e4245"
+  },
+  "fingerprint": "sha256:5dfb4336d408dcca15a9265c0e0be577129f3b8f0ef6c72b7e196a0a24632b24"
 }

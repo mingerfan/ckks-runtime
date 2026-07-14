@@ -15,16 +15,17 @@
     "device_counts": [
       1
     ],
-    "required_capabilities": []
+    "required_capabilities": [
+      "transfer"
+    ]
   },
   "values": [
     {
       "id": "1",
       "kind": "ciphertext",
       "place": {
-        "kind": "device",
-        "rank": 0,
-        "index": 0
+        "kind": "host",
+        "rank": 0
       },
       "context": "ctx-main",
       "level": 5,
@@ -36,9 +37,8 @@
       "id": "1",
       "kind": "ciphertext",
       "place": {
-        "kind": "device",
-        "rank": 0,
-        "index": 0
+        "kind": "host",
+        "rank": 0
       },
       "context": "ctx-main",
       "level": 5,
@@ -59,16 +59,59 @@
       "scale_log2": 40,
       "ntt": true,
       "components": 2
+    },
+    {
+      "id": "3",
+      "kind": "ciphertext",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "context": "ctx-main",
+      "level": 5,
+      "scale_log2": 40,
+      "ntt": true,
+      "components": 2
     }
   ],
   "external_inputs": [
     "1"
   ],
   "required_keys": [],
-  "initialization": [],
-  "execution": [
+  "initialization": [
     {
       "ordinal": 0,
+      "kind": "transfer",
+      "transfer_id": "1",
+      "hint": "auto",
+      "inputs": [
+        "1"
+      ],
+      "outputs": [
+        "2"
+      ],
+      "sources": [
+        {
+          "kind": "host",
+          "rank": 0
+        }
+      ],
+      "destinations": [
+        {
+          "kind": "device",
+          "rank": 0,
+          "index": 0
+        }
+      ],
+      "output_kinds": [
+        "ciphertext"
+      ]
+    }
+  ],
+  "execution": [
+    {
+      "ordinal": 1,
       "kind": "compute",
       "op": "add_cc",
       "place": {
@@ -77,15 +120,15 @@
         "index": 0
       },
       "inputs": [
-        "1",
-        "1"
+        "2",
+        "2"
       ],
-      "output": "2"
+      "output": "3"
     }
   ],
   "finalization": [],
   "final_outputs": [
-    "2"
+    "3"
   ],
-  "fingerprint": "sha256:0ba165b24bcef7085fe3fe6d57de6554add10687da9d8b5c67e4ee51d082a4c2"
+  "fingerprint": "sha256:2a7d2dfd6fccae5be7c9caaae86b0bf6b2c6f6881c168e22a1cd6d432b46e306"
 }

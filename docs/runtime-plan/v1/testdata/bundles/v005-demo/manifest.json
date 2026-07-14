@@ -1,0 +1,15 @@
+{
+  "bundle_format_version": 1,
+  "bundle_id": "v005-demo-weights",
+  "version": 1,
+  "context": "ctx-main",
+  "entries": [
+    {
+      "value_id": "1",
+      "name": "demo.mask",
+      "content": "sha256:fdeab9acf3710362bd2658cdc9a29e8f9c757fcf9811603a8c447cd1d9151108",
+      "byte_length": 64
+    }
+  ],
+  "fingerprint": "sha256:881ece04a4184592d106493a781bc6b5afe3b647f39de9befceb13a6a26e4245"
+}

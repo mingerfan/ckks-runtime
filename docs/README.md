@@ -49,7 +49,7 @@ Poseidon 仓库里已有一套单机多卡的静态调度代码（`src/poseidon/
 
 ### 协议规范(权威,机器可检查)
 
-- [RuntimePlan V1 规范](runtime-plan/v1/specification.md):计划文件的字段语义、编码规则、SSA/元信息不变量和指纹计算。配套 [schema.json](runtime-plan/v1/schema.json)、[版本兼容规则](runtime-plan/v1/compatibility.md) 和 [合法/非法样例集](runtime-plan/v1/testdata/README.md)。
+- [RuntimePlan V1 规范](runtime-plan/v1/specification.md):计划文件的字段语义、编码规则、SSA/元信息不变量和指纹计算。配套 [schema.json](runtime-plan/v1/schema.json)、[明文数据包格式](runtime-plan/v1/plaintext-bundle.md)、[版本兼容规则](runtime-plan/v1/compatibility.md) 和 [合法/非法样例集](runtime-plan/v1/testdata/README.md)。
 - [CKKS OperatorSpec V1 规范](operator-spec/v1/specification.md):目标后端的算子能力、level/`scale_log2` 边界、boot profile 和代价模型。配套 [schema.json](operator-spec/v1/schema.json) 和 [占位 profile](operator-spec/v1/profiles/README.md)(CPU eager / GPU lazy)。
 
 协议实现(JSON 读取器、验证器扩展)以规范为准;实现与样例集冲突时,先怀疑实现。

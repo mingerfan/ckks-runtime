@@ -26,9 +26,8 @@
       "id": "1",
       "kind": "ciphertext",
       "place": {
-        "kind": "device",
-        "rank": 0,
-        "index": 0
+        "kind": "host",
+        "rank": 0
       },
       "context": "ctx-main",
       "level": 2,
@@ -40,8 +39,9 @@
       "id": "2",
       "kind": "ciphertext",
       "place": {
-        "kind": "host",
-        "rank": 0
+        "kind": "device",
+        "rank": 0,
+        "index": 0
       },
       "context": "ctx-main",
       "level": 2,
@@ -57,13 +57,26 @@
         "rank": 0
       },
       "context": "ctx-main",
-      "level": 12,
+      "level": 2,
       "scale_log2": 40,
       "ntt": true,
       "components": 2
     },
     {
       "id": "4",
+      "kind": "ciphertext",
+      "place": {
+        "kind": "host",
+        "rank": 0
+      },
+      "context": "ctx-main",
+      "level": 12,
+      "scale_log2": 40,
+      "ntt": true,
+      "components": 2
+    },
+    {
+      "id": "5",
       "kind": "ciphertext",
       "place": {
         "kind": "device",
@@ -81,8 +94,7 @@
     "1"
   ],
   "required_keys": [],
-  "initialization": [],
-  "execution": [
+  "initialization": [
     {
       "ordinal": 0,
       "kind": "transfer",
@@ -93,6 +105,36 @@
       ],
       "outputs": [
         "2"
+      ],
+      "sources": [
+        {
+          "kind": "host",
+          "rank": 0
+        }
+      ],
+      "destinations": [
+        {
+          "kind": "device",
+          "rank": 0,
+          "index": 0
+        }
+      ],
+      "output_kinds": [
+        "ciphertext"
+      ]
+    }
+  ],
+  "execution": [
+    {
+      "ordinal": 1,
+      "kind": "transfer",
+      "transfer_id": "2",
+      "hint": "auto",
+      "inputs": [
+        "2"
+      ],
+      "outputs": [
+        "3"
       ],
       "sources": [
         {
@@ -112,7 +154,7 @@
       ]
     },
     {
-      "ordinal": 1,
+      "ordinal": 2,
       "kind": "compute",
       "op": "boot",
       "place": {
@@ -120,9 +162,9 @@
         "rank": 0
       },
       "inputs": [
-        "2"
+        "3"
       ],
-      "output": "3",
+      "output": "4",
       "attrs": {
         "target_level": 12,
         "target_scale_log2": 40,
@@ -132,15 +174,15 @@
       }
     },
     {
-      "ordinal": 2,
+      "ordinal": 3,
       "kind": "transfer",
-      "transfer_id": "2",
+      "transfer_id": "3",
       "hint": "auto",
       "inputs": [
-        "3"
+        "4"
       ],
       "outputs": [
-        "4"
+        "5"
       ],
       "sources": [
         {
@@ -162,7 +204,7 @@
   ],
   "finalization": [],
   "final_outputs": [
-    "4"
+    "5"
   ],
-  "fingerprint": "sha256:5809c8c6fb7d6fef24f961395a0c2c58fb6f538f90b2b862305fb8228551fe0d"
+  "fingerprint": "sha256:592f266707b59301597a8c45fd3bc5f5494e2b3bb7e5121123184200fe4e67e1"
 }

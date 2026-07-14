@@ -85,9 +85,18 @@ void PlanVerifier::verify(const RuntimePlan &plan) {
     std::unordered_set<ValueId> defined;
     std::unordered_set<ValueId> external;
     for (ValueId id : plan.external_inputs) {
-        if (!desc.values.count(id)) fail("external input has no value descriptor: " + std::to_string(id));
+        const auto it = desc.values.find(id);
+        if (it == desc.values.end()) fail("external input has no value descriptor: " + std::to_string(id));
+        if (it->second->place.kind != PlaceKind::Host)
+            fail("external input must be placed on Host (IO-2): " + std::to_string(id));
         if (!external.insert(id).second) fail("duplicate external input " + std::to_string(id));
         defined.insert(id);
+    }
+
+    if (plan.plaintext_bundle) {
+        if (plan.plaintext_bundle->id.empty() || plan.plaintext_bundle->version < 1 ||
+            plan.plaintext_bundle->fingerprint.empty())
+            fail("invalid plaintext_bundle reference");
     }
 
     std::unordered_set<TransferId> transfers;

@@ -1,5 +1,6 @@
 #include "runtime/json_plan_reader.hpp"
 #include "runtime/utils/sha256.hpp"
+#include "runtime/verifier.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -74,6 +75,7 @@ void test_valid_samples() {
         "v002_mul_rescale_transfer.json",
         "v003_replicate_multi_rank.json",
         "v004_host_boot_emulation.json",
+        "v005_plaintext_bundle.json",
     };
     for (const auto &name : names) {
         const RuntimePlan plan = read_valid(name);
@@ -81,12 +83,14 @@ void test_valid_samples() {
         require(plan.fingerprint_sha256.rfind("sha256:", 0) == 0, name + " fingerprint was not read");
         require(!plan.values.empty(), name + " values were not read");
         require(!plan.final_outputs.empty(), name + " final outputs were not read");
+        require(!plan.initialization.empty(), name + " initialization uploads were not read");
     }
 
     const RuntimePlan gpu = read_valid("v002_mul_rescale_transfer.json");
     require(gpu.target.rescale_mode == RescaleMode::Lazy, "GPU rescale mode was not read");
     require(gpu.target.operator_spec.id == "poseidon-ckks-gpu-v1", "OperatorSpec reference was not read");
-    require(gpu.values.at(1).scale_log2 == 80 && gpu.values.at(1).components == 3,
+    require(!gpu.plaintext_bundle.has_value(), "absent plaintext_bundle must stay empty");
+    require(gpu.values.at(2).scale_log2 == 80 && gpu.values.at(2).components == 3,
             "CKKS value metadata was not read");
     const auto &rescale = std::get<ComputeOp>(gpu.execution.at(2).body);
     const auto &rescale_attrs = std::get<RescaleAttrs>(rescale.attrs);
@@ -106,6 +110,26 @@ void test_valid_samples() {
             boot_attrs.operator_profile == "poseidon-cpu-boot-emulation-v1" &&
             boot_attrs.implementation == BootImplementation::DecryptReencrypt,
             "Boot attrs were not read");
+
+    const RuntimePlan bundled = read_valid("v005_plaintext_bundle.json");
+    require(bundled.plaintext_bundle.has_value(), "plaintext_bundle was not read");
+    require(bundled.plaintext_bundle->id == "v005-demo-weights" &&
+            bundled.plaintext_bundle->version == 1 &&
+            bundled.plaintext_bundle->fingerprint.rfind("sha256:", 0) == 0,
+            "plaintext_bundle reference fields were not read");
+    require(bundled.values.front().kind == ValueKind::Plaintext &&
+            bundled.values.front().place.kind == PlaceKind::Host,
+            "bundled plaintext input must be a Host plaintext value");
+}
+
+void test_external_input_host_only() {
+    for (const auto &name : {std::string("v001_minimal_single_device.json"),
+                             std::string("v005_plaintext_bundle.json")})
+        PlanVerifier::verify(read_valid(name));
+
+    const RuntimePlan bad = RuntimePlanJsonReader::read_file(
+        testdata("invalid", "i013_device_external_input.json").string());
+    expect_throw([&] { PlanVerifier::verify(bad); }, "IO-2");
 }
 
 void test_structural_invalid_samples() {
@@ -147,6 +171,7 @@ int main() {
     try {
         run_test("SHA-256 standard vectors", test_sha256_vectors);
         run_test("valid RuntimePlan V1 samples", test_valid_samples);
+        run_test("external inputs are Host-only (IO-2)", test_external_input_host_only);
         run_test("structural invalid RuntimePlan samples", test_structural_invalid_samples);
         run_test("strict JSON rules", test_strict_json_rules);
         std::cout << "ALL " << tests_run << " JSON TEST GROUPS PASSED\n";

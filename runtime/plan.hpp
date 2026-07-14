@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <iosfwd>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -97,6 +98,13 @@ struct OperatorSpecRef {
     std::string fingerprint;
 };
 
+// 计划顶层可选的明文数据包(权重包)引用,见 runtime-plan/v1/plaintext-bundle.md。
+struct PlaintextBundleRef {
+    std::string id;
+    int version = 0;
+    std::string fingerprint;
+};
+
 struct KeyRequirement {
     KeyKind kind = KeyKind::Secret;
     Place place;
@@ -118,6 +126,7 @@ struct RuntimePlan {
     std::uint64_t plan_id = 0;
     std::string fingerprint_sha256;
     TargetConfig target;
+    std::optional<PlaintextBundleRef> plaintext_bundle;
     std::vector<ValueDesc> values;
     std::vector<ValueId> external_inputs;
     std::vector<KeyRequirement> required_keys;

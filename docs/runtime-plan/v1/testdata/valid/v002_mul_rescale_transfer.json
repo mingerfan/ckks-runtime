@@ -24,9 +24,8 @@
       "id": "1",
       "kind": "ciphertext",
       "place": {
-        "kind": "device",
-        "rank": 0,
-        "index": 0
+        "kind": "host",
+        "rank": 0
       },
       "context": "ctx-main",
       "level": 5,
@@ -44,9 +43,9 @@
       },
       "context": "ctx-main",
       "level": 5,
-      "scale_log2": 80,
+      "scale_log2": 40,
       "ntt": true,
-      "components": 3
+      "components": 2
     },
     {
       "id": "3",
@@ -60,10 +59,24 @@
       "level": 5,
       "scale_log2": 80,
       "ntt": true,
-      "components": 2
+      "components": 3
     },
     {
       "id": "4",
+      "kind": "ciphertext",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "context": "ctx-main",
+      "level": 5,
+      "scale_log2": 80,
+      "ntt": true,
+      "components": 2
+    },
+    {
+      "id": "5",
       "kind": "ciphertext",
       "place": {
         "kind": "device",
@@ -77,7 +90,7 @@
       "components": 2
     },
     {
-      "id": "5",
+      "id": "6",
       "kind": "ciphertext",
       "place": {
         "kind": "device",
@@ -104,10 +117,39 @@
       }
     }
   ],
-  "initialization": [],
-  "execution": [
+  "initialization": [
     {
       "ordinal": 0,
+      "kind": "transfer",
+      "transfer_id": "100",
+      "hint": "auto",
+      "inputs": [
+        "1"
+      ],
+      "outputs": [
+        "2"
+      ],
+      "sources": [
+        {
+          "kind": "host",
+          "rank": 0
+        }
+      ],
+      "destinations": [
+        {
+          "kind": "device",
+          "rank": 0,
+          "index": 0
+        }
+      ],
+      "output_kinds": [
+        "ciphertext"
+      ]
+    }
+  ],
+  "execution": [
+    {
+      "ordinal": 1,
       "kind": "compute",
       "op": "mul_cc",
       "place": {
@@ -116,13 +158,13 @@
         "index": 0
       },
       "inputs": [
-        "1",
-        "1"
+        "2",
+        "2"
       ],
-      "output": "2"
+      "output": "3"
     },
     {
-      "ordinal": 1,
+      "ordinal": 2,
       "kind": "compute",
       "op": "relinearize",
       "place": {
@@ -131,12 +173,12 @@
         "index": 0
       },
       "inputs": [
-        "2"
+        "3"
       ],
-      "output": "3"
+      "output": "4"
     },
     {
-      "ordinal": 2,
+      "ordinal": 3,
       "kind": "compute",
       "op": "rescale",
       "place": {
@@ -145,24 +187,24 @@
         "index": 0
       },
       "inputs": [
-        "3"
+        "4"
       ],
-      "output": "4",
+      "output": "5",
       "attrs": {
         "target_level": 4,
         "target_scale_log2": 40
       }
     },
     {
-      "ordinal": 3,
+      "ordinal": 4,
       "kind": "transfer",
-      "transfer_id": "100",
+      "transfer_id": "101",
       "hint": "auto",
       "inputs": [
-        "4"
+        "5"
       ],
       "outputs": [
-        "5"
+        "6"
       ],
       "sources": [
         {
@@ -185,7 +227,7 @@
   ],
   "finalization": [],
   "final_outputs": [
-    "5"
+    "6"
   ],
-  "fingerprint": "sha256:84683e6b6c1843bdb6aaf138629437cd982174292469b1c820fa654402e6f165"
+  "fingerprint": "sha256:4a3e456f95bf870661b31bd16190bdf776b0b416698ddc7c2d41892215ea6b5a"
 }

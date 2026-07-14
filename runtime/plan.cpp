@@ -1,6 +1,5 @@
 #include "runtime/plan.hpp"
 
-#include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
@@ -129,6 +128,12 @@ std::uint64_t RuntimePlan::fingerprint() const {
     os << ':' << target.operator_spec.version << ':';
     append_string(os, target.operator_spec.fingerprint);
     os << ':' << static_cast<int>(target.rescale_mode) << ':' << static_cast<int>(target.boot_mode);
+    if (plaintext_bundle) {
+        os << ":B";
+        append_string(os, plaintext_bundle->id);
+        os << ':' << plaintext_bundle->version << ':';
+        append_string(os, plaintext_bundle->fingerprint);
+    }
     for (int n : target.device_counts) os << ':' << n;
     for (auto capability : target.required_capabilities) os << ":c" << static_cast<int>(capability);
     for (const auto &v : values) {
@@ -160,6 +165,8 @@ void RuntimePlan::print(std::ostream &out) const {
         << ", rescale=" << to_string(target.rescale_mode)
         << ", boot=" << to_string(target.boot_mode) << ", world=" << target.world_size
         << ", fingerprint=0x" << std::hex << fingerprint() << std::dec << ")\n";
+    if (plaintext_bundle)
+        out << "  plaintext_bundle=" << plaintext_bundle->id << '@' << plaintext_bundle->version << '\n';
     for (const auto &v : values) {
         out << "  %" << v.id << " : " << to_string(v.kind) << " @ " << to_string(v.place)
             << " context=" << v.context << " level=" << v.level

@@ -32,13 +32,15 @@ bool contains_name(std::initializer_list<const char *> names, const std::string 
 }
 
 void require_members(const Json &value, const std::string &path,
-                     std::initializer_list<const char *> names) {
+                     std::initializer_list<const char *> names,
+                     std::initializer_list<const char *> optional_names = {}) {
     if (!value.is_object()) fail(path, "expected object");
     for (const char *name : names) {
         if (!value.contains(name)) fail(path, "missing required field '" + std::string(name) + "'");
     }
     for (const auto &item : value.items()) {
-        if (!contains_name(names, item.key())) fail(path, "unknown field '" + item.key() + "'");
+        if (!contains_name(names, item.key()) && !contains_name(optional_names, item.key()))
+            fail(path, "unknown field '" + item.key() + "'");
     }
 }
 
@@ -240,6 +242,14 @@ CommHint read_comm_hint(const Json &value, const std::string &path) {
 OperatorSpecRef read_operator_spec(const Json &value, const std::string &path) {
     require_members(value, path, {"id", "version", "fingerprint"});
     return OperatorSpecRef{
+        read_string(value.at("id"), path + ".id"),
+        read_positive_int(value.at("version"), path + ".version"),
+        read_fingerprint(value.at("fingerprint"), path + ".fingerprint")};
+}
+
+PlaintextBundleRef read_plaintext_bundle(const Json &value, const std::string &path) {
+    require_members(value, path, {"id", "version", "fingerprint"});
+    return PlaintextBundleRef{
         read_string(value.at("id"), path + ".id"),
         read_positive_int(value.at("version"), path + ".version"),
         read_fingerprint(value.at("fingerprint"), path + ".fingerprint")};
@@ -453,7 +463,8 @@ RuntimePlan convert_plan(const Json &document) {
     require_members(document, "$",
         {"format_version", "plan_id", "fingerprint", "target", "values",
          "external_inputs", "required_keys", "initialization", "execution",
-         "finalization", "final_outputs"});
+         "finalization", "final_outputs"},
+        {"plaintext_bundle"});
 
     RuntimePlan plan;
     const int format_version = read_nonnegative_int(document.at("format_version"), "$.format_version");
@@ -462,6 +473,8 @@ RuntimePlan convert_plan(const Json &document) {
     plan.plan_id = read_id(document.at("plan_id"), "$.plan_id");
     plan.fingerprint_sha256 = read_fingerprint(document.at("fingerprint"), "$.fingerprint");
     plan.target = read_target(document.at("target"), "$.target");
+    if (document.contains("plaintext_bundle"))
+        plan.plaintext_bundle = read_plaintext_bundle(document.at("plaintext_bundle"), "$.plaintext_bundle");
 
     const Json &values = document.at("values");
     if (!values.is_array()) fail("$.values", "expected array");

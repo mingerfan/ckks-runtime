@@ -15,6 +15,7 @@
     "plan_id": { "$ref": "#/$defs/id64" },
     "fingerprint": { "$ref": "#/$defs/fingerprint" },
     "target": { "$ref": "#/$defs/target" },
+    "plaintext_bundle": { "$ref": "#/$defs/plaintextBundleRef" },
     "values": {
       "type": "array",
       "items": { "$ref": "#/$defs/valueDesc" }
@@ -49,6 +50,16 @@
       "type": "integer",
       "minimum": 0,
       "maximum": 2147483647
+    },
+    "plaintextBundleRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "fingerprint"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "version": { "type": "integer", "minimum": 1 },
+        "fingerprint": { "$ref": "#/$defs/fingerprint" }
+      }
     },
     "target": {
       "type": "object",

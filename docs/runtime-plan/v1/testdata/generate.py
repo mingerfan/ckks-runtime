@@ -180,8 +180,9 @@ def comm(ordinal, kind, transfer_id, inputs, outputs, sources, destinations,
 
 
 def plan(plan_id, target, values, external_inputs, required_keys,
-         execution, final_outputs, initialization=None, finalization=None):
-    return with_fingerprint({
+         execution, final_outputs, initialization=None, finalization=None,
+         plaintext_bundle=None):
+    document = {
         "format_version": 1,
         "plan_id": plan_id,
         "target": target,
@@ -192,7 +193,10 @@ def plan(plan_id, target, values, external_inputs, required_keys,
         "execution": execution,
         "finalization": finalization or [],
         "final_outputs": final_outputs,
-    })
+    }
+    if plaintext_bundle is not None:
+        document["plaintext_bundle"] = plaintext_bundle
+    return with_fingerprint(document)
 
 
 def cpu_target(**kw):
@@ -210,53 +214,58 @@ def gpu_target(**kw):
 
 
 # ---------------------------------------------------------------- valid plans
+# IO-2:external_inputs 只允许 Host,进设备一律走显式 transfer(通常放 initialization)。
 
 d00 = dev(0, 0)
+h0 = host(0)
 
 v001 = plan(
-    "1", cpu_target(),
-    values=[value("1", d00), value("2", d00)],
+    "1", cpu_target(required_capabilities=["transfer"]),
+    values=[value("1", h0), value("2", d00), value("3", d00)],
     external_inputs=["1"], required_keys=[],
-    execution=[compute(0, "add_cc", d00, ["1", "1"], "2")],
-    final_outputs=["2"],
+    initialization=[comm(0, "transfer", "1", ["1"], ["2"], [h0], [d00], ["ciphertext"])],
+    execution=[compute(1, "add_cc", d00, ["2", "2"], "3")],
+    final_outputs=["3"],
 )
 
 d01 = dev(0, 1)
 v002 = plan(
     "2", gpu_target(device_counts=[2], required_capabilities=["transfer"]),
     values=[
-        value("1", d00),
-        value("2", d00, scale_log2=80, components=3),
-        value("3", d00, scale_log2=80),
-        value("4", d00, level=4),
-        value("5", d01, level=4),
+        value("1", h0),
+        value("2", d00),
+        value("3", d00, scale_log2=80, components=3),
+        value("4", d00, scale_log2=80),
+        value("5", d00, level=4),
+        value("6", d01, level=4),
     ],
     external_inputs=["1"],
     required_keys=[{"kind": "relin", "place": d00}],
+    initialization=[comm(0, "transfer", "100", ["1"], ["2"], [h0], [d00], ["ciphertext"])],
     execution=[
-        compute(0, "mul_cc", d00, ["1", "1"], "2"),
-        compute(1, "relinearize", d00, ["2"], "3"),
-        compute(2, "rescale", d00, ["3"], "4",
+        compute(1, "mul_cc", d00, ["2", "2"], "3"),
+        compute(2, "relinearize", d00, ["3"], "4"),
+        compute(3, "rescale", d00, ["4"], "5",
                 {"target_level": 4, "target_scale_log2": 40}),
-        comm(3, "transfer", "100", ["4"], ["5"], [d00], [d01], ["ciphertext"]),
+        comm(4, "transfer", "101", ["5"], ["6"], [d00], [d01], ["ciphertext"]),
     ],
-    final_outputs=["5"],
+    final_outputs=["6"],
 )
 
 d10 = dev(1, 0)
 v003 = plan(
     "3", gpu_target(world_size=2, device_counts=[1, 1],
-                    required_capabilities=["replicate"]),
-    values=[value("1", d00), value("2", d10), value("3", host(1))],
+                    required_capabilities=["transfer", "replicate"]),
+    values=[value("1", h0), value("2", d00), value("3", d10), value("4", host(1))],
     external_inputs=["1"], required_keys=[],
+    initialization=[comm(0, "transfer", "1", ["1"], ["2"], [h0], [d00], ["ciphertext"])],
     execution=[
-        comm(0, "replicate", "7", ["1"], ["2", "3"], [d00], [d10, host(1)],
+        comm(1, "replicate", "7", ["2"], ["3", "4"], [d00], [d10, host(1)],
              ["ciphertext", "ciphertext"], hint="broadcast"),
     ],
-    final_outputs=["2", "3"],
+    final_outputs=["3", "4"],
 )
 
-h0 = host(0)
 BOOT_ATTRS = {"target_level": 12, "target_scale_log2": 40, "target_components": 2,
               "operator_profile": "poseidon-cpu-boot-emulation-v1",
               "implementation": "decrypt_reencrypt"}
@@ -265,19 +274,65 @@ v004 = plan(
                     required_capabilities=["transfer", "host_compute",
                                            "boot_decrypt_reencrypt"]),
     values=[
-        value("1", d00, level=2),
-        value("2", h0, level=2),
-        value("3", h0, level=12),
-        value("4", d00, level=12),
+        value("1", h0, level=2),
+        value("2", d00, level=2),
+        value("3", h0, level=2),
+        value("4", h0, level=12),
+        value("5", d00, level=12),
     ],
     external_inputs=["1"],
     required_keys=[{"kind": "secret", "place": h0}],
+    initialization=[comm(0, "transfer", "1", ["1"], ["2"], [h0], [d00], ["ciphertext"])],
     execution=[
-        comm(0, "transfer", "1", ["1"], ["2"], [d00], [h0], ["ciphertext"]),
-        compute(1, "boot", h0, ["2"], "3", BOOT_ATTRS),
-        comm(2, "transfer", "2", ["3"], ["4"], [h0], [d00], ["ciphertext"]),
+        comm(1, "transfer", "2", ["2"], ["3"], [d00], [h0], ["ciphertext"]),
+        compute(2, "boot", h0, ["3"], "4", BOOT_ATTRS),
+        comm(3, "transfer", "3", ["4"], ["5"], [h0], [d00], ["ciphertext"]),
     ],
-    final_outputs=["4"],
+    final_outputs=["5"],
+)
+
+# -------- v005:引用明文数据包(权重包)的推理片段 --------
+
+BUNDLE_DIR = HERE / "bundles" / "v005-demo"
+BUNDLE_DATA = bytes(range(64))
+BUNDLE_CONTENT = hashlib.sha256(BUNDLE_DATA).hexdigest()
+
+bundle_manifest = with_fingerprint({
+    "bundle_format_version": 1,
+    "bundle_id": "v005-demo-weights",
+    "version": 1,
+    "context": "ctx-main",
+    "entries": [
+        {"value_id": "1", "name": "demo.mask",
+         "content": "sha256:" + BUNDLE_CONTENT, "byte_length": len(BUNDLE_DATA)},
+    ],
+})
+data_path = BUNDLE_DIR / "data" / (BUNDLE_CONTENT + ".bin")
+data_path.parent.mkdir(parents=True, exist_ok=True)
+data_path.write_bytes(BUNDLE_DATA)
+print(f"wrote {data_path}")
+write(BUNDLE_DIR / "manifest.json", bundle_manifest)
+
+BUNDLE_REF = {"id": bundle_manifest["bundle_id"], "version": 1,
+              "fingerprint": bundle_manifest["fingerprint"]}
+
+v005 = plan(
+    "5", cpu_target(required_capabilities=["transfer"]),
+    values=[
+        value("1", h0, kind="plaintext", components=1),
+        value("2", h0),
+        value("3", d00, kind="plaintext", components=1),
+        value("4", d00),
+        value("5", d00, scale_log2=80),
+    ],
+    external_inputs=["1", "2"], required_keys=[],
+    initialization=[
+        comm(0, "transfer", "1", ["1"], ["3"], [h0], [d00], ["plaintext"]),
+        comm(1, "transfer", "2", ["2"], ["4"], [h0], [d00], ["ciphertext"]),
+    ],
+    execution=[compute(2, "mul_cp", d00, ["4", "3"], "5")],
+    final_outputs=["5"],
+    plaintext_bundle=BUNDLE_REF,
 )
 
 VALID = {
@@ -285,6 +340,7 @@ VALID = {
     "v002_mul_rescale_transfer.json": v002,
     "v003_replicate_multi_rank.json": v003,
     "v004_host_boot_emulation.json": v004,
+    "v005_plaintext_bundle.json": v005,
 }
 for name, obj in VALID.items():
     write(HERE / "valid" / name, obj)
@@ -320,14 +376,14 @@ p["target"]["boot_mode"] = "native"  # 指令仍是 decrypt_reencrypt
 invalid["i005_boot_mode_mismatch.json"] = refingerprint(p)
 
 p = copy.deepcopy(v004)
-p["values"][2]["level"] = 11  # boot attrs 仍声明 target_level 12
+p["values"][3]["level"] = 11  # boot attrs 仍声明 target_level 12
 invalid["i006_boot_target_desc_mismatch.json"] = refingerprint(p)
 
 p = copy.deepcopy(v001)
-p["values"].append(value("3", d00))
+p["values"].append(value("4", d00))
 p["execution"] = [
-    compute(0, "add_cc", d00, ["3", "3"], "2"),  # 使用尚未定义的 3
-    compute(1, "negate", d00, ["1"], "3"),
+    compute(1, "add_cc", d00, ["4", "4"], "3"),  # 使用尚未定义的 4
+    compute(2, "negate", d00, ["2"], "4"),
 ]
 invalid["i007_use_before_define.json"] = refingerprint(p)
 
@@ -341,7 +397,7 @@ p["comment"] = "unknown field must be rejected"
 invalid["i009_unknown_field.json"] = refingerprint(p)
 
 p = copy.deepcopy(v001)
-p["values"][0]["place"] = h0  # 指令 place 仍是 device(0,0)
+p["values"][1]["place"] = h0  # 使用它的指令 place 仍是 device(0,0)
 invalid["i010_place_mismatch.json"] = refingerprint(p)
 
 p = copy.deepcopy(v004)
@@ -352,6 +408,20 @@ p = copy.deepcopy(v001)
 fp = p["target"]["operator_spec"]["fingerprint"]
 p["target"]["operator_spec"]["fingerprint"] = fp[:-1] + ("0" if fp[-1] != "0" else "1")
 invalid["i012_operator_spec_fingerprint_mismatch.json"] = refingerprint(p)
+
+# 外部输入直接声明在 Device 上,没有任何上传指令(违反 IO-2)
+invalid["i013_device_external_input.json"] = plan(
+    "13", cpu_target(),
+    values=[value("1", d00), value("2", d00)],
+    external_inputs=["1"], required_keys=[],
+    execution=[compute(0, "add_cc", d00, ["1", "1"], "2")],
+    final_outputs=["2"],
+)
+
+p = copy.deepcopy(v005)
+fp = p["plaintext_bundle"]["fingerprint"]
+p["plaintext_bundle"]["fingerprint"] = fp[:-1] + ("0" if fp[-1] != "0" else "1")
+invalid["i014_plaintext_bundle_fingerprint_mismatch.json"] = refingerprint(p)
 
 for name, obj in invalid.items():
     write(HERE / "invalid" / name, obj)

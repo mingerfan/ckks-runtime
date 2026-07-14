@@ -13,6 +13,8 @@
 
 **同一个版本号下不允许"看文件内容猜格式"**;也不靠"缺了某字段"或"解析失败"推断这是旧格式文件。版本判断只看 `format_version` 一个字段。
 
+> **V1 冻结前的修订记录**:2026-07,在 V1 尚无外部使用者阶段对其做过一次原地增补(未升版本号):新增可选顶层字段 `plaintext_bundle` 与明文数据包格式(plaintext-bundle.md),新增检查 IO-2(external_inputs 必须在 Host)与 BND-1,全部样例随之重生成。此后 V1 视为冻结,再有此类变化必须升 `format_version`。
+
 ## 2. 修改流程
 
 1. 先改 Runtime 仓库里的规范和 Schema,同步增补 `testdata/` 的合法/非法样例;

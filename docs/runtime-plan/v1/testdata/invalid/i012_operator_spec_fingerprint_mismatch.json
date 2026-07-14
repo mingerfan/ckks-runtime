@@ -15,16 +15,17 @@
     "device_counts": [
       1
     ],
-    "required_capabilities": []
+    "required_capabilities": [
+      "transfer"
+    ]
   },
   "values": [
     {
       "id": "1",
       "kind": "ciphertext",
       "place": {
-        "kind": "device",
-        "rank": 0,
-        "index": 0
+        "kind": "host",
+        "rank": 0
       },
       "context": "ctx-main",
       "level": 5,
@@ -45,16 +46,59 @@
       "scale_log2": 40,
       "ntt": true,
       "components": 2
+    },
+    {
+      "id": "3",
+      "kind": "ciphertext",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "context": "ctx-main",
+      "level": 5,
+      "scale_log2": 40,
+      "ntt": true,
+      "components": 2
     }
   ],
   "external_inputs": [
     "1"
   ],
   "required_keys": [],
-  "initialization": [],
-  "execution": [
+  "initialization": [
     {
       "ordinal": 0,
+      "kind": "transfer",
+      "transfer_id": "1",
+      "hint": "auto",
+      "inputs": [
+        "1"
+      ],
+      "outputs": [
+        "2"
+      ],
+      "sources": [
+        {
+          "kind": "host",
+          "rank": 0
+        }
+      ],
+      "destinations": [
+        {
+          "kind": "device",
+          "rank": 0,
+          "index": 0
+        }
+      ],
+      "output_kinds": [
+        "ciphertext"
+      ]
+    }
+  ],
+  "execution": [
+    {
+      "ordinal": 1,
       "kind": "compute",
       "op": "add_cc",
       "place": {
@@ -63,15 +107,15 @@
         "index": 0
       },
       "inputs": [
-        "1",
-        "1"
+        "2",
+        "2"
       ],
-      "output": "2"
+      "output": "3"
     }
   ],
   "finalization": [],
   "final_outputs": [
-    "2"
+    "3"
   ],
-  "fingerprint": "sha256:41f364d603debd3cae61e51020b8a5640899105fe683dd9b706fa4bb1c430aec"
+  "fingerprint": "sha256:3e1993c454deaffe4d589621793af39aac26b3cfedde72370abcf44db621092b"
 }

@@ -1,6 +1,6 @@
 {
   "format_version": 1,
-  "plan_id": "1",
+  "plan_id": "13",
   "target": {
     "target_id": "poseidon-ckks-cpu",
     "capability_version": 1,
@@ -15,17 +15,16 @@
     "device_counts": [
       1
     ],
-    "required_capabilities": [
-      "transfer"
-    ]
+    "required_capabilities": []
   },
   "values": [
     {
       "id": "1",
       "kind": "ciphertext",
       "place": {
-        "kind": "host",
-        "rank": 0
+        "kind": "device",
+        "rank": 0,
+        "index": 0
       },
       "context": "ctx-main",
       "level": 5,
@@ -46,59 +45,16 @@
       "scale_log2": 40,
       "ntt": true,
       "components": 2
-    },
-    {
-      "id": "3",
-      "kind": "ciphertext",
-      "place": {
-        "kind": "device",
-        "rank": 0,
-        "index": 0
-      },
-      "context": "ctx-main",
-      "level": 5,
-      "scale_log2": 40,
-      "ntt": true,
-      "components": 2
     }
   ],
   "external_inputs": [
     "1"
   ],
   "required_keys": [],
-  "initialization": [
-    {
-      "ordinal": 0,
-      "kind": "transfer",
-      "transfer_id": "1",
-      "hint": "auto",
-      "inputs": [
-        "1"
-      ],
-      "outputs": [
-        "2"
-      ],
-      "sources": [
-        {
-          "kind": "host",
-          "rank": 0
-        }
-      ],
-      "destinations": [
-        {
-          "kind": "device",
-          "rank": 0,
-          "index": 0
-        }
-      ],
-      "output_kinds": [
-        "ciphertext"
-      ]
-    }
-  ],
+  "initialization": [],
   "execution": [
     {
-      "ordinal": 1,
+      "ordinal": 0,
       "kind": "compute",
       "op": "add_cc",
       "place": {
@@ -107,15 +63,15 @@
         "index": 0
       },
       "inputs": [
-        "2",
-        "2"
+        "1",
+        "1"
       ],
-      "output": "3"
+      "output": "2"
     }
   ],
   "finalization": [],
   "final_outputs": [
-    "3"
+    "2"
   ],
-  "fingerprint": "sha256:dd2356f68c399b53e55ba09b3a8b20e4e9135e407521e6b7c1c3662f0b71d9e0"
+  "fingerprint": "sha256:c7b65e7d252efb53f99b14903ae34cf6fbd9944494dd2919f4f065a25e2d9aaa"
 }

@@ -17,12 +17,26 @@
       1
     ],
     "required_capabilities": [
+      "transfer",
       "replicate"
     ]
   },
   "values": [
     {
       "id": "1",
+      "kind": "ciphertext",
+      "place": {
+        "kind": "host",
+        "rank": 0
+      },
+      "context": "ctx-main",
+      "level": 5,
+      "scale_log2": 40,
+      "ntt": true,
+      "components": 2
+    },
+    {
+      "id": "2",
       "kind": "ciphertext",
       "place": {
         "kind": "device",
@@ -36,7 +50,7 @@
       "components": 2
     },
     {
-      "id": "2",
+      "id": "3",
       "kind": "ciphertext",
       "place": {
         "kind": "device",
@@ -50,7 +64,7 @@
       "components": 2
     },
     {
-      "id": "3",
+      "id": "4",
       "kind": "ciphertext",
       "place": {
         "kind": "host",
@@ -67,19 +81,48 @@
     "1"
   ],
   "required_keys": [],
-  "initialization": [],
-  "execution": [
+  "initialization": [
     {
       "ordinal": 0,
-      "kind": "replicate",
-      "transfer_id": "7",
-      "hint": "broadcast",
+      "kind": "transfer",
+      "transfer_id": "1",
+      "hint": "auto",
       "inputs": [
         "1"
       ],
       "outputs": [
-        "2",
-        "3"
+        "2"
+      ],
+      "sources": [
+        {
+          "kind": "host",
+          "rank": 0
+        }
+      ],
+      "destinations": [
+        {
+          "kind": "device",
+          "rank": 0,
+          "index": 0
+        }
+      ],
+      "output_kinds": [
+        "ciphertext"
+      ]
+    }
+  ],
+  "execution": [
+    {
+      "ordinal": 1,
+      "kind": "replicate",
+      "transfer_id": "7",
+      "hint": "broadcast",
+      "inputs": [
+        "2"
+      ],
+      "outputs": [
+        "3",
+        "4"
       ],
       "sources": [
         {
@@ -107,8 +150,8 @@
   ],
   "finalization": [],
   "final_outputs": [
-    "2",
-    "3"
+    "3",
+    "4"
   ],
-  "fingerprint": "sha256:9561f34c3c79f316dab39ba9734780c36306ef03032c70b04260d0f83b3ed4d6"
+  "fingerprint": "sha256:762c3725e362850055e78d798ab5119ba53890ecd1dddb11347b44119168b916"
 }

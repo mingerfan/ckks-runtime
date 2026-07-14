@@ -6,12 +6,17 @@
 
 ## valid
 
+所有 valid 计划的外部输入都声明在 Host,由 `initialization` 阶段的显式 transfer 上传到设备(IO-2)。
+
 | 文件 | 覆盖内容 |
 | --- | --- |
-| `v001_minimal_single_device.json` | 最小计划:单 rank 单设备,一条 `add_cc`(输入自加),CPU eager spec |
-| `v002_mul_rescale_transfer.json` | GPU lazy spec:`mul_cc`(scale 相加、分量 2+2−1=3)→ `relinearize`(需 relin key)→ `rescale`(显式 target)→ 跨卡 `transfer` |
-| `v003_replicate_multi_rank.json` | 2 个 rank:`replicate` 一发两收(Device(1,0) + Host(1)),broadcast hint |
-| `v004_host_boot_emulation.json` | `decrypt_reencrypt` boot 全流程:Device→Host transfer、Host boot(需 secret key、引用 boot profile)、Host→Device 回传,能力声明齐全 |
+| `v001_minimal_single_device.json` | 最小计划:单 rank 单设备,Host 输入经 init transfer 上卡,一条 `add_cc`(输入自加),CPU eager spec |
+| `v002_mul_rescale_transfer.json` | GPU lazy spec:init 上传 → `mul_cc`(scale 相加、分量 2+2−1=3)→ `relinearize`(需 relin key)→ `rescale`(显式 target)→ 跨卡 `transfer` |
+| `v003_replicate_multi_rank.json` | 2 个 rank:init 上传后 `replicate` 一发两收(Device(1,0) + Host(1)),broadcast hint |
+| `v004_host_boot_emulation.json` | `decrypt_reencrypt` boot 全流程:init 上传、Device→Host transfer、Host boot(需 secret key、引用 boot profile)、Host→Device 回传,能力声明齐全 |
+| `v005_plaintext_bundle.json` | 引用明文数据包(`bundles/v005-demo/`):明文+密文双输入经 init 上传,`mul_cp`,顶层 `plaintext_bundle` 指纹引用 |
+
+`bundles/v005-demo/` 是 v005 引用的最小明文数据包(manifest + 一个内容寻址数据文件),格式见 [plaintext-bundle.md](../plaintext-bundle.md),同样由 `generate.py` 维护。
 
 ## invalid
 
@@ -29,7 +34,9 @@
 | `i010_place_mismatch.json` | 值声明在 Host,指令在 Device 上用它 | PLACE-1 |
 | `i011_missing_required_key.json` | 有 `decrypt_reencrypt` boot 却没声明 Host secret key | TGT-2 |
 | `i012_operator_spec_fingerprint_mismatch.json` | `operator_spec.fingerprint` 与持有的 spec 副本不符 | SPEC-1 |
+| `i013_device_external_input.json` | 外部输入直接声明在 Device 上,无上传指令 | IO-2 |
+| `i014_plaintext_bundle_fingerprint_mismatch.json` | `plaintext_bundle.fingerprint` 与 `bundles/v005-demo/` 清单不符 | BND-1 |
 
-除 `i008`(错误本身就是指纹)外,所有 invalid 文件的指纹对其内容都是**正确**的——保证实现拒绝它们的原因恰好是表中那一个错误,而不是顺带的指纹不符。
+除 `i008`(错误本身就是指纹)外,所有 invalid 文件的指纹对其内容都是**正确**的——保证实现拒绝它们的原因恰好是表中那一个错误,而不是顺带的指纹不符。`i012`/`i014` 需要读取方持有对应的 spec/bundle 副本才能发现,属于 preflight 检查。
 
 结构类错误(i001/i002/i004/i009)应当已被 `schema.json` 拦截;语义类错误(SSA、元信息、一致性)需要读取实现自己检查——Schema 只是第一道网,不是全部。
