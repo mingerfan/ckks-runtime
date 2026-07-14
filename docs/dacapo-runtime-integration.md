@@ -21,7 +21,10 @@
 ~~~text
 Dacapo
   CKKS 优化 / bootstrap 安排 / scale 管理
-  -> 面向 Poseidon 的 lazy-rescale 下沉
+  -> 按目标配置做 CKKS 合法化
+     |- CPU:普通 rescale
+     |- GPU:按 OperatorSpec 启用 lazy-rescale
+     `- 可选的 GPU boot -> CPU 解密再加密模拟
   -> 决定每条指令放在哪个进程、哪张卡(placement)
   -> 把所有数据搬运写成显式指令
   -> 输出 RuntimePlan 文件
@@ -32,7 +35,7 @@ Runtime
   -> 调 Api 完成实际计算和通信
        |- VecApi          (明文 std::vector,用来测试)
        |- PoseidonCpuApi  (Poseidon CPU 算子)
-       `- PoseidonGpuApi  (Poseidon GPU 算子)
+       `- PoseidonGpuApi  (GPU 算子 + 计划明确要求的 Host 算子)
 ~~~
 
 Runtime 不反向依赖 Dacapo 或 Poseidon。Poseidon 只依赖 Runtime;Dacapo 只在生成计划和跑编译集成测试时出现。
@@ -44,6 +47,7 @@ Runtime 不反向依赖 Dacapo 或 Poseidon。Poseidon 只依赖 Runtime;Dacapo 
 ~~~text
 ckks-runtime/
 |- docs/runtime-plan/           # 计划文件格式的规范文档
+|- docs/operator-spec/          # CKKS 算子参数、约束和代价模型的规范
 |- runtime/                     # 计划类型、验证器、执行器
 |- api/                         # VecApi、Mock、MPI 等接口实现
 |- testing/                     # 计划构造器、参考执行、差分比较
@@ -103,7 +107,14 @@ docs/runtime-plan/v1/
 `- testdata/
    |- valid/              # 所有实现都必须接受的样例文件
    `- invalid/            # 所有实现都必须拒绝的样例文件
+
+docs/operator-spec/v1/
+|- specification.md       # CKKS 参数、算子元信息变化和代价模型
+|- schema.json            # OperatorSpec 的 JSON Schema
+`- profiles/              # 集成测试固定使用的 Poseidon CPU/GPU 配置
 ~~~
+
+OperatorSpec 的字段含义和 Schema 由 Runtime 仓库维护,因为 Runtime 也要按同一规则验证计划。具体的 Poseidon CPU/GPU 数值来自 Poseidon 的实现和测量结果;Runtime 仓库只固定一份已经联调通过的副本。Dacapo 负责读取 spec,不拥有也不猜这些数值。
 
 两边的分工:
 
@@ -122,18 +133,27 @@ docs/runtime-plan/v1/
 
 ## 5. V1 协议要写清楚哪些内容
 
+V1 RuntimePlan 对应 `dialect-design.md` 里的**可执行 CKKS**阶段:placement 已完成,通信也已经显式化。逻辑 CKKS、已分配 CKKS 和 Dacapo 自己的分析属性都属于编译器内部表示,不直接进入协议。Dacapo 把可执行 CKKS 写成 JSON,Runtime 再把 JSON 读成自己的 C++ 结构。C++ `plan.hpp` 只是 Runtime 的内部类型,不是跨仓库契约。
+
+V1 只需要一份 JSON 协议,不要求再造一个 MLIR runtime dialect。如果以后确实有多个 MLIR 消费方,再讨论是否增加该 dialect。
+
 ### 5.1 文件头和目标环境
 
 - `format_version`:文件格式版本号;
 - `plan_id`:这份计划的标识;
 - 计划内容的指纹(fingerprint):对计划的语义内容算一个稳定的哈希,多进程执行时各进程比对指纹,确认大家拿的是同一份计划;
 - `target_id`:目标后端家族,如 `"poseidon-ckks-gpu"`;
-- `capability_version`:该后端支持的算子集合、lazy-rescale 行为和元信息规则的版本;
+- `capability_version`:Runtime Api 支持的算子、Place 和通信能力版本;
+- `operator_spec`:包含 id、version 和 fingerprint,指向编译这份计划时使用的 CKKS 算子规则,见 5.5;
+- `rescale_mode`:本计划采用 `eager` 还是 `lazy` rescale;
+- `boot_mode`:使用原生 boot,还是明确选择 CPU 解密再加密模拟;
 - `world_size`:进程(rank)数量;
 - 每个 rank 的设备数量;
 - 计划用到的 Api 能力集合。
 
-`format_version` 管文件长什么样,`target_id` + `capability_version` 管"这个后端会算什么"。Runtime 只接受自己明确认识的组合,遇到不认识的版本或目标就直接报错退出——不猜,不降级,不尝试用旧逻辑碰运气。
+`format_version` 管文件长什么样,`target_id` + `capability_version` 管"Runtime 能执行什么",OperatorSpec 管"这些 CKKS 算子怎样改变 level 和 `scale_log2`、需要多少 level、代价是多少"。Runtime 只接受自己明确认识的组合,遇到不认识的版本、目标、OperatorSpec 或模式就直接报错退出——不猜,不降级,不尝试用旧逻辑碰运气。
+
+`rescale_mode` 和 `boot_mode` 这两个头部字段是**冗余摘要,不是权威**:rescale 模式的权威是 OperatorSpec,boot 实现方式的权威是每条 Boot 指令自己的 `implementation` 属性。Runtime 必须交叉校验三处一致——头部说 eager 而 spec 说 lazy,或头部说原生 boot 而某条指令写着 `decrypt_reencrypt`,都直接拒绝计划。留着这两个字段只是为了让人和工具不用扫全文件就能看出计划的形态。
 
 ### 5.2 每个值(Value)的描述
 
@@ -143,15 +163,17 @@ docs/runtime-plan/v1/
 - 是明文还是密文;
 - 它在哪(唯一的 Place,见 5.3);
 - 属于哪套 CKKS 参数(context 标识);
-- level(还剩几层乘法深度);
-- scale(编码放大系数);
+- `level`:当前在模数链中的层号,使用非负整数。较大的值表示还保留更多 RNS 模数;Rescale 或 ModSwitch 后 level 下降。它不是浮点数,也不写成 `2^x`;
+- `scale_log2`:scale 的二进制指数,使用非负整数。`scale_log2 = 40` 表示逻辑 scale 为 `2^40`,协议里不传 `2^40` 的浮点值;
 - 是否处于 NTT 形式;
 - 密文分量(components)数量;
 - 其他会影响"这个算子能不能作用在这个值上"或"搬运时要复制多少数据"的元信息。
 
-**和现状的差距要心里有数**:本仓库现在的 `ValueDesc` 只有 id、明密文类型和位置三个字段,level/scale/NTT/分量数这些目前都活在 VecApi 的值对象里,没进计划协议。所以第一阶段的工作不只是"加个 JSON 读写",还包括把这些元信息字段提升到 `ValueDesc` 和验证器里。
+这里必须把两个词分清楚。Dacapo 当前的 Earth 类型本来就分别保存整数 `scale` 和整数 `level`;它的 `scale` 实际表示指数,SEAL 解释器也是到执行时才计算 `pow(2, scale)`。V1 把这个字段明确命名为 `scale_log2`,避免把它误认为浮点 scale,也避免和 level 混淆。
 
-scale 是浮点数,协议必须规定它的精确编码方式,不能依赖 JSON 库默认的浮点打印(不同库打印同一个 double 的文本可能不一样,会导致指纹不稳定)。候选方案:按 IEEE-754 位模式存整数、用十六进制浮点文本,或者如果目标语义允许,只存 scale 的指数。定 V1 规范时必须三选一。
+Dacapo 内部还有一个容易踩坑的方向差异:Earth 分析阶段的 level 会随着 rescale 增加,而下降到 CKKS PolyType 后会换算成“剩余模数链层号”,rescale 后下降。RuntimePlan V1 采用后者。导出器必须写最终 CKKS 层号,不能把 Earth 的原始 level 数字直接抄进 JSON。
+
+**和现状的差距要心里有数**:本仓库现在的 `ValueDesc` 只有 id、明密文类型和位置三个字段,level、scale、NTT、分量数这些目前都活在 VecApi 的值对象里,而且 VecApi 仍用 `double` 保存 scale。所以第一阶段不只是"加个 JSON 读写",还要把 CKKS 元信息提升到 `ValueDesc` 和验证器,并把协议侧及参考实现侧的 scale 改为整数 `scale_log2`。V1 协议和计划指纹中不允许出现浮点 scale。
 
 ### 5.3 位置(Place)
 
@@ -172,12 +194,42 @@ Device(rank=N,index=M)   # 第 N 个进程的第 M 张卡
 - 算什么(算子种类);
 - 输入输出的 ValueId;
 - 在哪算(唯一的 Place);
-- 算子参数:旋转步数、rescale 目标、bootstrap 目标等;
-- 该目标后端特有、但已被协议明确定义的属性。
+- 按算子类型定义的参数,不能用一张含义不明的通用整数表;
+- 该目标后端特有、但已被协议和 OperatorSpec 明确定义的 profile 引用。
+
+V1 至少把这些参数写死:
+
+- Rotate:`steps`;
+- Rescale:`target_level` 和 `target_scale_log2`;
+- ModSwitch:`target_level`;
+- Boot:`target_level`、`target_scale_log2`、`target_components`、`operator_profile` 和 `implementation`。`implementation` 至少区分原生 boot 与 `decrypt_reencrypt` 模拟。V1 Boot 保持 context 和 polynomial degree 不变。
+
+算子输出的 `ValueDesc` 必须和这些目标参数一致。例如 Boot 声明输出到 level 6、`scale_log2` 40、2 个分量,输出值描述也必须是同一个 context、level 6、`scale_log2` 40、2 个分量。Runtime 发现两处不一致时直接拒绝计划。
+
+V1 规范还要列出一份**导出前必须消除的算子清单**:可执行 CKKS 的算子集合必须和 RuntimePlan 的算子集合严格相等。像 `upscale` 这类编译器内部算子(Dacapo 已有 `UpscaleToMulcp` 把它下沉成明文乘法)必须在导出前消掉;导出器遇到集合之外的算子就是它自己的 bug,报错而不是发明新编码。
 
 Runtime 拿到指令就照着执行:不看输入在哪来猜测该在哪张卡上算,也不发现"输入不在本地"就好心帮忙搬一趟。所有搬运必须是编译器写下的显式指令,否则就是编译器的 bug,应该报错暴露而不是被运行时兜底掩盖。
 
-### 5.5 通信指令
+### 5.5 CKKS OperatorSpec
+
+Dacapo 现在的 profile JSON 已经混合保存了 `rescalingFactor`、level 上下界、bootstrap level 范围、每个算子的延迟表和噪声表。接 Poseidon GPU 后,boot 内部是否使用 lazy-rescale、受 RNS 单模数 bit 数限制后实际要消耗多少 level,也会进入这类配置。继续把这些数据散落在 pass 参数或代码常量里,编译结果很难复现。
+
+因此把目标相关的 CKKS 算子数据独立成一份有版本的 OperatorSpec。它至少要描述:
+
+- `spec_id`、版本和内容指纹;
+- context、poly degree、RNS 模数链和单模数 bit 数限制;
+- scale 的表示方式。V1 固定为整数 `scale_log2`;
+- 该 profile 使用 eager 还是 lazy rescale;
+- 每种算子是否支持、合法输入范围、输出元信息规则和代价;
+- 噪声模型:schema 要明确规定它是必填还是可选、缺省时编译器怎么处理。现状是 CPU profile 有噪声表而 GPU profile 没有——这是漂移不是设计,新 schema 不允许再用"缺字段"来表达含义;
+- Boot 的独立 profile:合法输入 level、目标 level/`scale_log2`、内部 rescale 模式、实际 level 消耗和代价;
+- CPU 解密再加密模拟需要的 Host 能力和密钥要求。
+
+CPU 和 GPU 使用不同的 OperatorSpec。Poseidon CPU 不要求 lazy-rescale,CPU profile 使用 eager 模式;当前受低 bit RNS 限制的 Poseidon GPU profile 明确使用 lazy 模式。也就是说,lazy-rescale Pass 对整个 Dacapo 编译器是可选项,但选中这个 GPU profile 后就是必选项。GPU boot 的 level 消耗不能沿用 CPU 数值,必须以所选 GPU boot profile 为准。如果内部实现或 RNS bit 限制改变了消耗,就更新 OperatorSpec 版本或 profile,不能悄悄改变同一版本的含义。
+
+OperatorSpec 是 Dacapo 的编译输入,不是让 Runtime 临场重新规划的配置。RuntimePlan 文件头记录它的 id、版本和指纹,每个值和算子再记录已经算好的具体 level、`scale_log2` 和 profile。Runtime 只验证这些结果与自己支持的 profile 相符,不会根据 OperatorSpec 帮编译器补 Rescale 或重算 boot 位置。
+
+### 5.6 通信指令
 
 V1 支持两种:
 
@@ -195,7 +247,9 @@ V1 支持两种:
 
 `outputs[i]`、`destinations[i]`、输出类型三个列表必须一一对应。hint 只是建议——Api 可以选别的等价实现,但不管怎么实现,通信完成后"哪些值出现在哪些位置"必须和计划写的一致。
 
-### 5.6 输入输出和生命周期
+Transfer 和 Replicate 必须保持 CKKS 数学值及其元信息不变。CPU/GPU 表示可以在 Api 内部转换,但 context、level、`scale_log2`、NTT 状态和分量数不能在搬运时悄悄变化。
+
+### 5.7 输入输出和生命周期
 
 计划还要写明:
 
@@ -205,6 +259,8 @@ V1 支持两种:
 - 常量和模型权重这类大块数据的引用方式。
 
 计划文件只描述"计划"本身,不规定 Poseidon GPU 对象在显存里的内存布局。常量数据(比如模型权重)可以放在独立的文件里,计划中用稳定的 ID 引用;那些文件的格式单独定义,不塞进本协议。
+
+**密钥不进计划文件**。secret key(`decrypt_reencrypt` boot 在 Host 上要用)、galois key(Rotate 要用)、relinearization key 这些都是 Api 实例的构造配置,由部署方在创建 Api 时提供,协议里不出现密钥内容或路径。计划最多声明"这份计划需要哪几类密钥、在哪些位置可用",让 Runtime 的执行前检查能对着 Api 的实际配置把关——缺 key 要在执行前发现,而不是跑到一半才炸。
 
 ## 6. V1 用什么文件格式
 
@@ -221,9 +277,17 @@ V1 支持两种:
 {
   "format_version": 1,
   "plan_id": "42",
+  "fingerprint": "sha256:...",
   "target": {
     "target_id": "poseidon-ckks-gpu",
     "capability_version": 1,
+    "operator_spec": {
+      "id": "poseidon-ckks-gpu-v1",
+      "version": 1,
+      "fingerprint": "sha256:..."
+    },
+    "rescale_mode": "lazy",
+    "boot_mode": "decrypt_reencrypt",
     "world_size": 2,
     "device_counts": [2, 2]
   },
@@ -241,14 +305,14 @@ V1 支持两种:
 - 64 位整数是否用十进制字符串编码(很多 JSON 工具把大整数当 double 处理,会悄悄丢精度);
 - 枚举用固定名字还是固定数字;
 - 读到不认识的字段怎么办,缺字段怎么办;
-- 浮点数的精确表示(见 5.2);
+- `level` 和 `scale_log2` 只接受非负整数,拒绝浮点数和字符串形式的 `2^x`;
 - 字符串编码;
 - 指纹以什么为输入计算——必须基于解析后的语义内容,和缩进、空格、字段顺序无关,否则格式化一下文件指纹就变了;
 - 数组的顺序有没有含义。
 
 如果以后确认 JSON 的解析速度或文件体积真成了瓶颈,再为新的 `format_version` 定义二进制格式。同一个版本号下不允许"看文件内容猜格式"。
 
-## 7. Dacapo 这边要做什么(含一个必须先做的决策)
+## 7. Dacapo 这边要做什么
 
 ### 7.1 目标形态
 
@@ -257,18 +321,63 @@ Dacapo 新增一条可选的 Poseidon 编译管线:
 ~~~text
 CKKS 逻辑优化
 -> bootstrap 安排 / scale 管理
--> 面向 Poseidon 的 lazy-rescale 下沉
+-> 读取 TargetSpec 和 OperatorSpec
+-> 按目标选择 eager 或 lazy rescale
+-> 按需把 GPU 原生 boot 改成 CPU 解密再加密模拟
 -> 决定每条指令的 rank 和设备(placement)
 -> 插入显式的 Transfer/Replicate
 -> 生成端自检
 -> 输出 RuntimePlan 文件
 ~~~
 
-关于 lazy-rescale 放哪一层,判断标准是:**它改不改计划的可观察内容**。如果它会移动 Rescale 的位置、改变 level/scale、增减算子或改变值的生存期,就必须在 placement 之前、在 Dacapo 里做——因为这些变化影响计算量、显存占用和通信量,placement 需要看到真实的代价。如果它只是不改变语义的 GPU kernel 提交技巧,就留在 PoseidonGpuApi 内部,协议里根本不出现。
+lazy-rescale 不是所有目标都必须打开的全局规则:
 
-Dacapo 通过一份声明式的目标描述(TargetSpec)了解硬件:CPU 还是 GPU、几个进程几张卡、拓扑和带宽、各算子和通信的代价、支持的算子集合,以及对应的 `target_id` 和 `capability_version`。Dacapo 不 include 任何 Poseidon 头文件,也不调用 Poseidon 的运行时接口。
+- Poseidon CPU 不要求 lazy-rescale,CPU OperatorSpec 使用 eager 模式;
+- 当前低 bit Poseidon GPU OperatorSpec 声明 `rescale_mode=lazy`,选中该 profile 时 Dacapo 必须启用对应 pass;
+- 同一个 Dacapo 编译入口通过 spec 选择模式,不维护两套互相漂移的编译器代码。
 
-### 7.2 已定决策:MLIR 原生产出,HEVM 整条路退役
+关于 lazy-rescale 放哪一层,判断标准是:**它改不改计划的可观察内容**。如果它会移动 Rescale 的位置、改变 level/`scale_log2`、增减算子或改变值的生存期,就必须在 placement 之前、在 Dacapo 里做——因为这些变化影响计算量、显存占用和通信量,placement 需要看到真实代价。如果它只是一个不改变这些内容的 GPU kernel 实现细节,才留在 PoseidonGpuApi 内部。
+
+Mul、Rescale 等算子的外部元信息变化由计划明确写出。Boot 内部的 lazy-rescale 不会展开成一长串 RuntimePlan 指令,但它造成的合法输入范围、实际 level 消耗和输出元信息必须由所选 boot profile 明确给出。Dacapo 按该 profile 规划,Runtime 和 PoseidonApi 按同一个 profile 校验和执行。
+
+Dacapo 通过两份声明式配置了解目标:
+
+- TargetSpec 描述 CPU/GPU、进程和设备数量、拓扑、带宽以及 `target_id`/`capability_version`;
+- OperatorSpec 描述 CKKS 参数、算子支持范围、元信息变化、lazy-rescale 和 boot profile。
+
+Dacapo 不 include 任何 Poseidon 头文件,也不调用 Poseidon 的运行时接口。
+
+### 7.2 可选的 GPU boot CPU 模拟 Pass
+
+Poseidon GPU 原生 boot 还不完善时,Dacapo 提供一个显式开关,例如 `boot_mode=decrypt_reencrypt`。打开后,目标合法化 Pass 把 GPU 上的原生 Boot 改成一个只能放在 Host 的 Boot,其 `implementation` 明确写成 `decrypt_reencrypt`。这个 Pass 要在 placement 之前运行,让 placement 和通信显式化看到真实的数据搬运成本。
+
+通信显式化之后,计划形态应当类似:
+
+~~~text
+%host_in  = Transfer %gpu_in  Device -> Host
+%host_out = Boot %host_in {
+  place = Host,
+  implementation = decrypt_reencrypt,
+  target_level = L,
+  target_scale_log2 = S,
+  target_components = 2,
+  operator_profile = "poseidon-cpu-boot-emulation-v1"
+}
+%gpu_out  = Transfer %host_out Host -> Device
+~~~
+
+Host 上的实现步骤是:用 Poseidon CPU 路径解密和解码,再按目标 context、`target_level` 和 `target_scale_log2` 编码并重新加密。最后一条 Transfer 只负责把这个已经符合 GPU 参数的密文转成 GPU 表示并上传,不能再次改变 level 或 `scale_log2`。
+
+这里有四条硬规则:
+
+1. 这是测试和联调用的 boot 模拟,会用到 secret key,并让明文短暂出现在 Host 内存中,不能当成安全的生产 boot;
+2. Runtime 不会在 GPU Boot 失败后偷偷走这条路。是否使用模拟必须由 Dacapo Pass 明确写进计划;
+3. Device→Host 和 Host→Device 都是普通的显式 Transfer,各自产生新的 ValueId;
+4. Runtime 执行一份计划时只持有一个 Api 实例。GPU 目标的 PoseidonGpuApi 需要组合 Poseidon CPU 能力来执行这个 Host Boot,而不是让 Runtime 同时调度两个互不相关的 Api。
+
+不开该 Pass 时,计划保留原生 GPU Boot。如果目标 capability 或 boot profile 不支持它,Dacapo 应在编译期报错;漏过编译期检查时,Runtime 在执行前再次拒绝。
+
+### 7.3 已定决策:MLIR 原生产出,HEVM 整条路退役
 
 Dacapo 现有的产出路径是编译成 HEVM 字节码(`.hevm` + `.cst` 常量文件),再由 Poseidon 的 `frontends/dacapo` 解析成自己的调度表示。**本方案决定不走这条路**:RuntimePlan 的产出管线在 MLIR 层新写,placement 和通信插入作为 MLIR pass 实现,直接输出 RuntimePlan JSON;HEVM 作为中间产物被彻底抛弃。
 
@@ -299,8 +408,11 @@ Runtime 只面对一个窄接口:创建值、计算(`compute`)、发起异步通
 ~~~text
 VecApi          = 明文 vector 计算 + Mock/MPI 通信
 PoseidonCpuApi  = Poseidon CPU 算子 + 主机内存/MPI 通信
-PoseidonGpuApi  = Poseidon GPU 算子 + CUDA P2P/NCCL/GPU-aware MPI 通信
+PoseidonGpuApi  = Poseidon GPU 算子 + 必要的 Host 算子
+                  + CUDA P2P/NCCL/GPU-aware MPI 通信
 ~~~
+
+`PoseidonGpuApi` 不是说所有指令都必须在 GPU 上执行,而是说这份 Api 能执行 GPU 目标计划。普通计算仍在 Device;只有计划明确放到 Host 的算子,例如 `decrypt_reencrypt` Boot,才调用它内部组合的 Poseidon CPU 实现。Runtime 仍然只调用一个 Api,也不会根据算子失败情况临时换后端。
 
 Poseidon 现有 mgpu 代码里,GPU 对象的物化和分段拷贝、设备上下文、跨卡通信这些是真金白银的积累,全部迁进 PoseidonApi 继续用。而 mgpu 自己那套调度表示、placement、验证器和执行器,在迁移完成后删除——不长期养两套执行系统。具体哪些删哪些留,见第 11 节的分级清单。
 
@@ -310,12 +422,12 @@ Poseidon 现有 mgpu 代码里,GPU 对象的物化和分段拷贝、设备上下
 
 | 层级 | 输入与执行 | 主要验证什么 |
 | --- | --- | --- |
-| Dacapo 单元测试 | 上层程序 → 计划文件 | lazy-rescale、placement、通信插入、元信息生成对不对 |
+| Dacapo 单元测试 | 上层程序 → 计划文件 | CPU eager/GPU lazy 两种 rescale、boot profile、CPU 模拟 Pass、placement、通信插入和元信息生成对不对 |
 | Runtime 单元测试 | 手工构造的计划 → VecApi/MockApi | 解析、验证器、值状态管理、多 rank、出错即停 |
 | 两边集成测试 | Dacapo → JSON 文件 → Runtime → VecApi | 双方对协议的理解一致;真实编译产物能跑对 |
-| Poseidon 后端测试 | 同一份计划 → Vec/CPU/GPU 三种 Api | 三种后端算出同样的结果,元信息和同步语义一致 |
+| Poseidon 后端测试 | 同一份计划 → Vec/CPU/GPU 三种 Api | 三种后端算出同样的结果,元信息和同步语义一致;GPU 计划的 Host boot 模拟能正确往返 |
 
-Runtime 仓库的协议测试集应包含:每种算子和通信指令的最小合法计划;单卡、单机多卡、多进程的代表计划;合法的边界值;以及成对的"必须拒绝"样例——未知版本、未知枚举、缺字段、重复定义 ValueId、位置对不上、Transfer/Replicate 列表长度不匹配、目标能力不符,等等。指纹的稳定性(同一语义、不同排版 → 同一指纹)也要有专门测试。
+Runtime 仓库的协议测试集应包含:每种算子和通信指令的最小合法计划;CPU eager 和 GPU lazy 计划;原生 Boot 与 Host `decrypt_reencrypt` Boot;单卡、单机多卡、多进程的代表计划;合法的边界值;以及成对的"必须拒绝"样例——未知版本、未知 OperatorSpec、spec 指纹不符、头部 `rescale_mode`/`boot_mode` 与 OperatorSpec 或指令属性不一致、`level`/`scale_log2` 不是整数、算子目标元信息和输出 ValueDesc 不一致、重复定义 ValueId、位置对不上、Transfer/Replicate 列表长度不匹配、目标能力不符,等等。指纹的稳定性(同一语义、不同排版 → 同一指纹)也要有专门测试。
 
 Dacapo 集成测试的主路径:
 
@@ -346,26 +458,32 @@ Dacapo 测试模型
 ### 阶段一:冻结协议
 
 1. 在 Runtime 仓库建 `docs/runtime-plan/v1/`,写规范、Schema、指纹计算规则;
-2. **把 5.2 节的 CKKS 元信息(context、level、scale、NTT、分量数)补进 `ValueDesc` 和验证器**——这是现状和协议之间最大的实现缺口;
-3. 建立合法/非法样例文件集;
-4. 给 `RuntimePlan` 写独立的 JSON 读取器(当前完全没有 JSON 代码);
-5. 验证器覆盖规范要求的全部执行前检查。
+2. 建 `docs/operator-spec/v1/`,先定义 CPU eager 和 GPU lazy 两个最小 profile,再补 GPU boot profile;
+3. **把 5.2 节的 CKKS 元信息(context、level、`scale_log2`、NTT、分量数)补进 `ValueDesc` 和验证器**,并删掉协议侧的浮点 scale;
+4. 把 Rescale/Boot 的 C++ 属性改成整数目标 level 和 `target_scale_log2`,加入 boot implementation/profile;
+5. 建立合法/非法样例文件集;
+6. 给 `RuntimePlan` 写独立的 JSON 读取器(当前完全没有 JSON 代码);
+7. 验证器覆盖规范要求的全部执行前检查,包括 OperatorSpec 匹配和 Host compute 能力。
 
 ### 阶段二:接入 Dacapo
 
 1. Dacapo 作为可选 submodule 进入 Runtime;
-2. 在 Dacapo 里搭 MLIR 层的 RuntimePlan 产出管线,先支持单卡配置(无 placement、无通信指令),实现生成端自检和 JSON 写出;
-3. 用 VecApi 建立真实编译产物的单卡端到端测试;
-4. 加入多卡 placement 和 Transfer/Replicate 插入,扩展端到端测试到多卡、多进程计划。
+2. 把 Dacapo 现有 profile JSON 中的 CKKS 参数、算子延迟/噪声和 bootstrap 范围迁到版本化 OperatorSpec。注意 profile 里的 bootstrap level 上下界是 Earth 方向的数字,迁移时要做和 5.2 节一样的层号换算,不能照抄;
+3. 在 Dacapo 里搭 MLIR 层的 RuntimePlan 产出管线,先支持单卡配置(无 placement、无通信指令),实现生成端自检和 JSON 写出;
+4. 接 CPU eager 和 GPU lazy 两种 rescale 管线,用 spec 决定是否启用 lazy-rescale;
+5. 加入可选的 GPU Boot→Host `decrypt_reencrypt` 合法化 Pass;
+6. 用 VecApi 建立真实编译产物的单卡端到端测试;
+7. 加入多卡 placement 和 Transfer/Replicate 插入,扩展端到端测试到多卡、多进程计划。
 
 ### 阶段三:接入 Poseidon CPU/GPU
 
 1. Poseidon 以可选构建路径引入 Runtime;
 2. 先做单进程单设备的 PoseidonCpuApi;
 3. 再做单进程单卡的 PoseidonGpuApi;
-4. 迁移同进程跨卡的对象拷贝;
-5. 接入跨进程通信;
-6. 同一份计划在 Vec/CPU/GPU 三种 Api 下跑,结果必须一致。
+4. 让 PoseidonGpuApi 支持计划明确要求的 Host Boot 模拟:Device→Host、CPU 解密再加密、Host→Device;
+5. 迁移同进程跨卡的对象拷贝;
+6. 接入跨进程通信;
+7. 同一份计划在 Vec/CPU/GPU 三种 Api 下跑,结果必须一致。
 
 ### 阶段四:删除重复实现
 
@@ -386,7 +504,7 @@ Dacapo 测试模型
 - `mgpu/ir/`:调度中间表示,被 RuntimePlan 取代;
 - `mgpu/compiler/`:placement、拷贝插入、调度器、验证器、管线,职责移交计划生成侧;
 - `mgpu/runtime/executor/` 与 `mgpu/runtime/preflight/`:被 `SequentialRuntime` + `PlanVerifier` 取代;
-- `frontends/dacapo/` 整个目录:HEVM/CST 解析、常量装载、输入输出绑定和第三套执行器(`poseidon_gpu_hevm_executor.*`)。HEVM 格式退役后整条链没有存在理由,不迁移(见 7.2);其中的 CKKS 元信息对账逻辑以规范文字和测试样例形式沉淀进协议,而非搬运代码;
+- `frontends/dacapo/` 整个目录:HEVM/CST 解析、常量装载、输入输出绑定和第三套执行器(`poseidon_gpu_hevm_executor.*`)。HEVM 格式退役后整条链没有存在理由,不迁移(见 7.3);其中的 CKKS 元信息对账逻辑以规范文字和测试样例形式沉淀进协议,而非搬运代码;
 - Dacapo 仓库的 `lib/Runtime/{HEAAN,SEAL}_HEVM.cpp`:Dacapo 自带的 HEVM 解释器。注意它同时是差分测试的 CPU 参照实现,且被 `python/hecate/runner.py` 加载——要等新路径有了替代参照(PoseidonCpuApi 跑通并对过账)之后再删;
 - 相关的约 38 个测试文件随各自被删的模块一起退役,其中验证的不变量(SSA、位置一致性、拷贝合法性)要确认在 Runtime 测试集中有对应覆盖。
 
@@ -395,8 +513,12 @@ Dacapo 测试模型
 ## 12. 结论
 
 - RuntimePlan 是 Runtime 定义并拥有的版本化执行契约,规范、Schema 和测试样例都放在 Runtime 仓库;
+- RuntimePlan V1 是可执行 CKKS 的 JSON 序列化;Dacapo 的逻辑/已分配 MLIR 和 Runtime 的 C++ `plan.hpp` 都不是跨仓库协议;
 - Dacapo 和 Runtime 不共享 C++ 类型,各自实现文件的写和读,靠交叉测试对齐;
 - 两边各有一个按同一规范独立实现的检查器,Runtime 的执行前检查是最终把关;
+- `level` 是整数模数链层号,`scale_log2` 是整数 scale 指数;V1 不传浮点 scale;
+- CPU 和 GPU 使用不同的 OperatorSpec。CPU 默认 eager rescale,当前低 bit GPU profile 使用 lazy-rescale;GPU boot 的内部 level 消耗也由独立 boot profile 给出;
+- GPU 原生 boot 不可用时,只能由 Dacapo 的可选 Pass 明确生成 Device→Host、CPU 解密再加密、Host→Device 的计划,Runtime 不做隐式回退;
 - Dacapo 是 Runtime 的可选 submodule(指向 `dacapo-modified` fork),只用于锁版本和集成测试;
 - 计划产出走 MLIR 原生管线直接输出 RuntimePlan,HEVM 字节码及其解释器/解析器整条链退役;
 - Poseidon 只引入 Runtime,通过 PoseidonCpuApi/PoseidonGpuApi 提供计算和通信;mgpu 中的 GPU 拷贝与通信代码迁入 Api 层复用,调度和执行代码在迁移验证后删除;

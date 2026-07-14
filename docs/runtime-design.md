@@ -47,7 +47,7 @@ public:
 
 ## 3. Runtime 的输入
 
-可执行计划已经包含：固定的计划/版本 ID、每条指令的稳定序号、纯计算指令、通信动作、来源/目标的物理 Place、输出的值类型、可选的通信 hint、初始化/执行/收尾三个阶段的划分、编译目标要求的节点数和本地设备数。
+可执行计划已经包含：固定的计划/版本 ID、目标 capability、OperatorSpec 的 id/版本/指纹、rescale/boot 模式、每条指令的稳定序号、纯计算指令、通信动作、来源/目标的物理 Place、每个值的 context/level/`scale_log2`/NTT/分量数、可选的通信 hint、初始化/执行/收尾三个阶段的划分、编译目标要求的节点数和本地设备数。
 
 Runtime 自己只需要一个运行时身份：
 
@@ -100,13 +100,17 @@ struct PendingGroup {
 
 执行前的检查清单：
 
-- 格式/版本；
+- 格式/版本、目标 capability 和 OperatorSpec/profile；
 - ValueId 唯一定义，且每个 ValueId 恰好绑定一个 Place；
 - 不允许"先用后定义"；
 - 指令的参数个数和值类型正确；
-- 计算指令必须是纯计算，且只有一个执行 Place；
+- 每个值都有完整的 CKKS 元信息,`level` 和 `scale_log2` 都是非负整数；
+- 计算指令必须是纯计算，且只有一个执行 Place；该 Place 必须支持这个算子和实现模式；
 - 计算指令的输入已在该 Place 上物化；
+- Rescale/Boot 的目标 level、`target_scale_log2`、目标分量数与输出 ValueDesc 一致；
+- `decrypt_reencrypt` Boot 只能在 Host,并且计划声明了所需的 CPU 能力和密钥；
 - 通信动作的输入输出关系符合其类型；
+- Transfer/Replicate 前后 CKKS 元信息一致；
 - Replicate 的每个目标对应一个不同的输出 ValueId；
 - 来源/目标 Place 属于编译目标；
 - 传输 ID 唯一；
@@ -138,6 +142,8 @@ execute_compute(op):
 > 计算函数返回后，输出对同一个 Api 实例上后续发起的调用保证可见（包括交给 `communicate_async`）。指令执行期间阻塞 host 的同步点只有 `wait`；发布最终输出前调用 `synchronize`。
 
 也就是说，Api 内部可以异步地启动 GPU kernel，用 stream/event 保证调用之间的先后顺序，而不必每个算子都同步一次。Runtime 不接触 CUDA event，也感知不到这层异步。
+
+计算不等于“只能在 Device 上算”。目标 capability 可以允许某些算子在 Host 执行。例如 GPU boot 的 CPU 模拟在可执行计划里是 Device→Host Transfer、Host 上的 `Boot(implementation=decrypt_reencrypt)`、Host→Device Transfer。Runtime 只是按顺序执行这三条指令,不会在原生 GPU Boot 失败后临时拼出这条路径。
 
 ## 7. 通信动作的执行
 
@@ -245,7 +251,7 @@ Value &ensure_ready(ValueId id, Place expected_place):
 
 多个 runtime 之间不加逐指令同步，它们可以以不同速度推进，只通过通信动作和最终的测试汇合点协调。这样才能测出"接收方先到/发送方先到""并发等待""全组终止"这些真实场景。
 
-Runtime 启动时至少检查：节点总数、本地 rank、计划 ID/版本、本地设备数、编译目标标识。不设计复杂的能力协商。
+Runtime 启动时至少检查：节点总数、本地 rank、计划 ID/版本、本地设备数、编译目标标识、capability 版本、OperatorSpec id/版本/指纹、rescale/boot 模式。不设计复杂的能力协商；不匹配就直接终止。
 
 ## 12. Fail-fast
 

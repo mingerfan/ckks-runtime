@@ -5,9 +5,9 @@
 本仓库暂不实现 MLIR dialect，但 C++ demo 里的 SSA 类型、算子分类、位置分配、通信和验证器，必须和未来 MLIR 下降（lowering）的结果保持一致。本文档约束：
 
 - 未来逻辑 CKKS dialect 的语义；
-- 设备分配和通信显式化这两个编译步骤；
-- 可执行 SSA 的输入格式；
-- 当前 `runtime/plan.hpp` 的 C++ 类型映射；
+- 目标相关合法化、设备分配和通信显式化这些编译步骤；
+- 可执行 SSA 到 RuntimePlan V1 JSON 的对应关系；
+- Runtime 内部 `runtime/plan.hpp` 的目标类型映射；
 - runtime 验证器依赖的稳定不变量。
 
 设计重点：让逻辑计算图保持纯净，同时生成足够明确、可验证的物理执行计划。
@@ -24,7 +24,7 @@
       -> !ckks.ciphertext
 ~~~
 
-这一阶段：指令没有通信副作用；Place 尚未确定；值表示数学对象而不是具体 buffer；CKKS 的 level、scale、参数上下文等语义必须可验证；rescale、relinearize、rotate、bootstrap 等必要算子已显式存在，或可由语义合法化步骤确定。
+这一阶段：指令没有通信副作用；Place 尚未确定；值表示数学对象而不是具体 buffer；CKKS 的 level、`scale_log2`、参数上下文等语义必须可验证；rescale、relinearize、rotate、bootstrap 等必要算子已显式存在，或可由语义合法化步骤确定。
 
 ### 2.2 已分配 CKKS
 
@@ -86,13 +86,24 @@
 
 **Dist（或 Comm）dialect**：transfer、replicate、可选的集合通信；位置效果；可选的异步 token。
 
-设备分配 Pass 不需要新 dialect，它只是给 CKKS 算子加属性。如果最终的执行计划以后需要稳定的序列化格式、独立版本和多个消费者，再引入一个 ckks-runtime dialect；首期直接把可执行 CKKS 翻译成 C++ 执行序列即可。
+设备分配 Pass 不需要新 dialect，它只是给 CKKS 算子加属性。跨 Dacapo 和 Runtime 的稳定边界已经确定为 RuntimePlan V1 JSON:可执行 CKKS 直接序列化成 JSON,Runtime 再解析成自己的 C++ 结构。V1 不需要额外创建一个 ckks-runtime MLIR dialect;以后只有在确实出现多个 MLIR 消费方时再考虑。
 
 ## 4. 类型设计
 
 ### 4.1 CKKS 语义类型
 
-逻辑类型至少区分明文（Plaintext）和密文（Ciphertext）。可选的静态描述包括：参数/上下文标识、多项式阶数、level 或参数层标识、scale、是否 NTT 形式、密文分量个数、编码方式。
+逻辑类型至少区分明文（Plaintext）和密文（Ciphertext）。可选的静态描述包括：参数/上下文标识、多项式阶数、level、`scale_log2`、是否 NTT 形式、密文分量个数、编码方式。
+
+两个整数的含义固定如下:
+
+- `level` 是当前模数链层号。较大的值表示还保留更多 RNS 模数;Rescale 或 ModSwitch 后它下降。不要把它解释为浮点数或 `2^x`;
+- `scale_log2` 是 scale 的二进制指数,使用非负整数。值 40 表示逻辑 scale 为 `2^40`,计划中不保存浮点 scale。
+
+Dacapo 当前 Earth 类型里的 `scale` 已经是这个整数指数。对外协议改名为 `scale_log2`,只是把原有含义写清楚。
+
+Dacapo 的 Earth 分析阶段用“已经消耗多少层”的方向记录 level,Rescale 后数值增加;下降到 CKKS PolyType 时会换算成“还剩多少层”,Rescale 后数值下降。RuntimePlan V1 固定采用后者。序列化必须发生在这个换算之后。
+
+在逻辑和已分配阶段,这些元信息可以放在类型、值属性或分析结果中;导出可执行计划之前必须全部落到每个值的描述符中,不能再是“可选信息”。
 
 **不建议把 Place 编进 CKKS 数学类型。** Place 是执行属性，不是密文数学性质的一部分；混在一起会产生大量的位置转换 cast 和类型组合爆炸。静态类型放不下的元信息，放在值描述符、算子属性或分析结果里。
 
@@ -132,9 +143,16 @@ enum class OpClass {
 };
 ~~~
 
-**纯计算**：AddCC、AddCP、SubCC、SubCP、MulCC、MulCP、Negate、Rotate、Rescale、ModSwitch、Relinearize、Boot。逻辑上引用透明：`outputs = f(inputs)`。Api 在物理上分配和写入输出 buffer 不算逻辑副作用；计算函数本身不得主动发起通信。
+**纯计算**：AddCC、AddCP、SubCC、SubCP、MulCC、MulCP、Negate、Rotate、Rescale、ModSwitch、Relinearize、Boot。逻辑上引用透明：`outputs = f(inputs)`。Api 在物理上分配和写入输出 buffer 不算逻辑副作用；计算函数本身不得主动发起通信。计算 Place 可以是 Device,也可以是目标明确支持的 Host;不能在 Runtime 里写死“所有计算只能在 GPU”。
 
-**通信**：Transfer、Replicate、Gather，将来可能加 Scatter、AllGather 或分片转换。Transfer/Replicate 对数学值是原样搬运，但在位置、资源、错误和完成状态上有实际效果，不能被当成可随意删除的空操作。Gather 等必须单独定义输入输出的数学关系。
+Boot 有两种明确的实现模式:
+
+- `native`:使用目标后端的原生 boot;
+- `decrypt_reencrypt`:只允许放在 Host,用 CPU 解密、解码、重新编码和加密来模拟 boot。
+
+第二种模式会暴露明文,只用于测试和联调。它必须由编译 Pass 明确选择,不能由 Api 在原生 Boot 失败后偷偷回退。
+
+**通信**：V1 只有 Transfer 和 Replicate。将来可以增加 Gather、Scatter、AllGather 或分片转换,但要先定义清楚数学关系并升级协议。Transfer/Replicate 对数学值和 CKKS 元信息都是原样搬运,但在位置、资源、错误和完成状态上有实际效果,不能被当成可随意删除的空操作。
 
 **外部输入输出**：运行时的输入绑定、上传/下载、结果发布。
 
@@ -159,13 +177,48 @@ enum class OpClass {
 
 ### 7.1 CKKS 语义合法化
 
-在设备分配之前完成：算子类型合法化、scale 和 level 规划、rescale 插入、relinearize 插入、rotate 分解、bootstrap 决策、密钥需求分析、目标 Api 能力预检查。这些步骤会改变图结构和密文大小，所以要放在分配之前。
+在设备分配之前完成：算子类型合法化、`scale_log2` 和 level 规划、rescale 插入、relinearize 插入、rotate 分解、bootstrap 决策和密钥需求分析。这些步骤会改变图结构和密文大小，所以要放在分配之前。
 
-### 7.2 设备分配
+### 7.2 目标相关合法化
+
+这个 Pass 读取 TargetSpec 和版本化的 CKKS OperatorSpec,把通用 CKKS 图变成目标真正能执行的图。OperatorSpec 至少给出 context/RNS 限制、算子支持范围、元信息变化、代价、rescale 模式和 boot profile。
+
+rescale 的规则是:
+
+- Poseidon CPU profile 使用 eager 模式,不要求 lazy-rescale;
+- 当前低 bit Poseidon GPU profile 固定为 lazy 模式,选中该 profile 时 Dacapo 必须启用相应变换;
+- pass 产生的 Rescale 位置、每个值的 level 和 `scale_log2` 都会进入后续计划,Runtime 不再改变。
+
+GPU boot 暂不可用时,可选 Pass 把 Boot 标成 `implementation=decrypt_reencrypt`,并限制 `compute_place` 必须是 Host。通信显式化完成后,它自然形成下面的计划:
+
+~~~mlir
+%host_in = dist.transfer %gpu_in {
+  source = #place.device<rank=0, index=0>,
+  destination = #place.host<rank=0>
+}
+
+%host_out = ckks.boot %host_in {
+  place = #place.host<rank=0>,
+  implementation = #ckks.boot_impl<decrypt_reencrypt>,
+  target_level = 6,
+  target_scale_log2 = 40,
+  target_components = 2,
+  operator_profile = "poseidon-cpu-boot-emulation-v1"
+}
+
+%gpu_out = dist.transfer %host_out {
+  source = #place.host<rank=0>,
+  destination = #place.device<rank=0, index=0>
+}
+~~~
+
+Boot 内部如果也需要 lazy-rescale,其合法输入范围、实际 level 消耗和输出规则由 boot profile 给出。不要把 CPU 的固定消耗直接套到 GPU。
+
+### 7.3 设备分配
 
 输入逻辑 CKKS，输出已分配 CKKS。职责：为每条计算指令选唯一的 `compute_place`；算出各结果需要出现的位置集合；使用编译期已知的固定拓扑；校验位置和目标 Api 能力；权衡 Host/Device、延迟、带宽、显存和密钥位置；**不插入实际通信**。
 
-### 7.3 通信显式化
+### 7.4 通信显式化
 
 输入已分配 CKKS，输出可执行 CKKS。职责：
 
@@ -179,13 +232,13 @@ enum class OpClass {
 - 生成 CommKind 和可选的 CommHint；
 - 不把具体的 MPI/NCCL/CUDA 调用写进通用 IR。
 
-### 7.4 可执行验证
+### 7.5 可执行验证
 
-检查：所有计算指令有唯一 Place；每个 ValueId 恰好属于一个 Place；所有计算操作数都在本地；不再有未满足的 `result_places`；transfer 的源已定义且位置合法；结果类型和源的数学类型一致；来源/目标属于编译目标；通信动作的输入输出关系合法；Replicate 的输出数等于目标数且一一对应；不允许一个输出 ValueId 对应多个目标。
+检查：所有计算指令有唯一 Place；该 Place 支持对应算子和 boot implementation；每个 ValueId 恰好属于一个 Place；所有计算操作数都在本地；每个值都有完整的 context、level、`scale_log2`、NTT 和分量数；算子目标元信息与输出值描述一致；OperatorSpec/profile 引用有效；不再有未满足的 `result_places`；transfer 的源已定义且位置合法；传输前后数学类型和 CKKS 元信息一致；来源/目标属于编译目标；通信动作的输入输出关系合法；Replicate 的输出数等于目标数且一一对应；不允许一个输出 ValueId 对应多个目标。
 
-### 7.5 翻译
+### 7.6 导出 RuntimePlan V1
 
-把可执行 CKKS 转成 C++ 的 RuntimePlan。首期不需要新 dialect。
+把可执行 CKKS 序列化成 RuntimePlan V1 JSON。JSON 是 Dacapo 与 Runtime 之间唯一的稳定协议。Runtime 读取后可以转成自己的 C++ `RuntimePlan`,但两边不共享 C++ 类型。首期不需要新 MLIR dialect。
 
 ## 8. 等待与异步的表示
 
@@ -200,12 +253,13 @@ enum class OpClass {
 
 MLIR 的 async dialect 可以承担 token 和 await 的语义，不必自建一套。
 
-## 9. C++ Demo 类型映射
+## 9. Runtime 内部类型映射
 
-当前实现位于 `runtime/plan.hpp`。旧的"一个值绑多个设备"表示已删除，执行计划直接使用以下单位置类型：
+Runtime 读完 V1 JSON 后,内部 C++ 类型至少要能表达下面这些信息。这里描述的是目标形态,不是跨仓库 ABI。当前 `runtime/plan.hpp` 已经有单位置 SSA 和三阶段计划,但还缺 CKKS 元信息、OperatorSpec 引用、整数 `scale_log2` 和 Host Boot 模式。
 
 ~~~cpp
 using ValueId = std::uint64_t;
+using ScaleLog2 = std::uint32_t;
 
 enum class ValueKind {
     Plaintext,
@@ -223,66 +277,102 @@ struct Place {
     int index;
 };
 
-enum class OpKind {
-    AddCC, AddCP,
-    SubCC, SubCP,
-    MulCC, MulCP,
-    Negate, Rotate,
-    Rescale, ModSwitch,
-    Relinearize, Boot,
-    Transfer, Replicate, Gather,
-    Input, Output
+struct CkksMetadata {
+    std::string context_id;
+    std::uint64_t polynomial_degree;
+    std::uint32_t level;
+    ScaleLog2 scale_log2;
+    bool ntt;
+    std::uint32_t components;
 };
 
-// 仅编译器内部（已分配阶段）使用，不进入 RuntimePlan。
-struct PlacedComputeAttrs {
-    Place compute_place;
-    std::vector<Place> required_result_places;
-};
-
-struct ComputeAttrs {
-    // 可执行阶段：计算结果只位于这一个 Place。
-    Place place;
-    // rotate 步数、目标 level 等算子专属属性
-};
-
-enum class CommHint {
-    Auto, PointToPoint, Collective, Broadcast,
-    GatherPrimitive, Tree, Ring, HostStaged
-};
-
-struct CommunicationAttrs {
-    std::vector<Place> sources;
-    std::vector<Place> destinations;
-    CommHint hint;
-    std::uint64_t transfer_ordinal;
-};
-
-using OpAttrs = std::variant<ComputeAttrs, CommunicationAttrs>;
-
-struct SsaOp {
-    OpKind kind;
-    std::vector<ValueId> inputs;
-    std::vector<ValueId> outputs;
-    OpAttrs attrs;
-};
-
-struct ExecutableValueDesc {
+struct ValueDesc {
     ValueId id;
     ValueKind kind;
     Place place;
+    CkksMetadata metadata;
+};
+
+enum class BootImplementation {
+    Native,
+    DecryptReencrypt
+};
+
+struct RotateAttrs {
+    int steps;
+};
+
+struct RescaleAttrs {
+    std::uint32_t target_level;
+    ScaleLog2 target_scale_log2;
+};
+
+struct ModSwitchAttrs {
+    std::uint32_t target_level;
+};
+
+struct BootAttrs {
+    BootImplementation implementation;
+    std::uint32_t target_level;
+    ScaleLog2 target_scale_log2;
+    std::uint32_t target_components;
+    std::string operator_profile;
+};
+
+using ComputeAttrs = std::variant<
+    std::monostate, RotateAttrs, RescaleAttrs, ModSwitchAttrs, BootAttrs>;
+
+struct ComputeOp {
+    ComputeKind kind;
+    std::vector<ValueId> inputs;
+    ValueId output;
+    Place place;
+    ComputeAttrs attrs;
+};
+
+struct OperatorSpecRef {
+    std::string id;
+    std::uint32_t version;
+    std::string fingerprint;
+};
+
+enum class RescaleMode {
+    Eager,
+    Lazy
+};
+
+enum class BootMode {
+    Native,
+    DecryptReencrypt
+};
+
+struct TargetConfig {
+    std::string target_id;
+    std::uint32_t capability_version;
+    OperatorSpecRef operator_spec;
+    RescaleMode rescale_mode;
+    BootMode boot_mode;
+    int world_size;
+    std::vector<int> device_counts;
 };
 
 struct RuntimePlan {
-    // 验证器保证每个 id 只出现一次，因此只对应一个 place。
-    std::vector<ExecutableValueDesc> values;
-    std::vector<SsaOp> ops;
+    std::uint32_t format_version;
+    std::uint64_t plan_id;
+    std::string fingerprint;
+    TargetConfig target;
+    std::vector<ValueDesc> values;
+    std::vector<ValueId> external_inputs;
+    std::vector<Instruction> initialization;
+    std::vector<Instruction> execution;
+    std::vector<Instruction> finalization;
+    std::vector<ValueId> final_outputs;
 };
 ~~~
 
-对 Replicate，`outputs.size()` 必须等于 `destinations.size()`，且 `outputs[i]` 的值描述符必须指向 `destinations[i]`。实现可以用模板或更严格的分类型算子，但要避免所有算子共用一组含义不明的平铺字段。
+Rescale 和 Boot 不再使用 `double scale_divisor` 或 `double scale`;它们直接写目标 level 和整数 `target_scale_log2`。对 Replicate，`outputs.size()` 必须等于 `destinations.size()`，且 `outputs[i]` 的值描述符必须指向 `destinations[i]`。实现可以用模板或更严格的分类型算子，但要避免所有算子共用一组含义不明的平铺字段。
 
-这套类型与 poseidon::mgpu 的 `MgpuOp`（ops + device_id + 整数属性表）语义兼容：`Place{rank=0, index=d}` 退化后就是 mgpu 的 `device_id = d`，Transfer 对应 mgpu 的 CopyCipher/CopyPlain。迁移对接时可以写一个 MgpuSchedule 到 RuntimePlan 的直接翻译。
+单位置和显式拷贝这两个核心不变量仍与 poseidon::mgpu 的 `MgpuOp` 兼容:`Place{rank=0, index=d}` 退化后就是 mgpu 的 `device_id=d`,Transfer 对应 CopyCipher/CopyPlain。但 mgpu 当前没有完整 CKKS 元信息、Host compute 和 OperatorSpec,所以迁移时只能复用它的拷贝与执行能力,不能把旧的整数属性表原样当成 V1 协议。
 
 ## 10. 编译难点与首期限制
 

@@ -2,7 +2,7 @@
 
 ## 1. 设计目标
 
-面向 runtime 的通信接口应当尽量小，只表达编译器已经确定的通信语义。具体的对象布局、buffer、MPI/NCCL/CUDA 调用、实现降级和格式转换，都由 Api 兼容层处理。
+面向 runtime 的通信接口应当尽量小，只表达编译器已经确定的通信语义。具体的对象布局、buffer、MPI/NCCL/CUDA 调用、等价的传输降级和 CPU/GPU 对象格式转换，都由 Api 兼容层处理。
 
 本设计的前提：
 
@@ -59,7 +59,7 @@ Scatter:    一个输入 -> N 个切片，各自位于自己的目标位置
 AllGather:  多个输入 -> 每个目标各得一份独立的合并结果
 ~~~
 
-每种通信动作必须先定义清楚输入到输出的数学关系。Api 的实现降级只能改变"怎么传"，不能改变"传出来是什么"。
+每种通信动作必须先定义清楚输入到输出的数学关系。Api 的实现降级只能改变"怎么传"，不能改变"传出来是什么"，也不能改变 context、level、`scale_log2`、NTT 状态或分量数。
 
 计划严格遵守单位置规则：每个输出 ValueId 恰好属于一个 Place。同一份数据出现在多个位置时，必须用多个不同的 ValueId。
 
@@ -108,7 +108,7 @@ struct CommAction {
 };
 ~~~
 
-CommAction 来自编译器，runtime 不修改。`output_types` 是 SSA 层的类型信息，供 Api 在目标端分配或构造值时使用，不是底层的 buffer 描述。
+CommAction 来自编译器，runtime 不修改。`output_types` 是 SSA 层的明文/密文类型信息，完整 CKKS 元信息来自对应输出的 ValueDesc。Api 用这些信息在目标端分配或构造值，它们不是底层的 buffer 描述。
 
 所有通信动作都满足：
 
@@ -160,11 +160,13 @@ public:
 Runtime 不需要知道数据对象的内部结构。`Api::Value` 已经是各后端自己定义的类型：
 
 ~~~text
-VecApi:      variant<VecPlaintext, VecCiphertext>
-PoseidonApi: variant<GpuPlaintextData, GpuCiphertextData>
+VecApi:         variant<VecPlaintext, VecCiphertext>
+PoseidonCpuApi: variant<CpuPlaintextData, CpuCiphertextData>
+PoseidonGpuApi: variant<CpuPlaintextData, CpuCiphertextData,
+                        GpuPlaintextData, GpuCiphertextData>
 ~~~
 
-Poseidon 的 Api 可以在内部展开密文的多段 buffer、在目标端分配、复制元信息、转换 CPU/GPU 表示、调 MPI/NCCL/CUDA、管理锁页内存——这些都不进 runtime 的公共接口。poseidon::mgpu 现有的 `GpuObjectCopyMaterializer` 已经实现了"把不透明对象拆成一组分段 buffer 拷贝"这件事，迁移对接时可以直接复用在 Api 内部。
+GPU 目标计划可能包含显式的 Host compute，例如 CPU 解密再加密模拟 boot，所以同一个 PoseidonGpuApi 必须同时容纳 Host 和 Device 值。Poseidon 的 Api 可以在内部展开密文的多段 buffer、在目标端分配、复制元信息、转换 CPU/GPU 表示、调 MPI/NCCL/CUDA、管理锁页内存——这些都不进 runtime 的公共接口。poseidon::mgpu 现有的 `GpuObjectCopyMaterializer` 已经实现了"把不透明对象拆成一组分段 buffer 拷贝"这件事，迁移对接时可以直接复用在 Api 内部。
 
 因此首期不引入 ObjectHandle、ObjectDescriptor、ObjectAdapter、BufferView、MemoryKind 或通用序列化接口。如果未来确实要让一个通用的 MPI 传输层独立复用多种对象布局，再把对象适配器作为 Api 的内部模块加进去，而不是提前进入 Runtime 接口。
 
@@ -180,7 +182,7 @@ Transfer:
 
 Runtime 不根据值的类型（明文/密文）自动判断要不要上传，判断依据始终是计划里的来源/目标 Place。
 
-Api 可以在一次 Host→Device 里顺便完成：目标端分配、普通内存到锁页内存的暂存、CPU/GPU 表示转换、cudaMemcpy、元信息物化。只要输出的数学值和类型符合计划，就是合法实现。
+Api 可以在一次 Host→Device 里顺便完成：目标端分配、普通内存到锁页内存的暂存、CPU/GPU 对象表示转换和 cudaMemcpy。只要输出的数学值、类型和全部 CKKS 元信息与计划一致，就是合法实现。
 
 ## 9. 初始化、执行和收尾
 
@@ -238,6 +240,8 @@ Gather + Collective 提示
 5. 调试模式可以记录实际用了哪种实现。
 
 Runtime 不需要能力查询，也不参与降级。
+
+这里的“降级”只指通信的等价实现。例如 Broadcast hint 可以改用多个点对点。GPU Boot 改成 CPU 解密再加密会改变计算 Place，还会增加 Device→Host 和 Host→Device，不属于 Api 可以隐藏的降级；它必须由编译器显式写进计划。
 
 ## 12. 异步与等待
 
