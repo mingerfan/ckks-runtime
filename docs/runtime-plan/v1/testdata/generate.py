@@ -15,6 +15,7 @@
 import copy
 import hashlib
 import json
+import struct
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -294,7 +295,8 @@ v004 = plan(
 # -------- v005:引用明文数据包(权重包)的推理片段 --------
 
 BUNDLE_DIR = HERE / "bundles" / "v005-demo"
-BUNDLE_DATA = bytes(range(64))
+# 数据文件是编码前的浮点 slot 向量:小端 float64 数组(这里是 8 个 slot 的 0/1 mask)。
+BUNDLE_DATA = struct.pack("<8d", 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0)
 BUNDLE_CONTENT = hashlib.sha256(BUNDLE_DATA).hexdigest()
 
 bundle_manifest = with_fingerprint({

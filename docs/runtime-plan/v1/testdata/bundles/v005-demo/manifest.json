@@ -7,9 +7,9 @@
     {
       "value_id": "1",
       "name": "demo.mask",
-      "content": "sha256:fdeab9acf3710362bd2658cdc9a29e8f9c757fcf9811603a8c447cd1d9151108",
+      "content": "sha256:e1fd30e2981704910390655fb7727790af514458eb1a4d1f344381a27c6fa6cb",
       "byte_length": 64
     }
   ],
-  "fingerprint": "sha256:881ece04a4184592d106493a781bc6b5afe3b647f39de9befceb13a6a26e4245"
+  "fingerprint": "sha256:fc1685f9cc3a27967c0f647755d8498f93ee9ffe6e54eb60d7e57817d3a0a088"
 }

@@ -66,7 +66,22 @@ void test_sha256_vectors() {
             "SHA-256 abc vector failed");
     require(sha256_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq") ==
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
-            "SHA-256 multi-block vector failed");
+            "SHA-256 two-block padding vector failed");
+
+    const std::string full_block(64, 'a');
+    require(sha256_hex(full_block) ==
+            "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+            "SHA-256 full-block vector failed");
+
+    const std::string binary_input("abc\0def", 7);
+    require(sha256_hex(binary_input) ==
+            "516a5e926ce20c5f4d80f00e1a01abdf14986def6588d6abeed9fce090bc660c",
+            "SHA-256 binary input vector failed");
+
+    const std::string million_as(1'000'000, 'a');
+    require(sha256_hex(million_as) ==
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
+            "SHA-256 million-a vector failed");
 }
 
 void test_valid_samples() {
@@ -169,7 +184,7 @@ void test_strict_json_rules() {
 
 int main() {
     try {
-        run_test("SHA-256 standard vectors", test_sha256_vectors);
+        run_test("SHA-256 known-answer vectors", test_sha256_vectors);
         run_test("valid RuntimePlan V1 samples", test_valid_samples);
         run_test("external inputs are Host-only (IO-2)", test_external_input_host_only);
         run_test("structural invalid RuntimePlan samples", test_structural_invalid_samples);

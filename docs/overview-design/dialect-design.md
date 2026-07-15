@@ -161,11 +161,11 @@ Boot 有两种明确的实现模式:
 神经网络推理的权重、bias 和 rotate-and-sum 的 mask,在 IR 里统一用一个 `Pure` 的 constant 算子表示,payload 二选一:
 
 - **内联形态**:数据直接放在 attribute 里(用 MLIR 的 `DenseResourceElementsAttr` 存 blob,避免大数据常驻 attribute uniquer),适合小 mask、手写测试;
-- **引用形态**:attribute 只存 `{bundle_key, 元信息}`,`bundle_key` 是编码后数据的内容哈希,数据本体在计划旁的[明文数据包](../runtime-plan/v1/plaintext-bundle.md)里。
+- **引用形态**:attribute 只存 `{bundle_key, 元信息}`,`bundle_key` 是浮点数据的内容哈希,数据本体在计划旁的[明文数据包](../runtime-plan/v1/plaintext-bundle.md)里。
 
 两种形态对使用者透明,fold/CSE 按 attribute 相等合并——由于引用形态的 key 就是内容哈希,"字节相同 ⇒ key 相同 ⇒ 被 CSE"是免费的去重(重复 mask、低内存测试里复用的占位常量都受益)。不需要单独的 load 算子,constant 本身就是取值点。
 
-导出前由**常量外化 pass**(带字节阈值参数)把超过阈值的内联常量编码、写入数据包并原地改写为引用形态;阈值 0 即全部外化。**导出 RuntimePlan 时必须全外化**:每个存活的 constant 映射为一条 Host 上的 plaintext external_input,计划文件里永远不含数据字节。placement 和通信显式化把 constant 的结果当普通 Host 明文值处理,不感知"这是权重"。
+导出前由**常量外化 pass**(带字节阈值参数)把超过阈值的内联常量的浮点向量原样写入数据包并原地改写为引用形态;阈值 0 即全部外化。外化只搬字节,**不做 CKKS 编码**——编码由 Runtime 装载时按 ValueDesc 声明的 level/`scale_log2` 执行(见数据包文档),编译器因此不依赖任何同态加密库,数据包体积也停留在浮点向量的量级,而不是编码后多项式的量级。**导出 RuntimePlan 时必须全外化**:每个存活的 constant 映射为一条 Host 上的 plaintext external_input,计划文件里永远不含数据字节。placement 和通信显式化把 constant 的结果当普通 Host 明文值处理,不感知"这是权重"。
 
 ## 6. 提示与强制指令的区别
 

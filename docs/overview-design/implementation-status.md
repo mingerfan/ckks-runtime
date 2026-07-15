@@ -15,7 +15,7 @@
 - RuntimePlan V1 独立 JSON 读取器：严格拒绝 BOM、重复 key、未知/缺失字段、浮点数、非法枚举和错误的 64 位 ID 编码，并用仓库内 SHA-256 实现重算指纹；nlohmann-json 固定在 `third_party/`，不依赖 OpenSSL。
 - `ValueDesc` 已包含 context、level、整数 `scale_log2`、NTT 和分量数；Rescale/Boot、Vec 和 MPI 元信息也已改用整数 `scale_log2`。
 - `TargetConfig` 已能保存 capability、OperatorSpec 引用、rescale/boot 模式、能力声明和密钥声明。
-- 顶层可选 `plaintext_bundle` 引用的解析与外部输入 Host-only 检查(IO-2);数据包本身的加载与 BND-1 preflight 未实现。
+- 顶层可选 `plaintext_bundle` 引用的解析与外部输入 Host-only 检查(IO-2);数据包本身的装载(浮点 slot 向量按 ValueDesc 编码)与 BND-1 preflight 未实现。
 
 ## 测试覆盖
 
@@ -49,7 +49,7 @@ xmake
 
 - PlanVerifier 尚未覆盖 V1 的全部语义检查，包括完整元信息变化、能力/密钥声明精确匹配和无孤儿 ValueDesc；
 - OperatorSpec 文件读取、id/版本/指纹匹配、level/rescale/boot profile 检查;
-- 明文数据包(plaintext bundle)的清单读取、内容哈希核对与 BND-1 preflight;
+- 明文数据包(plaintext bundle)的清单读取、内容哈希核对、装载时编码与 BND-1 preflight;
 - Runtime 对 Host compute 的支持。当前验证器仍把计算写死在 Device；
 - `Boot(implementation=decrypt_reencrypt)` 及显式的 Device→Host、Host→Device 流程；
 - PoseidonGpuApi 内部组合 Poseidon CPU 能力来执行 Host boot 模拟。
