@@ -61,7 +61,7 @@ VecExecutor::Worker &VecExecutor::worker_for(const Place &place) {
 
 VecValue VecExecutor::compute(const ComputeOp &op, const std::vector<VecValue> &inputs) {
     if (config_.mode == VecExecMode::Sync) return VecValue::ready(compute_now(op, inputs));
-    VecValue output = VecValue::pending(ValueKind::Ciphertext);
+    VecValue output = VecValue::pending(ValueKind::Ciphertext, compute_metadata(op, inputs));
     Worker &worker = worker_for(op.place);
     {
         std::lock_guard<std::mutex> lock(worker.mutex);
@@ -75,6 +75,67 @@ VecValue VecExecutor::compute(const ComputeOp &op, const std::vector<VecValue> &
     }
     worker.cv.notify_one();
     return output;
+}
+
+VecMetadata VecExecutor::compute_metadata(const ComputeOp &op, const std::vector<VecValue> &inputs) const {
+    const auto unary = [&] {
+        if (inputs.size() != 1 || inputs[0].kind() != ValueKind::Ciphertext)
+            throw std::runtime_error("unary cipher operation type mismatch");
+        return inputs[0].metadata();
+    };
+    const auto binary = [&](ValueKind rhs_kind, bool multiply) {
+        if (inputs.size() != 2 || inputs[0].kind() != ValueKind::Ciphertext || inputs[1].kind() != rhs_kind)
+            throw std::runtime_error("binary operation type mismatch");
+        VecMetadata a = inputs[0].metadata();
+        const VecMetadata b = inputs[1].metadata();
+        if (a.context != b.context || a.degree != b.degree || a.level != b.level || a.ntt != b.ntt)
+            throw std::runtime_error("incompatible VecValue metadata");
+        if (!multiply && a.scale_log2 != b.scale_log2) throw std::runtime_error("scale mismatch");
+        if (multiply) {
+            if (b.scale_log2 > std::numeric_limits<int>::max() - a.scale_log2)
+                throw std::runtime_error("multiplication scale overflow");
+            a.scale_log2 += b.scale_log2;
+            if (rhs_kind == ValueKind::Ciphertext) a.components += b.components - 1;
+        }
+        return a;
+    };
+    switch (op.kind) {
+    case ComputeKind::AddCC: case ComputeKind::SubCC: return binary(ValueKind::Ciphertext, false);
+    case ComputeKind::AddCP: case ComputeKind::SubCP: return binary(ValueKind::Plaintext, false);
+    case ComputeKind::MulCC: return binary(ValueKind::Ciphertext, true);
+    case ComputeKind::MulCP: return binary(ValueKind::Plaintext, true);
+    case ComputeKind::Negate: case ComputeKind::Rotate: return unary();
+    case ComputeKind::Rescale: {
+        auto metadata = unary();
+        const auto attrs = std::get<RescaleAttrs>(op.attrs);
+        if (attrs.target_level >= metadata.level) throw std::runtime_error("rescale must lower level");
+        metadata.level = attrs.target_level;
+        metadata.scale_log2 = attrs.target_scale_log2;
+        return metadata;
+    }
+    case ComputeKind::ModSwitch: {
+        auto metadata = unary();
+        const int target = std::get<ModSwitchAttrs>(op.attrs).target_level;
+        if (target >= metadata.level) throw std::runtime_error("modswitch must lower level");
+        metadata.level = target;
+        return metadata;
+    }
+    case ComputeKind::Relinearize: {
+        auto metadata = unary();
+        if (metadata.components <= 2) throw std::runtime_error("relinearize requires more than two components");
+        metadata.components = 2;
+        return metadata;
+    }
+    case ComputeKind::Boot: {
+        auto metadata = unary();
+        const auto attrs = std::get<BootAttrs>(op.attrs);
+        metadata.level = attrs.target_level;
+        metadata.scale_log2 = attrs.target_scale_log2;
+        metadata.components = attrs.target_components;
+        return metadata;
+    }
+    }
+    throw std::runtime_error("unsupported compute operation");
 }
 
 VecPayload VecExecutor::compute_now(const ComputeOp &op, const std::vector<VecValue> &inputs) {

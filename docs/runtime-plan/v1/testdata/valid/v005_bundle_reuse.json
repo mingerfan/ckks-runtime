@@ -1,6 +1,6 @@
 {
-  "format_version": 2,
-  "plan_id": "1",
+  "format_version": 1,
+  "plan_id": "5",
   "target": {
     "target_id": "poseidon-ckks-cpu",
     "capability_version": 1,
@@ -17,19 +17,6 @@
   "values": [
     {
       "id": "1",
-      "kind": "ciphertext",
-      "place": {
-        "kind": "host",
-        "rank": 0
-      },
-      "context": "ctx-main",
-      "level": 5,
-      "scale_log2": 40,
-      "ntt": true,
-      "components": 2
-    },
-    {
-      "id": "2",
       "kind": "plaintext",
       "place": {
         "kind": "host",
@@ -42,56 +29,49 @@
       "components": 1
     },
     {
-      "id": "3",
-      "kind": "ciphertext",
+      "id": "2",
+      "kind": "plaintext",
       "place": {
         "kind": "host",
         "rank": 0
       },
       "context": "ctx-main",
-      "level": 5,
-      "scale_log2": 40,
+      "level": 4,
+      "scale_log2": 20,
       "ntt": true,
-      "components": 2
+      "components": 1
     }
   ],
-  "external_inputs": [
-    "1"
-  ],
+  "external_inputs": [],
   "initialization": [
     {
       "ordinal": 0,
       "kind": "encode",
       "payload": {
-        "kind": "inline",
-        "values": [
-          1,
-          -0.0,
-          3.5,
-          -2
-        ]
+        "kind": "bundle",
+        "content": "sha256:e96073c2982060586f6307ec21b1ea98a68fc0c099dcee5f527d80d70e47967e"
+      },
+      "output": "1"
+    },
+    {
+      "ordinal": 1,
+      "kind": "encode",
+      "payload": {
+        "kind": "bundle",
+        "content": "sha256:e96073c2982060586f6307ec21b1ea98a68fc0c099dcee5f527d80d70e47967e"
       },
       "output": "2"
     }
   ],
-  "execution": [
-    {
-      "ordinal": 1,
-      "kind": "compute",
-      "op": "add_cp",
-      "place": {
-        "kind": "host",
-        "rank": 0
-      },
-      "inputs": [
-        "1",
-        "2"
-      ],
-      "output": "3"
-    }
-  ],
+  "execution": [],
   "finalization": [],
   "final_outputs": [
-    "3"
-  ]
+    "1",
+    "2"
+  ],
+  "plaintext_bundle": {
+    "id": "v005-demo-weights",
+    "version": 1,
+    "manifest_sha256": "sha256:b95504c2738001c1f0408ccdced8e9b799d4cd735b6008b5b84b1f0a184de5de"
+  }
 }

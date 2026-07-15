@@ -1,24 +1,17 @@
 {
   "format_version": 1,
-  "plan_id": "3",
+  "plan_id": "6",
   "target": {
     "target_id": "poseidon-ckks-gpu",
     "capability_version": 1,
     "operator_spec": {
       "id": "poseidon-ckks-gpu-v1",
       "version": 1,
-      "fingerprint": "sha256:6d78861376555678db29a3ac21ce5275a7118c98addf298e9ad8b1f4579da71c"
+      "source_sha256": "sha256:9b578bcac67c9ee2cace717ad9a6733053e46dbf574f195329ef1d255c9663eb"
     },
-    "rescale_mode": "lazy",
-    "boot_mode": "native",
-    "world_size": 2,
+    "world_size": 1,
     "device_counts": [
-      1,
       1
-    ],
-    "required_capabilities": [
-      "transfer",
-      "replicate"
     ]
   },
   "values": [
@@ -30,7 +23,7 @@
         "rank": 0
       },
       "context": "ctx-main",
-      "level": 5,
+      "level": 2,
       "scale_log2": 40,
       "ntt": true,
       "components": 2
@@ -44,7 +37,7 @@
         "index": 0
       },
       "context": "ctx-main",
-      "level": 5,
+      "level": 2,
       "scale_log2": 40,
       "ntt": true,
       "components": 2
@@ -54,24 +47,11 @@
       "kind": "ciphertext",
       "place": {
         "kind": "device",
-        "rank": 1,
+        "rank": 0,
         "index": 0
       },
       "context": "ctx-main",
-      "level": 5,
-      "scale_log2": 40,
-      "ntt": true,
-      "components": 2
-    },
-    {
-      "id": "4",
-      "kind": "ciphertext",
-      "place": {
-        "kind": "host",
-        "rank": 1
-      },
-      "context": "ctx-main",
-      "level": 5,
+      "level": 12,
       "scale_log2": 40,
       "ntt": true,
       "components": 2
@@ -80,12 +60,11 @@
   "external_inputs": [
     "1"
   ],
-  "required_keys": [],
   "initialization": [
     {
       "ordinal": 0,
       "kind": "transfer",
-      "transfer_id": "1",
+      "transfer_id": "300",
       "hint": "auto",
       "inputs": [
         "1"
@@ -114,44 +93,28 @@
   "execution": [
     {
       "ordinal": 1,
-      "kind": "replicate",
-      "transfer_id": "7",
-      "hint": "broadcast",
+      "kind": "compute",
+      "op": "boot",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
       "inputs": [
         "2"
       ],
-      "outputs": [
-        "3",
-        "4"
-      ],
-      "sources": [
-        {
-          "kind": "device",
-          "rank": 0,
-          "index": 0
-        }
-      ],
-      "destinations": [
-        {
-          "kind": "device",
-          "rank": 1,
-          "index": 0
-        },
-        {
-          "kind": "host",
-          "rank": 1
-        }
-      ],
-      "output_kinds": [
-        "ciphertext",
-        "ciphertext"
-      ]
+      "output": "3",
+      "attrs": {
+        "target_level": 12,
+        "target_scale_log2": 40,
+        "target_components": 2,
+        "operator_profile": "poseidon-native-boot-v1",
+        "implementation": "native"
+      }
     }
   ],
   "finalization": [],
   "final_outputs": [
-    "3",
-    "4"
-  ],
-  "fingerprint": "sha256:762c3725e362850055e78d798ab5119ba53890ecd1dddb11347b44119168b916"
+    "3"
+  ]
 }

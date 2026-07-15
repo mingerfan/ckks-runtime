@@ -28,21 +28,29 @@ int main(int argc, char **argv) {
 
     const bool inject_error = argc == 2 && std::strcmp(argv[1], "--inject-error") == 0;
     const bool inject_large_transfer_id = argc == 2 && std::strcmp(argv[1], "--inject-large-transfer-id") == 0;
+    const bool inject_digest_mismatch = argc == 2 && std::strcmp(argv[1], "--digest-mismatch") == 0;
+    const bool inject_skip_mismatch = argc == 2 && std::strcmp(argv[1], "--skip-mismatch") == 0;
     auto built = make_fanout_plan(std::vector<int>(static_cast<std::size_t>(world), 1));
     if (inject_large_transfer_id)
         std::get<CommAction>(built.plan.initialization.at(1).body).id = std::numeric_limits<TransferId>::max();
-    const VecValue cipher = make_cipher({1, 2, 3, 4}, "mpi-ctx", 16384, 3, 1);
-    const VecValue plain = make_plain({2, 3, 4, 5}, "mpi-ctx", 16384, 3, 1);
+    for (auto &desc : built.plan.values) desc.context = "ctx";
+    const VecValue cipher = make_cipher({1, 2, 3, 4}, "ctx", 8192, 3, 1);
+    const VecValue plain = make_plain({2, 3, 4, 5}, "ctx", 8192, 3, 1);
     const auto reference = run_fanout_reference(cipher, plain);
 
     MpiVecApi api;
     SequentialRuntime<MpiVecApi> runtime(rank, world, 1, api);
     std::unordered_map<ValueId, VecValue> inputs;
     if (rank == 0) {
-        inputs.emplace(0, inject_error ? make_plain({1, 2, 3, 4}, "mpi-ctx", 16384, 3, 1) : cipher.deep_copy());
+        inputs.emplace(0, inject_error ? make_plain({1, 2, 3, 4}, "ctx", 8192, 3, 1) : cipher.deep_copy());
         inputs.emplace(1, plain.deep_copy());
     }
-    const auto artifact = runtime.run(built.plan, inputs, DiffMode::FinalOnly);
+    const LoadedRuntimePlan loaded{built.plan, inject_digest_mismatch && rank == world - 1
+        ? "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        : "sha256:1111111111111111111111111111111111111111111111111111111111111111"};
+    const RuntimeResources resources{built.operator_spec, std::nullopt,
+        inject_skip_mismatch && rank == world - 1};
+    const auto artifact = runtime.run(loaded, resources, inputs, DiffMode::FinalOnly);
 
     int local_ok = 1;
     if (rank == world - 1) {

@@ -12,9 +12,12 @@ set_policy("check.auto_ignore_flags", false)
 target("runtime_core")
     set_kind("static")
     add_includedirs(".", {public = true})
+    add_includedirs("third_party")
     add_files(
         "runtime/plan.cpp",
         "runtime/verifier.cpp",
+        "runtime/plaintext_bundle.cpp",
+        "runtime/utils/sha256.cpp",
         "api/vec_value.cpp",
         "api/vec_api.cpp",
         "api/mock_api.cpp",
@@ -25,13 +28,16 @@ target("runtime_plan_json")
     set_kind("static")
     add_includedirs(".", {public = true})
     add_includedirs("third_party")
-    add_files("runtime/json_plan_reader.cpp", "runtime/utils/sha256.cpp")
+    add_files(
+        "runtime/json_plan_reader.cpp",
+        "runtime/operator_spec_reader.cpp")
     add_deps("runtime_core")
 
 target("runtime_tests")
     set_kind("binary")
     add_files("tests/runtime_tests.cpp")
-    add_deps("runtime_core")
+    add_deps("runtime_plan_json")
+    add_defines("CKKS_RUNTIME_SOURCE_DIR=\"$(projectdir)\"")
 
 target("runtime_plan_json_tests")
     set_kind("binary")

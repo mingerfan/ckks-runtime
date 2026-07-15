@@ -1,327 +1,86 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ckks-runtime/runtime-plan/v1/schema.json",
-  "title": "RuntimePlan V1 previous-draft schema",
-  "description": "上一版草案的机器结构约束:尚无显式 Encode,不允许 inline 浮点 payload,并仍含旧的自嵌 fingerprint。目标格式改用原始文件字节摘要,见 specification.md;迁移完成前不要把本 Schema 当作最终 V1。",
+  "title": "RuntimePlan V1",
   "type": "object",
   "additionalProperties": false,
-  "required": [
-    "format_version", "plan_id", "fingerprint", "target", "values",
-    "external_inputs", "required_keys", "initialization", "execution",
-    "finalization", "final_outputs"
-  ],
+  "required": ["format_version", "plan_id", "target", "values", "external_inputs", "initialization", "execution", "finalization", "final_outputs"],
   "properties": {
     "format_version": { "const": 1 },
     "plan_id": { "$ref": "#/$defs/id64" },
-    "fingerprint": { "$ref": "#/$defs/fingerprint" },
     "target": { "$ref": "#/$defs/target" },
     "plaintext_bundle": { "$ref": "#/$defs/plaintextBundleRef" },
-    "values": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/valueDesc" }
-    },
-    "external_inputs": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/id64" }
-    },
-    "required_keys": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/keyRequirement" }
-    },
+    "values": { "type": "array", "items": { "$ref": "#/$defs/valueDesc" } },
+    "external_inputs": { "type": "array", "items": { "$ref": "#/$defs/id64" } },
     "initialization": { "$ref": "#/$defs/instructionList" },
     "execution": { "$ref": "#/$defs/instructionList" },
     "finalization": { "$ref": "#/$defs/instructionList" },
-    "final_outputs": {
-      "type": "array",
-      "minItems": 1,
-      "items": { "$ref": "#/$defs/id64" }
-    }
+    "final_outputs": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/id64" } }
   },
   "$defs": {
-    "id64": {
-      "type": "string",
-      "pattern": "^(0|[1-9][0-9]*)$"
-    },
-    "fingerprint": {
-      "type": "string",
-      "pattern": "^sha256:[0-9a-f]{64}$"
-    },
-    "smallNonNegInt": {
-      "type": "integer",
-      "minimum": 0,
-      "maximum": 2147483647
-    },
-    "plaintextBundleRef": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["id", "version", "fingerprint"],
-      "properties": {
-        "id": { "type": "string", "minLength": 1 },
-        "version": { "type": "integer", "minimum": 1 },
-        "fingerprint": { "$ref": "#/$defs/fingerprint" }
-      }
+    "id64": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" },
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "nonnegativeInteger": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
+    "place": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["kind", "rank"], "properties": { "kind": { "const": "host" }, "rank": { "$ref": "#/$defs/nonnegativeInteger" } } },
+        { "type": "object", "additionalProperties": false, "required": ["kind", "rank", "index"], "properties": { "kind": { "const": "device" }, "rank": { "$ref": "#/$defs/nonnegativeInteger" }, "index": { "$ref": "#/$defs/nonnegativeInteger" } } }
+      ]
     },
     "target": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "target_id", "capability_version", "operator_spec", "rescale_mode",
-        "boot_mode", "world_size", "device_counts", "required_capabilities"
-      ],
+      "type": "object", "additionalProperties": false,
+      "required": ["target_id", "capability_version", "operator_spec", "world_size", "device_counts"],
       "properties": {
         "target_id": { "type": "string", "minLength": 1 },
         "capability_version": { "type": "integer", "minimum": 1 },
-        "operator_spec": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["id", "version", "fingerprint"],
-          "properties": {
-            "id": { "type": "string", "minLength": 1 },
-            "version": { "type": "integer", "minimum": 1 },
-            "fingerprint": { "$ref": "#/$defs/fingerprint" }
-          }
-        },
-        "rescale_mode": { "enum": ["eager", "lazy"] },
-        "boot_mode": { "enum": ["native", "decrypt_reencrypt"] },
+        "operator_spec": { "type": "object", "additionalProperties": false, "required": ["id", "version", "source_sha256"], "properties": { "id": { "type": "string", "minLength": 1 }, "version": { "type": "integer", "minimum": 1 }, "source_sha256": { "$ref": "#/$defs/sha256" } } },
         "world_size": { "type": "integer", "minimum": 1 },
-        "device_counts": {
-          "type": "array",
-          "minItems": 1,
-          "items": { "$ref": "#/$defs/smallNonNegInt" }
-        },
-        "required_capabilities": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": {
-            "enum": ["transfer", "replicate", "host_compute", "boot_native", "boot_decrypt_reencrypt"]
-          }
-        }
+        "device_counts": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/nonnegativeInteger" } }
       }
     },
-    "hostPlace": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["kind", "rank"],
-      "properties": {
-        "kind": { "const": "host" },
-        "rank": { "$ref": "#/$defs/smallNonNegInt" }
-      }
-    },
-    "devicePlace": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["kind", "rank", "index"],
-      "properties": {
-        "kind": { "const": "device" },
-        "rank": { "$ref": "#/$defs/smallNonNegInt" },
-        "index": { "$ref": "#/$defs/smallNonNegInt" }
-      }
-    },
-    "place": {
-      "oneOf": [
-        { "$ref": "#/$defs/hostPlace" },
-        { "$ref": "#/$defs/devicePlace" }
-      ]
-    },
-    "valueKind": { "enum": ["ciphertext", "plaintext"] },
+    "plaintextBundleRef": { "type": "object", "additionalProperties": false, "required": ["id", "version", "manifest_sha256"], "properties": { "id": { "type": "string", "minLength": 1 }, "version": { "type": "integer", "minimum": 1 }, "manifest_sha256": { "$ref": "#/$defs/sha256" } } },
     "valueDesc": {
-      "type": "object",
-      "additionalProperties": false,
+      "type": "object", "additionalProperties": false,
       "required": ["id", "kind", "place", "context", "level", "scale_log2", "ntt", "components"],
+      "properties": { "id": { "$ref": "#/$defs/id64" }, "kind": { "enum": ["plaintext", "ciphertext"] }, "place": { "$ref": "#/$defs/place" }, "context": { "type": "string", "minLength": 1 }, "level": { "$ref": "#/$defs/nonnegativeInteger" }, "scale_log2": { "$ref": "#/$defs/nonnegativeInteger" }, "ntt": { "type": "boolean" }, "components": { "type": "integer", "minimum": 1 } }
+    },
+    "instructionList": { "type": "array", "items": { "$ref": "#/$defs/instruction" } },
+    "instruction": { "oneOf": [ { "$ref": "#/$defs/encode" }, { "$ref": "#/$defs/compute" }, { "$ref": "#/$defs/communication" } ] },
+    "encode": {
+      "type": "object", "additionalProperties": false, "required": ["ordinal", "kind", "payload", "output"],
       "properties": {
-        "id": { "$ref": "#/$defs/id64" },
-        "kind": { "$ref": "#/$defs/valueKind" },
-        "place": { "$ref": "#/$defs/place" },
-        "context": { "type": "string", "minLength": 1 },
-        "level": { "$ref": "#/$defs/smallNonNegInt" },
-        "scale_log2": { "$ref": "#/$defs/smallNonNegInt" },
-        "ntt": { "type": "boolean" },
-        "components": { "type": "integer", "minimum": 1, "maximum": 2147483647 }
+        "ordinal": { "$ref": "#/$defs/nonnegativeInteger" }, "kind": { "const": "encode" }, "output": { "$ref": "#/$defs/id64" },
+        "payload": { "oneOf": [
+          { "type": "object", "additionalProperties": false, "required": ["kind", "values"], "properties": { "kind": { "const": "inline" }, "values": { "type": "array", "minItems": 1, "items": { "type": "number" } } } },
+          { "type": "object", "additionalProperties": false, "required": ["kind", "content"], "properties": { "kind": { "const": "bundle" }, "content": { "$ref": "#/$defs/sha256" } } }
+        ] }
       }
     },
-    "keyRequirement": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["kind", "place"],
+    "compute": {
+      "type": "object", "additionalProperties": false, "required": ["ordinal", "kind", "op", "place", "inputs", "output"],
       "properties": {
-        "kind": { "enum": ["secret", "relin", "galois"] },
-        "place": { "$ref": "#/$defs/place" }
-      }
-    },
-    "instructionList": {
-      "type": "array",
-      "items": {
-        "oneOf": [
-          { "$ref": "#/$defs/computeInstruction" },
-          { "$ref": "#/$defs/commInstruction" }
-        ]
-      }
-    },
-    "computeInstruction": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["ordinal", "kind", "op", "place", "inputs", "output"],
-      "properties": {
-        "ordinal": { "$ref": "#/$defs/smallNonNegInt" },
-        "kind": { "const": "compute" },
-        "op": {
-          "enum": [
-            "add_cc", "add_cp", "sub_cc", "sub_cp", "mul_cc", "mul_cp",
-            "negate", "rotate", "rescale", "mod_switch", "relinearize", "boot"
-          ]
-        },
-        "place": { "$ref": "#/$defs/place" },
-        "inputs": {
-          "type": "array",
-          "minItems": 1,
-          "maxItems": 2,
-          "items": { "$ref": "#/$defs/id64" }
-        },
-        "output": { "$ref": "#/$defs/id64" },
-        "attrs": { "type": "object" }
+        "ordinal": { "$ref": "#/$defs/nonnegativeInteger" }, "kind": { "const": "compute" },
+        "op": { "enum": ["add_cc", "add_cp", "sub_cc", "sub_cp", "mul_cc", "mul_cp", "negate", "rotate", "rescale", "mod_switch", "relinearize", "boot"] },
+        "place": { "$ref": "#/$defs/place" }, "inputs": { "type": "array", "minItems": 1, "maxItems": 2, "items": { "$ref": "#/$defs/id64" } }, "output": { "$ref": "#/$defs/id64" }, "attrs": { "type": "object" }
       },
       "allOf": [
-        {
-          "if": { "properties": { "op": { "enum": ["add_cc", "add_cp", "sub_cc", "sub_cp", "mul_cc", "mul_cp"] } } },
-          "then": {
-            "properties": { "inputs": { "minItems": 2, "maxItems": 2 } },
-            "not": { "required": ["attrs"] }
-          }
-        },
-        {
-          "if": { "properties": { "op": { "enum": ["negate", "relinearize"] } } },
-          "then": {
-            "properties": { "inputs": { "minItems": 1, "maxItems": 1 } },
-            "not": { "required": ["attrs"] }
-          }
-        },
-        {
-          "if": { "properties": { "op": { "const": "rotate" } } },
-          "then": {
-            "required": ["attrs"],
-            "properties": {
-              "inputs": { "minItems": 1, "maxItems": 1 },
-              "attrs": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["steps"],
-                "properties": {
-                  "steps": { "type": "integer", "not": { "const": 0 } }
-                }
-              }
-            }
-          }
-        },
-        {
-          "if": { "properties": { "op": { "const": "rescale" } } },
-          "then": {
-            "required": ["attrs"],
-            "properties": {
-              "inputs": { "minItems": 1, "maxItems": 1 },
-              "attrs": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["target_level", "target_scale_log2"],
-                "properties": {
-                  "target_level": { "$ref": "#/$defs/smallNonNegInt" },
-                  "target_scale_log2": { "$ref": "#/$defs/smallNonNegInt" }
-                }
-              }
-            }
-          }
-        },
-        {
-          "if": { "properties": { "op": { "const": "mod_switch" } } },
-          "then": {
-            "required": ["attrs"],
-            "properties": {
-              "inputs": { "minItems": 1, "maxItems": 1 },
-              "attrs": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["target_level"],
-                "properties": {
-                  "target_level": { "$ref": "#/$defs/smallNonNegInt" }
-                }
-              }
-            }
-          }
-        },
-        {
-          "if": { "properties": { "op": { "const": "boot" } } },
-          "then": {
-            "required": ["attrs"],
-            "properties": {
-              "inputs": { "minItems": 1, "maxItems": 1 },
-              "attrs": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["target_level", "target_scale_log2", "target_components", "operator_profile", "implementation"],
-                "properties": {
-                  "target_level": { "$ref": "#/$defs/smallNonNegInt" },
-                  "target_scale_log2": { "$ref": "#/$defs/smallNonNegInt" },
-                  "target_components": { "type": "integer", "minimum": 1 },
-                  "operator_profile": { "type": "string", "minLength": 1 },
-                  "implementation": { "enum": ["native", "decrypt_reencrypt"] }
-                }
-              }
-            }
-          }
-        }
+        { "if": { "properties": { "op": { "enum": ["add_cc", "add_cp", "sub_cc", "sub_cp", "mul_cc", "mul_cp", "negate", "relinearize"] } } }, "then": { "not": { "required": ["attrs"] } } },
+        { "if": { "properties": { "op": { "const": "rotate" } } }, "then": { "required": ["attrs"], "properties": { "attrs": { "type": "object", "additionalProperties": false, "required": ["steps"], "properties": { "steps": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647, "not": { "const": 0 } } } } } } },
+        { "if": { "properties": { "op": { "const": "rescale" } } }, "then": { "required": ["attrs"], "properties": { "attrs": { "type": "object", "additionalProperties": false, "required": ["target_level", "target_scale_log2"], "properties": { "target_level": { "$ref": "#/$defs/nonnegativeInteger" }, "target_scale_log2": { "$ref": "#/$defs/nonnegativeInteger" } } } } } },
+        { "if": { "properties": { "op": { "const": "mod_switch" } } }, "then": { "required": ["attrs"], "properties": { "attrs": { "type": "object", "additionalProperties": false, "required": ["target_level"], "properties": { "target_level": { "$ref": "#/$defs/nonnegativeInteger" } } } } } },
+        { "if": { "properties": { "op": { "const": "boot" } } }, "then": { "required": ["attrs"], "properties": { "attrs": { "type": "object", "additionalProperties": false, "required": ["target_level", "target_scale_log2", "target_components", "operator_profile", "implementation"], "properties": { "target_level": { "$ref": "#/$defs/nonnegativeInteger" }, "target_scale_log2": { "$ref": "#/$defs/nonnegativeInteger" }, "target_components": { "type": "integer", "minimum": 1 }, "operator_profile": { "type": "string", "minLength": 1 }, "implementation": { "enum": ["native", "decrypt_reencrypt"] } } } } } }
       ]
     },
-    "commInstruction": {
-      "type": "object",
-      "additionalProperties": false,
+    "communication": {
+      "type": "object", "additionalProperties": false,
       "required": ["ordinal", "kind", "transfer_id", "hint", "inputs", "outputs", "sources", "destinations", "output_kinds"],
       "properties": {
-        "ordinal": { "$ref": "#/$defs/smallNonNegInt" },
-        "kind": { "enum": ["transfer", "replicate"] },
-        "transfer_id": { "$ref": "#/$defs/id64" },
+        "ordinal": { "$ref": "#/$defs/nonnegativeInteger" }, "kind": { "enum": ["transfer", "replicate"] }, "transfer_id": { "$ref": "#/$defs/id64" },
         "hint": { "enum": ["auto", "point_to_point", "broadcast", "tree", "ring", "host_staged"] },
-        "inputs": {
-          "type": "array", "minItems": 1, "maxItems": 1,
-          "items": { "$ref": "#/$defs/id64" }
-        },
-        "outputs": {
-          "type": "array", "minItems": 1,
-          "items": { "$ref": "#/$defs/id64" }
-        },
-        "sources": {
-          "type": "array", "minItems": 1, "maxItems": 1,
-          "items": { "$ref": "#/$defs/place" }
-        },
-        "destinations": {
-          "type": "array", "minItems": 1,
-          "items": { "$ref": "#/$defs/place" }
-        },
-        "output_kinds": {
-          "type": "array", "minItems": 1,
-          "items": { "$ref": "#/$defs/valueKind" }
-        }
-      },
-      "allOf": [
-        {
-          "if": { "properties": { "kind": { "const": "transfer" } } },
-          "then": {
-            "properties": {
-              "outputs": { "maxItems": 1 },
-              "destinations": { "maxItems": 1 },
-              "output_kinds": { "maxItems": 1 }
-            }
-          }
-        },
-        {
-          "if": { "properties": { "kind": { "const": "replicate" } } },
-          "then": {
-            "properties": {
-              "outputs": { "minItems": 2 },
-              "destinations": { "minItems": 2 },
-              "output_kinds": { "minItems": 2 }
-            }
-          }
-        }
-      ]
+        "inputs": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "$ref": "#/$defs/id64" } }, "outputs": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/id64" } },
+        "sources": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "$ref": "#/$defs/place" } }, "destinations": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/place" } },
+        "output_kinds": { "type": "array", "minItems": 1, "items": { "enum": ["plaintext", "ciphertext"] } }
+      }
     }
   }
 }

@@ -10,17 +10,29 @@ MockCluster::MockCluster(MockClusterConfig config) : config_(std::move(config)) 
     if (config_.world_size <= 0 || config_.max_delay_ms < 0) throw std::runtime_error("invalid MockCluster configuration");
 }
 
-void MockCluster::preflight(int rank, std::uint64_t fingerprint) {
+void MockCluster::preflight(int rank, std::string plan_source_sha256,
+                            bool skip_artifact_digest_checks) {
     std::unique_lock<std::mutex> lock(mutex_);
-    if (!fingerprints_.emplace(rank, fingerprint).second) throw std::runtime_error("rank called preflight twice");
+    if (!plan_digests_.emplace(rank, std::move(plan_source_sha256)).second)
+        throw std::runtime_error("rank called preflight twice");
+    skip_digest_checks_.emplace(rank, skip_artifact_digest_checks);
     cv_.notify_all();
-    cv_.wait(lock, [&] { return aborted_ || fingerprints_.size() == static_cast<std::size_t>(config_.world_size); });
+    cv_.wait(lock, [&] { return aborted_ || plan_digests_.size() == static_cast<std::size_t>(config_.world_size); });
     if (aborted_) throw ClusterPanic(abort_reason_);
-    const auto expected = fingerprints_.begin()->second;
-    for (const auto &entry : fingerprints_) {
-        if (entry.second != expected) {
+    const bool skip = skip_digest_checks_.begin()->second;
+    for (const auto &entry : skip_digest_checks_) {
+        if (entry.second != skip) {
             aborted_ = true;
-            abort_reason_ = "plan fingerprint mismatch across mock ranks";
+            abort_reason_ = "skip_artifact_digest_checks mismatch across mock ranks";
+            cv_.notify_all();
+            throw ClusterPanic(abort_reason_);
+        }
+    }
+    if (!skip) {
+        const auto &expected = plan_digests_.begin()->second;
+        for (const auto &entry : plan_digests_) if (entry.second != expected) {
+            aborted_ = true;
+            abort_reason_ = "plan source SHA-256 mismatch across mock ranks";
             cv_.notify_all();
             throw ClusterPanic(abort_reason_);
         }
@@ -36,6 +48,13 @@ int MockCluster::delay_ms(TransferId id, std::size_t slot) const {
 
 bool MockCluster::corrupt_output_count(TransferId id) const { return config_.corrupt_output_count.count(id) != 0; }
 bool MockCluster::corrupt_output_type(TransferId id) const { return config_.corrupt_output_type.count(id) != 0; }
+bool MockCluster::corrupt_output_metadata(TransferId id) const { return config_.corrupt_output_metadata.count(id) != 0; }
+bool MockCluster::capability_available(RequiredCapability capability) const {
+    return config_.missing_capabilities.count(capability) == 0;
+}
+bool MockCluster::key_available(const KeyRequirement &key) const {
+    return config_.missing_keys.count(key) == 0;
+}
 
 void MockCluster::publish(TransferId id, std::size_t slot, VecValue value) {
     const int delay = delay_ms(id, slot);
@@ -74,6 +93,12 @@ MockVecApi::MockVecApi(int rank, std::shared_ptr<MockCluster> cluster, VecExecCo
 }
 
 MockVecApi::~MockVecApi() = default;
+
+MockVecApi::Value MockVecApi::encode_plaintext(const ValueDesc &output_desc,
+                                               const std::vector<double> &slots) {
+    return make_plain(slots, output_desc.context, poly_degree_, output_desc.level,
+                      output_desc.scale_log2, output_desc.ntt);
+}
 
 MockVecApi::Value MockVecApi::compute(const ComputeOp &op, const std::vector<Value> &inputs) {
     { std::lock_guard<std::mutex> lock(stats_mutex_); ++stats_.compute_calls; }
@@ -130,6 +155,11 @@ std::vector<MockVecApi::Value> MockVecApi::wait(CommHandle &handle) {
         payload.metadata.components = payload.kind == ValueKind::Plaintext ? 1 : 2;
         outputs.front() = VecValue::ready(std::move(payload));
     }
+    if (cluster_->corrupt_output_metadata(handle.id) && !outputs.empty()) {
+        VecPayload payload = outputs.front().materialize();
+        ++payload.metadata.level;
+        outputs.front() = VecValue::ready(std::move(payload));
+    }
     {
         std::lock_guard<std::mutex> lock(stats_mutex_);
         ++stats_.completed_handles;
@@ -139,7 +169,33 @@ std::vector<MockVecApi::Value> MockVecApi::wait(CommHandle &handle) {
 
 void MockVecApi::synchronize(Value &value) { static_cast<void>(value.materialize()); }
 
-void MockVecApi::preflight(std::uint64_t fingerprint) { cluster_->preflight(rank_, fingerprint); }
+void MockVecApi::preflight(std::string_view plan_source_sha256,
+                           bool skip_artifact_digest_checks,
+                           const TargetConfig &target,
+                           const OperatorSpec &operator_spec,
+                           const PlanRequirements &requirements) {
+    poly_degree_ = operator_spec.poly_degree;
+    if (target.capability_version != 1) throw std::runtime_error("MockVecApi does not support target capability_version");
+    for (RequiredCapability capability : requirements.capabilities)
+        if (!cluster_->capability_available(capability))
+            throw std::runtime_error("Api lacks required capability: " + to_string(capability));
+    for (const auto &key : requirements.keys)
+        if (!cluster_->key_available(key)) {
+            std::string message = "Api lacks required " + to_string(key.kind) + " key at " + to_string(key.place);
+            if (key.rotation_step) message += " for rotation step " + std::to_string(*key.rotation_step);
+            throw std::runtime_error(message);
+        }
+    cluster_->preflight(rank_, std::string(plan_source_sha256), skip_artifact_digest_checks);
+}
+
+void MockVecApi::validate_value(const Value &value, const ValueDesc &expected) const {
+    const VecMetadata metadata = value.metadata();
+    if (value.kind() != expected.kind || metadata.context != expected.context ||
+        metadata.degree != poly_degree_ || metadata.level != expected.level ||
+        metadata.scale_log2 != expected.scale_log2 || metadata.ntt != expected.ntt ||
+        metadata.components != expected.components)
+        throw std::runtime_error("Api value metadata does not match ValueDesc " + std::to_string(expected.id));
+}
 
 [[noreturn]] void MockVecApi::abort_all(int, const std::string &reason) { cluster_->abort_all(reason); }
 

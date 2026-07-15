@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fhegpu {
@@ -32,9 +33,10 @@ class VecValue {
 public:
     VecValue() = default;
     static VecValue ready(VecPayload payload);
-    static VecValue pending(ValueKind expected_kind);
+    static VecValue pending(ValueKind expected_kind, VecMetadata expected_metadata);
 
     ValueKind kind() const;
+    VecMetadata metadata() const;
     VecPayload materialize() const;
     VecValue deep_copy() const;
     void fulfill(VecPayload payload) const;
@@ -43,8 +45,10 @@ public:
 
 private:
     struct State {
-        explicit State(ValueKind kind) : expected_kind(kind) {}
+        State(ValueKind kind, VecMetadata metadata)
+            : expected_kind(kind), expected_metadata(std::move(metadata)) {}
         ValueKind expected_kind;
+        VecMetadata expected_metadata;
         mutable std::mutex mutex;
         mutable std::condition_variable cv;
         bool ready = false;

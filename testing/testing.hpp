@@ -4,6 +4,8 @@
 #include "runtime/runtime.hpp"
 
 #include <unordered_map>
+#include <filesystem>
+#include <optional>
 
 namespace fhegpu {
 
@@ -16,6 +18,7 @@ using DiffMap = std::vector<DiffPoint>;
 
 struct BuiltPlan {
     RuntimePlan plan;
+    LoadedOperatorSpec operator_spec;
     DiffMap diff_map;
     ValueId reference_output = 0;
 };
@@ -39,9 +42,12 @@ struct HarnessResult {
 };
 
 HarnessResult run_mock_cluster(const RuntimePlan &plan,
+                               const LoadedOperatorSpec &operator_spec,
                                const std::unordered_map<ValueId, VecValue> &rank0_inputs,
                                MockClusterConfig cluster_config,
                                VecExecConfig exec_config,
-                               DiffMode diff_mode = DiffMode::FinalOnly);
+                               DiffMode diff_mode = DiffMode::FinalOnly,
+                               bool skip_artifact_digest_checks = false,
+                               const std::vector<std::optional<std::filesystem::path>> &bundle_dirs = {});
 
 } // namespace fhegpu

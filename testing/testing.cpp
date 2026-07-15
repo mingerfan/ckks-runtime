@@ -18,6 +18,30 @@ ValueDesc value_desc(ValueId id, ValueKind kind, Place place, int scale_log2 = 1
                      kind == ValueKind::Plaintext ? 1 : 2};
 }
 
+LoadedOperatorSpec make_test_operator_spec() {
+    OperatorSpec spec;
+    spec.id = "vec-operator-spec";
+    spec.version = 1;
+    spec.status = "placeholder";
+    spec.target_id = "vec-fixed-target";
+    spec.context_id = "ctx";
+    spec.poly_degree = 8192;
+    spec.rns_moduli_log2 = {60, 40, 40, 40, 60};
+    spec.max_modulus_log2 = 60;
+    spec.default_scale_log2 = 40;
+    spec.level_lower_bound = 0;
+    spec.level_upper_bound = 4;
+    for (ComputeKind kind : {ComputeKind::AddCC, ComputeKind::AddCP, ComputeKind::SubCC,
+             ComputeKind::SubCP, ComputeKind::MulCC, ComputeKind::MulCP, ComputeKind::Negate,
+             ComputeKind::Rotate, ComputeKind::Rescale, ComputeKind::ModSwitch,
+             ComputeKind::Relinearize, ComputeKind::Boot})
+        spec.operators.emplace(kind, OperatorSupport{true, std::nullopt,
+            kind == ComputeKind::Rescale ? std::optional<int>{2} : std::nullopt});
+    spec.boot_profiles.push_back(BootProfile{"test-boot", BootImplementation::DecryptReencrypt,
+        0, 4, 2, 4, 1, 2, 1, true, true});
+    return {std::move(spec), "sha256:0000000000000000000000000000000000000000000000000000000000000000"};
+}
+
 } // namespace
 
 BuiltPlan make_fanout_plan(const std::vector<int> &device_counts) {
@@ -31,6 +55,7 @@ BuiltPlan make_fanout_plan(const std::vector<int> &device_counts) {
     if (devices.empty()) throw std::runtime_error("fanout plan requires at least one device");
 
     BuiltPlan built;
+    built.operator_spec = make_test_operator_spec();
     auto &plan = built.plan;
     plan.plan_id = 0x46504750554c4cULL;
     plan.target.target_id = "vec-fixed-target";
@@ -39,7 +64,6 @@ BuiltPlan make_fanout_plan(const std::vector<int> &device_counts) {
     plan.target.capability_version = 1;
     plan.target.operator_spec = {"vec-operator-spec", 1,
         "sha256:0000000000000000000000000000000000000000000000000000000000000000"};
-    plan.target.required_capabilities = {RequiredCapability::Transfer};
     ValueId next_value = 0;
     TransferId next_transfer = 100;
     std::size_t ordinal = 0;
@@ -64,7 +88,6 @@ BuiltPlan make_fanout_plan(const std::vector<int> &device_counts) {
         plan.values.push_back(value_desc(id, ValueKind::Plaintext, place));
     }
     const bool replicate_plain = devices.size() > 1;
-    if (replicate_plain) plan.target.required_capabilities.push_back(RequiredCapability::Replicate);
     plan.initialization.push_back(instruction(ordinal++, CommAction{
         next_transfer++, replicate_plain ? CommKind::Replicate : CommKind::Transfer,
         replicate_plain ? CommHint::Broadcast : CommHint::PointToPoint,
@@ -87,7 +110,8 @@ BuiltPlan make_fanout_plan(const std::vector<int> &device_counts) {
             products[outputs.size()] = id;
             plan.values.push_back(value_desc(id, ValueKind::Ciphertext, place, 2));
         }
-        plan.execution.push_back(instruction(ordinal++, CommAction{next_transfer++, CommKind::Replicate, CommHint::Broadcast,
+        const CommKind product_comm_kind = outputs.size() == 1 ? CommKind::Transfer : CommKind::Replicate;
+        plan.execution.push_back(instruction(ordinal++, CommAction{next_transfer++, product_comm_kind, CommHint::Broadcast,
             {product}, outputs, {devices.front()}, destinations, types}));
     }
 
@@ -154,10 +178,13 @@ void compare_values(const VecValue &actual_value, const VecValue &expected_value
 }
 
 HarnessResult run_mock_cluster(const RuntimePlan &plan,
+                               const LoadedOperatorSpec &operator_spec,
                                const std::unordered_map<ValueId, VecValue> &rank0_inputs,
                                MockClusterConfig cluster_config,
                                VecExecConfig exec_config,
-                               DiffMode diff_mode) {
+                               DiffMode diff_mode,
+                               bool skip_artifact_digest_checks,
+                               const std::vector<std::optional<std::filesystem::path>> &bundle_dirs) {
     cluster_config.world_size = plan.target.world_size;
     auto cluster = std::make_shared<MockCluster>(cluster_config);
     std::vector<std::unique_ptr<MockVecApi>> apis;
@@ -176,8 +203,13 @@ HarnessResult run_mock_cluster(const RuntimePlan &plan,
         threads.emplace_back([&, rank] {
             try {
                 const std::unordered_map<ValueId, VecValue> empty;
+                const LoadedRuntimePlan loaded{plan,
+                    "sha256:1111111111111111111111111111111111111111111111111111111111111111"};
+                const auto bundle_dir = bundle_dirs.empty() ? std::optional<std::filesystem::path>{}
+                    : bundle_dirs.at(static_cast<std::size_t>(rank));
+                const RuntimeResources resources{operator_spec, bundle_dir, skip_artifact_digest_checks};
                 artifacts[static_cast<std::size_t>(rank)] = runtimes[static_cast<std::size_t>(rank)]->run(
-                    plan, rank == 0 ? rank0_inputs : empty, diff_mode);
+                    loaded, resources, rank == 0 ? rank0_inputs : empty, diff_mode);
             } catch (...) { errors[static_cast<std::size_t>(rank)] = std::current_exception(); }
         });
     }

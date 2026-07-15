@@ -6,7 +6,7 @@
 
 - 未来逻辑 CKKS dialect 的语义；
 - 目标相关合法化、设备分配和通信显式化这些编译步骤；
-- 可执行 SSA 到 RuntimePlan V1 草案 JSON 的对应关系；
+- 可执行 SSA 到 RuntimePlan V1 JSON 的对应关系；
 - Runtime 内部 `runtime/plan.hpp` 的目标类型映射；
 - runtime 验证器依赖的稳定不变量。
 
@@ -86,7 +86,7 @@
 
 **Dist（或 Comm）dialect**：transfer、replicate、可选的集合通信；位置效果；可选的异步 token。
 
-设备分配 Pass 不需要新 dialect，它只是给 CKKS 算子加属性。跨 Dacapo 和 Runtime 的目标边界是 RuntimePlan V1 草案 JSON:可执行 CKKS 直接序列化成 JSON,Runtime 再解析成自己的 C++ 结构。V1 不需要额外创建一个 ckks-runtime MLIR dialect;以后只有在确实出现多个 MLIR 消费方时再考虑。
+设备分配 Pass 不需要新 dialect，它只是给 CKKS 算子加属性。跨 Dacapo 和 Runtime 的目标边界是 RuntimePlan V1 JSON：可执行 CKKS 直接序列化成 JSON，Runtime 再解析成自己的 C++ 结构。V1 不需要额外创建一个 ckks-runtime MLIR dialect；以后只有在确实出现多个 MLIR 消费方时再考虑。
 
 ## 4. 类型设计
 
@@ -101,7 +101,7 @@
 
 Dacapo 当前 Earth 类型里的 `scale` 已经是这个整数指数。对外协议改名为 `scale_log2`,只是把原有含义写清楚。
 
-Dacapo 的 Earth 分析阶段用“已经消耗多少层”的方向记录 level,Rescale 后数值增加;下降到 CKKS PolyType 时会换算成“还剩多少层”,Rescale 后数值下降。RuntimePlan V1 草案固定采用后者。序列化必须发生在这个换算之后。
+Dacapo 的 Earth 分析阶段用“已经消耗多少层”的方向记录 level，Rescale 后数值增加；下降到 CKKS PolyType 时会换算成“还剩多少层”，Rescale 后数值下降。RuntimePlan V1 固定采用后者。序列化必须发生在这个换算之后。
 
 在逻辑和已分配阶段,这些元信息可以放在类型、值属性或分析结果中;导出可执行计划之前必须全部落到每个值的描述符中,不能再是“可选信息”。
 
@@ -288,9 +288,9 @@ Boot 内部如果也需要 lazy-rescale,其合法输入范围、实际 level 消
 - **SSA**:每个 ValueId 恰好定义一次,没有未满足的 `result_places`,所有使用都被定义支配;
 - **通信**:源和目标属于编译目标,Transfer/Replicate 前后数学类型与元信息一致,输出和目标一一对应。
 
-### 7.6 导出 RuntimePlan V1 草案
+### 7.6 导出 RuntimePlan V1
 
-把可执行 CKKS 序列化成 RuntimePlan V1 草案 JSON。`ckks.encode` 一对一变成 initialization 中的 Encode 指令:内联 payload 写成浮点数组,引用 payload 写成 `content` 哈希,输出仍使用原来的 ValueId。JSON 是 Dacapo 与 Runtime 之间唯一的稳定协议。Runtime 读取后可以转成自己的 C++ `RuntimePlan`,但两边不共享 C++ 类型。首期不需要新 MLIR dialect。
+把可执行 CKKS 序列化成 RuntimePlan V1 JSON。`ckks.encode` 一对一变成 initialization 中的 Encode 指令：内联 payload 写成浮点数组，引用 payload 写成 `content` 哈希，输出仍使用原来的 ValueId。JSON 是 Dacapo 与 Runtime 之间唯一的稳定协议。Runtime 读取后可以转成自己的 C++ `RuntimePlan`，但两边不共享 C++ 类型。首期不需要新 MLIR dialect。
 
 ## 8. 等待与异步的表示
 
@@ -443,17 +443,15 @@ enum class KeyKind {
 struct KeyRequirement {
     KeyKind kind;
     Place place;
+    std::optional<int> rotation_step;
 };
 
 struct TargetConfig {
     std::string target_id;
     std::uint32_t capability_version;
     OperatorSpecRef operator_spec;
-    RescaleMode rescale_mode;
-    BootMode boot_mode;
     int world_size;
     std::vector<int> device_counts;
-    std::vector<RequiredCapability> required_capabilities;
 };
 
 struct RuntimePlan {
@@ -463,13 +461,19 @@ struct RuntimePlan {
     std::optional<PlaintextBundleRef> plaintext_bundle;
     std::vector<ValueDesc> values;
     std::vector<ValueId> external_inputs;
-    std::vector<KeyRequirement> required_keys;
     std::vector<Instruction> initialization;
     std::vector<Instruction> execution;
     std::vector<Instruction> finalization;
     std::vector<ValueId> final_outputs;
 };
+
+struct PlanRequirements {
+    std::vector<RequiredCapability> capabilities;
+    std::vector<KeyRequirement> keys;
+};
 ~~~
+
+`PlanRequirements` 由 Runtime 根据实际指令和 OperatorSpec 推导，不写回 RuntimePlan JSON。
 
 Rescale 和 Boot 不再使用 `double scale_divisor` 或 `double scale`;它们直接写目标 level 和整数 `target_scale_log2`。对 Replicate，`outputs.size()` 必须等于 `destinations.size()`，且 `outputs[i]` 的值描述符必须指向 `destinations[i]`。实现可以用模板或更严格的分类型算子，但要避免所有算子共用一组含义不明的平铺字段。
 

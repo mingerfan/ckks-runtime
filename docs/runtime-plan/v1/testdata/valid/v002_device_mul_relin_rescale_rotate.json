@@ -7,16 +7,11 @@
     "operator_spec": {
       "id": "poseidon-ckks-gpu-v1",
       "version": 1,
-      "fingerprint": "sha256:6d78861376555678db29a3ac21ce5275a7118c98addf298e9ad8b1f4579da71c"
+      "source_sha256": "sha256:9b578bcac67c9ee2cace717ad9a6733053e46dbf574f195329ef1d255c9663eb"
     },
-    "rescale_mode": "lazy",
-    "boot_mode": "native",
     "world_size": 1,
     "device_counts": [
-      2
-    ],
-    "required_capabilities": [
-      "transfer"
+      1
     ]
   },
   "values": [
@@ -95,7 +90,20 @@
       "place": {
         "kind": "device",
         "rank": 0,
-        "index": 1
+        "index": 0
+      },
+      "context": "ctx-main",
+      "level": 4,
+      "scale_log2": 40,
+      "ntt": true,
+      "components": 2
+    },
+    {
+      "id": "7",
+      "kind": "ciphertext",
+      "place": {
+        "kind": "host",
+        "rank": 0
       },
       "context": "ctx-main",
       "level": 4,
@@ -106,16 +114,6 @@
   ],
   "external_inputs": [
     "1"
-  ],
-  "required_keys": [
-    {
-      "kind": "relin",
-      "place": {
-        "kind": "device",
-        "rank": 0,
-        "index": 0
-      }
-    }
   ],
   "initialization": [
     {
@@ -197,14 +195,33 @@
     },
     {
       "ordinal": 4,
+      "kind": "compute",
+      "op": "rotate",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "inputs": [
+        "5"
+      ],
+      "output": "6",
+      "attrs": {
+        "steps": -1
+      }
+    }
+  ],
+  "finalization": [
+    {
+      "ordinal": 5,
       "kind": "transfer",
       "transfer_id": "101",
       "hint": "auto",
       "inputs": [
-        "5"
+        "6"
       ],
       "outputs": [
-        "6"
+        "7"
       ],
       "sources": [
         {
@@ -215,9 +232,8 @@
       ],
       "destinations": [
         {
-          "kind": "device",
-          "rank": 0,
-          "index": 1
+          "kind": "host",
+          "rank": 0
         }
       ],
       "output_kinds": [
@@ -225,9 +241,7 @@
       ]
     }
   ],
-  "finalization": [],
   "final_outputs": [
-    "6"
-  ],
-  "fingerprint": "sha256:4a3e456f95bf870661b31bd16190bdf776b0b416698ddc7c2d41892215ea6b5a"
+    "7"
+  ]
 }

@@ -7,16 +7,11 @@
     "operator_spec": {
       "id": "poseidon-ckks-cpu-v1",
       "version": 1,
-      "fingerprint": "sha256:3df4bd521e4c6bdbbdf9a6f923d301c02cc73760673b6e4e24ec2d1c3b31a8c0"
+      "source_sha256": "sha256:895301761eb595b6eaa4acca85cadb7aad869639fabdd2b9789518c3b85ae1a1"
     },
-    "rescale_mode": "eager",
-    "boot_mode": "native",
     "world_size": 1,
     "device_counts": [
       1
-    ],
-    "required_capabilities": [
-      "transfer"
     ]
   },
   "values": [
@@ -35,25 +30,23 @@
     },
     {
       "id": "2",
-      "kind": "ciphertext",
+      "kind": "plaintext",
       "place": {
-        "kind": "device",
-        "rank": 0,
-        "index": 0
+        "kind": "host",
+        "rank": 0
       },
       "context": "ctx-main",
       "level": 5,
       "scale_log2": 40,
       "ntt": true,
-      "components": 2
+      "components": 1
     },
     {
       "id": "3",
       "kind": "ciphertext",
       "place": {
-        "kind": "device",
-        "rank": 0,
-        "index": 0
+        "kind": "host",
+        "rank": 0
       },
       "context": "ctx-main",
       "level": 5,
@@ -65,49 +58,33 @@
   "external_inputs": [
     "1"
   ],
-  "required_keys": [],
   "initialization": [
     {
       "ordinal": 0,
-      "kind": "transfer",
-      "transfer_id": "1",
-      "hint": "auto",
-      "inputs": [
-        "1"
-      ],
-      "outputs": [
-        "2"
-      ],
-      "sources": [
-        {
-          "kind": "host",
-          "rank": 0
-        }
-      ],
-      "destinations": [
-        {
-          "kind": "device",
-          "rank": 0,
-          "index": 0
-        }
-      ],
-      "output_kinds": [
-        "ciphertext"
-      ]
+      "kind": "encode",
+      "payload": {
+        "kind": "inline",
+        "values": [
+          1,
+          -0.0,
+          3.5,
+          -2
+        ]
+      },
+      "output": "2"
     }
   ],
   "execution": [
     {
       "ordinal": 1,
       "kind": "compute",
-      "op": "add_cc",
+      "op": "add_cp",
       "place": {
-        "kind": "device",
-        "rank": 0,
-        "index": 0
+        "kind": "host",
+        "rank": 0
       },
       "inputs": [
-        "2",
+        "1",
         "2"
       ],
       "output": "3"
@@ -117,5 +94,5 @@
   "final_outputs": [
     "3"
   ],
-  "fingerprint": "sha256:3e1993c454deaffe4d589621793af39aac26b3cfedde72370abcf44db621092b"
+  "comment": "not allowed"
 }

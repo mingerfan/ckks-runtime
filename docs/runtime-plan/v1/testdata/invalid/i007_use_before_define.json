@@ -1,22 +1,17 @@
 {
   "format_version": 1,
-  "plan_id": "1",
+  "plan_id": "2",
   "target": {
-    "target_id": "poseidon-ckks-cpu",
+    "target_id": "poseidon-ckks-gpu",
     "capability_version": 1,
     "operator_spec": {
-      "id": "poseidon-ckks-cpu-v1",
+      "id": "poseidon-ckks-gpu-v1",
       "version": 1,
-      "fingerprint": "sha256:3df4bd521e4c6bdbbdf9a6f923d301c02cc73760673b6e4e24ec2d1c3b31a8cf"
+      "source_sha256": "sha256:9b578bcac67c9ee2cace717ad9a6733053e46dbf574f195329ef1d255c9663eb"
     },
-    "rescale_mode": "eager",
-    "boot_mode": "native",
     "world_size": 1,
     "device_counts": [
       1
-    ],
-    "required_capabilities": [
-      "transfer"
     ]
   },
   "values": [
@@ -57,9 +52,9 @@
       },
       "context": "ctx-main",
       "level": 5,
-      "scale_log2": 40,
+      "scale_log2": 80,
       "ntt": true,
-      "components": 2
+      "components": 3
     },
     {
       "id": "4",
@@ -71,6 +66,47 @@
       },
       "context": "ctx-main",
       "level": 5,
+      "scale_log2": 80,
+      "ntt": true,
+      "components": 2
+    },
+    {
+      "id": "5",
+      "kind": "ciphertext",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "context": "ctx-main",
+      "level": 4,
+      "scale_log2": 40,
+      "ntt": true,
+      "components": 2
+    },
+    {
+      "id": "6",
+      "kind": "ciphertext",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "context": "ctx-main",
+      "level": 4,
+      "scale_log2": 40,
+      "ntt": true,
+      "components": 2
+    },
+    {
+      "id": "7",
+      "kind": "ciphertext",
+      "place": {
+        "kind": "host",
+        "rank": 0
+      },
+      "context": "ctx-main",
+      "level": 4,
       "scale_log2": 40,
       "ntt": true,
       "components": 2
@@ -79,12 +115,11 @@
   "external_inputs": [
     "1"
   ],
-  "required_keys": [],
   "initialization": [
     {
       "ordinal": 0,
       "kind": "transfer",
-      "transfer_id": "1",
+      "transfer_id": "100",
       "hint": "auto",
       "inputs": [
         "1"
@@ -114,36 +149,99 @@
     {
       "ordinal": 1,
       "kind": "compute",
-      "op": "add_cc",
+      "op": "mul_cc",
       "place": {
         "kind": "device",
         "rank": 0,
         "index": 0
       },
       "inputs": [
-        "4",
-        "4"
+        "7",
+        "2"
       ],
       "output": "3"
     },
     {
       "ordinal": 2,
       "kind": "compute",
-      "op": "negate",
+      "op": "relinearize",
       "place": {
         "kind": "device",
         "rank": 0,
         "index": 0
       },
       "inputs": [
-        "2"
+        "3"
       ],
       "output": "4"
+    },
+    {
+      "ordinal": 3,
+      "kind": "compute",
+      "op": "rescale",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "inputs": [
+        "4"
+      ],
+      "output": "5",
+      "attrs": {
+        "target_level": 4,
+        "target_scale_log2": 40
+      }
+    },
+    {
+      "ordinal": 4,
+      "kind": "compute",
+      "op": "rotate",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "inputs": [
+        "5"
+      ],
+      "output": "6",
+      "attrs": {
+        "steps": -1
+      }
     }
   ],
-  "finalization": [],
-  "final_outputs": [
-    "3"
+  "finalization": [
+    {
+      "ordinal": 5,
+      "kind": "transfer",
+      "transfer_id": "101",
+      "hint": "auto",
+      "inputs": [
+        "6"
+      ],
+      "outputs": [
+        "7"
+      ],
+      "sources": [
+        {
+          "kind": "device",
+          "rank": 0,
+          "index": 0
+        }
+      ],
+      "destinations": [
+        {
+          "kind": "host",
+          "rank": 0
+        }
+      ],
+      "output_kinds": [
+        "ciphertext"
+      ]
+    }
   ],
-  "fingerprint": "sha256:a013702e6b71ab835e4856ebf14f113854cd37ee1e106f4c15c7444a10de7f57"
+  "final_outputs": [
+    "7"
+  ]
 }

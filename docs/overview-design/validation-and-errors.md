@@ -1,6 +1,6 @@
 # 合法性验证与错误处理
 
-> 本文列出目标验证规则。当前 `PlanVerifier` 已覆盖基础结构、SSA、Place、类型和 Transfer/Replicate；OperatorSpec、能力/密钥、Encode/bundle 和实际 Api::Value 的完整元信息核对仍未实现。现状见[实现状态](implementation-status.md)。
+> 本文列出 RuntimePlan V1 的验证规则。`PlanVerifier`、bundle loader 和 Api 值校验已经覆盖这些阶段一要求；真实 Poseidon 后端见[实现状态](implementation-status.md)。
 
 ## 1. 原则
 

@@ -2,14 +2,14 @@
   "bundle_format_version": 1,
   "bundle_id": "v005-demo-weights",
   "version": 1,
-  "context": "ctx-main",
-  "entries": [
+  "blobs": [
     {
-      "value_id": "1",
-      "name": "demo.mask",
-      "content": "sha256:e1fd30e2981704910390655fb7727790af514458eb1a4d1f344381a27c6fa6cb",
-      "byte_length": 64
+      "content": "sha256:e96073c2982060586f6307ec21b1ea98a68fc0c099dcee5f527d80d70e47967e",
+      "byte_length": 32
+    },
+    {
+      "content": "sha256:ac6a48691a9269689d056bda012b4cbbfb30c82b85662b4aef6bee596167613d",
+      "byte_length": 16
     }
-  ],
-  "fingerprint": "sha256:fc1685f9cc3a27967c0f647755d8498f93ee9ffe6e54eb60d7e57817d3a0a088"
+  ]
 }

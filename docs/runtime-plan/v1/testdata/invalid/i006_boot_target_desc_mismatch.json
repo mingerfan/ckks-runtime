@@ -7,18 +7,11 @@
     "operator_spec": {
       "id": "poseidon-ckks-gpu-v1",
       "version": 1,
-      "fingerprint": "sha256:6d78861376555678db29a3ac21ce5275a7118c98addf298e9ad8b1f4579da71c"
+      "source_sha256": "sha256:9b578bcac67c9ee2cace717ad9a6733053e46dbf574f195329ef1d255c9663eb"
     },
-    "rescale_mode": "lazy",
-    "boot_mode": "decrypt_reencrypt",
     "world_size": 1,
     "device_counts": [
       1
-    ],
-    "required_capabilities": [
-      "transfer",
-      "host_compute",
-      "boot_decrypt_reencrypt"
     ]
   },
   "values": [
@@ -39,49 +32,8 @@
       "id": "2",
       "kind": "ciphertext",
       "place": {
-        "kind": "device",
-        "rank": 0,
-        "index": 0
-      },
-      "context": "ctx-main",
-      "level": 2,
-      "scale_log2": 40,
-      "ntt": true,
-      "components": 2
-    },
-    {
-      "id": "3",
-      "kind": "ciphertext",
-      "place": {
         "kind": "host",
         "rank": 0
-      },
-      "context": "ctx-main",
-      "level": 2,
-      "scale_log2": 40,
-      "ntt": true,
-      "components": 2
-    },
-    {
-      "id": "4",
-      "kind": "ciphertext",
-      "place": {
-        "kind": "host",
-        "rank": 0
-      },
-      "context": "ctx-main",
-      "level": 11,
-      "scale_log2": 40,
-      "ntt": true,
-      "components": 2
-    },
-    {
-      "id": "5",
-      "kind": "ciphertext",
-      "place": {
-        "kind": "device",
-        "rank": 0,
-        "index": 0
       },
       "context": "ctx-main",
       "level": 12,
@@ -93,76 +45,10 @@
   "external_inputs": [
     "1"
   ],
-  "required_keys": [
-    {
-      "kind": "secret",
-      "place": {
-        "kind": "host",
-        "rank": 0
-      }
-    }
-  ],
-  "initialization": [
-    {
-      "ordinal": 0,
-      "kind": "transfer",
-      "transfer_id": "1",
-      "hint": "auto",
-      "inputs": [
-        "1"
-      ],
-      "outputs": [
-        "2"
-      ],
-      "sources": [
-        {
-          "kind": "host",
-          "rank": 0
-        }
-      ],
-      "destinations": [
-        {
-          "kind": "device",
-          "rank": 0,
-          "index": 0
-        }
-      ],
-      "output_kinds": [
-        "ciphertext"
-      ]
-    }
-  ],
+  "initialization": [],
   "execution": [
     {
-      "ordinal": 1,
-      "kind": "transfer",
-      "transfer_id": "2",
-      "hint": "auto",
-      "inputs": [
-        "2"
-      ],
-      "outputs": [
-        "3"
-      ],
-      "sources": [
-        {
-          "kind": "device",
-          "rank": 0,
-          "index": 0
-        }
-      ],
-      "destinations": [
-        {
-          "kind": "host",
-          "rank": 0
-        }
-      ],
-      "output_kinds": [
-        "ciphertext"
-      ]
-    },
-    {
-      "ordinal": 2,
+      "ordinal": 0,
       "kind": "compute",
       "op": "boot",
       "place": {
@@ -170,49 +56,20 @@
         "rank": 0
       },
       "inputs": [
-        "3"
+        "1"
       ],
-      "output": "4",
+      "output": "2",
       "attrs": {
-        "target_level": 12,
+        "target_level": 11,
         "target_scale_log2": 40,
         "target_components": 2,
         "operator_profile": "poseidon-cpu-boot-emulation-v1",
         "implementation": "decrypt_reencrypt"
       }
-    },
-    {
-      "ordinal": 3,
-      "kind": "transfer",
-      "transfer_id": "3",
-      "hint": "auto",
-      "inputs": [
-        "4"
-      ],
-      "outputs": [
-        "5"
-      ],
-      "sources": [
-        {
-          "kind": "host",
-          "rank": 0
-        }
-      ],
-      "destinations": [
-        {
-          "kind": "device",
-          "rank": 0,
-          "index": 0
-        }
-      ],
-      "output_kinds": [
-        "ciphertext"
-      ]
     }
   ],
   "finalization": [],
   "final_outputs": [
-    "5"
-  ],
-  "fingerprint": "sha256:bab1348fe4a78740c0871b229834e280701f2009e0ab4aaf8541310681e51615"
+    "2"
+  ]
 }

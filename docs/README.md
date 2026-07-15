@@ -2,7 +2,7 @@
 
 本目录是多设备 CKKS 推理 runtime 的设计基线。这里的 runtime 指的是"拿到一份编译器已经排好的执行计划，在多个设备上把它跑完"的那部分程序。
 
-> 本目录同时包含**目标设计**和**当前实现说明**。阅读接口或协议前,先看[实现状态](overview-design/implementation-status.md):显式 Encode、bundle 装载、Host compute 和 OperatorSpec 完整校验目前仍未实现。设计文档使用现在时描述最终形态,不表示对应 C++ 接口已经存在。
+> 本目录同时包含架构设计和当前实现说明。RuntimePlan V1 已冻结；真实 Poseidon 后端和 Dacapo 生成链属于后续阶段，见[实现状态](overview-design/implementation-status.md)。
 
 ## 项目要做什么
 
@@ -29,9 +29,9 @@
 | 你想知道什么 | 应该看哪里 |
 | --- | --- |
 | 当前代码现在能跑什么 | [实现状态](overview-design/implementation-status.md)、[`runtime/plan.hpp`](../runtime/plan.hpp)、[`runtime/verifier.cpp`](../runtime/verifier.cpp)、[`runtime/runtime.hpp`](../runtime/runtime.hpp) |
-| 最终架构准备做到什么 | [总体架构](overview-design/architecture.md)、[Runtime 设计](overview-design/runtime-design.md)、[RuntimePlan V1 草案](runtime-plan/v1/specification.md) |
+| 最终架构准备做到什么 | [总体架构](overview-design/architecture.md)、[Runtime 设计](overview-design/runtime-design.md)、[RuntimePlan V1](runtime-plan/v1/specification.md) |
 
-当前代码的指令只有 Compute、Transfer 和 Replicate。目标草案还会加入 Encode,因此看到设计文档中的 `EncodeOp`、`encode_plaintext` 或 bundle 目录参数时,不要误认为 `plan.hpp` 和 Runtime 已经实现了这些接口。
+当前代码已经实现 Encode、Compute、Transfer 和 Replicate，以及 OperatorSpec/bundle 读取和完整 preflight。
 
 ## 与 poseidon::mgpu 的关系
 
@@ -64,14 +64,14 @@ Poseidon 仓库里已有一套单机多卡的静态调度代码（`src/poseidon/
 建议按两条路线阅读：
 
 - **先看代码现状**：[实现状态](overview-design/implementation-status.md) → [`plan.hpp`](../runtime/plan.hpp) → [`verifier.cpp`](../runtime/verifier.cpp) → [`runtime.hpp`](../runtime/runtime.hpp) → [`runtime_tests.cpp`](../tests/runtime_tests.cpp)。
-- **再看目标设计**：[总体架构](overview-design/architecture.md) → [Dialect 与 SSA](overview-design/dialect-design.md) → [RuntimePlan V1 草案](runtime-plan/v1/specification.md) → [Runtime 设计](overview-design/runtime-design.md) → [通信设计](overview-design/communication-design.md) → [验证与错误](overview-design/validation-and-errors.md)。
+- **再看目标设计**：[总体架构](overview-design/architecture.md) → [Dialect 与 SSA](overview-design/dialect-design.md) → [RuntimePlan V1](runtime-plan/v1/specification.md) → [Runtime 设计](overview-design/runtime-design.md) → [通信设计](overview-design/communication-design.md) → [验证与错误](overview-design/validation-and-errors.md)。
 
-### 协议规范(V1 草案,机器文件待迁移)
+### 协议规范（V1 已冻结）
 
-- [RuntimePlan V1 规范](runtime-plan/v1/specification.md):计划文件的字段语义、编码规则、SSA/元信息不变量和原始文件字节摘要。V1 当前仍是设计草案,Markdown 已采用显式 Encode 和原始字节 SHA-256,Schema、样例和 C++ 实现尚待迁移。配套 [schema.json](runtime-plan/v1/schema.json)、[明文数据包格式](runtime-plan/v1/plaintext-bundle.md)、[版本兼容规则](runtime-plan/v1/compatibility.md) 和 [合法/非法样例集](runtime-plan/v1/testdata/README.md)。
+- [RuntimePlan V1 规范](runtime-plan/v1/specification.md)：已冻结的计划字段、SSA/元信息规则、原始字节摘要和执行边界。配套 [schema.json](runtime-plan/v1/schema.json)、[明文数据包格式](runtime-plan/v1/plaintext-bundle.md)、[版本兼容规则](runtime-plan/v1/compatibility.md) 和 [合法/非法样例集](runtime-plan/v1/testdata/README.md)。
 - [CKKS OperatorSpec V1 规范](operator-spec/v1/specification.md):目标后端的算子能力、level/`scale_log2` 边界、boot profile 和代价模型。配套 [schema.json](operator-spec/v1/schema.json) 和 [占位 profile](operator-spec/v1/profiles/README.md)(CPU eager / GPU lazy)。
 
-协议冻结后,JSON 读取器、Schema 和样例集都必须与规范一致。当前迁移差距见[实现状态](overview-design/implementation-status.md)。
+规范、JSON 读取器、Schema 和样例集已经对齐。
 
 ### 总体设计(背景与决策)
 
@@ -111,18 +111,18 @@ Poseidon 仓库里已有一套单机多卡的静态调度代码（`src/poseidon/
 
 | 路径 | 职责 |
 | --- | --- |
-| `runtime/plan.*` | 当前内存版 RuntimePlan、强类型计算/通信动作、内部 64 位摘要与计划打印 |
-| `runtime/json_plan_reader.*`、`runtime/utils/sha256.*` | 上一版 RuntimePlan JSON 的严格读取和旧语义指纹核对 |
-| `runtime/verifier.*` | SSA、Place、类型、目标配置和 Transfer/Replicate 合法性检查 |
+| `runtime/plan.*` | RuntimePlan、Encode/计算/通信强类型数据和计划打印 |
+| `runtime/json_plan_reader.*`、`runtime/operator_spec_reader.*`、`runtime/plaintext_bundle.*` | RuntimePlan、OperatorSpec 和本 rank bundle 数据的严格读取 |
+| `runtime/verifier.*` | SSA、Place、CKKS 元信息、OperatorSpec、能力和具体密钥检查 |
 | `runtime/runtime.hpp` | ValueStore、Ready/Pending、SequentialRuntime 和 RunArtifact |
 | `api/vec_*` | VecValue 元信息语义及同步/异步计算 |
 | `api/mock_api.*` | MockCluster、多 runtime 通信、延迟/故障注入和全组终止 |
-| `api/mpi_api.*` | MPI 非阻塞通信、序列化、内部摘要 preflight 与 MPI_Abort |
+| `api/mpi_api.*` | MPI 非阻塞通信、序列化、原始计划摘要 preflight 与 MPI_Abort |
 | `testing/` | 计划构造器、顺序参考执行器、DiffMap、比较和 Mock 测试驱动 |
 | `tests/` | 普通测试与 MPI 端到端测试 |
 | `tools/`、`benchmarks/` | MPI 环境自检与通信基准 |
 
-当前代码仍有两个旧摘要:JSON 顶层 `fingerprint` 是上一版 reader 核对的 SHA-256;`RuntimePlan::fingerprint()` 是 Mock/MPI 多 rank 检查使用的内部 64 位摘要。目标 V1 会删除 JSON 自嵌 `fingerprint`,改为读取文件时直接对完整原始字节计算 `plan_source_sha256`;调试时可显式跳过产物摘要比较,但不能关闭其他验证。
+V1 不使用 JSON 自嵌摘要或内部 64 位语义指纹。reader 对完整原始字节计算 SHA-256；调试时可以显式跳过三类产物摘要比较，但不会关闭其他验证。
 
 旧文档中的 `VecApi` 和 `MockCommunicationApi` 是早期统称。当前代码分别拆成 `VecExecutor`、`MockVecApi + MockCluster` 和 `MpiVecApi`;测试驱动是 `run_mock_cluster()`,没有单独的 `MultiRuntimeHarness` 类。
 

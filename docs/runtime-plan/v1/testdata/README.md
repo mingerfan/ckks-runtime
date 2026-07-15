@@ -1,44 +1,13 @@
-# 协议测试样例集
+# RuntimePlan V1 测试数据
 
-> **迁移提示:** 当前 JSON 样例和 `generate.py` 仍对应上一版“bundle plaintext 作为 external_input + 自嵌 JCS 等价 fingerprint”的格式,尚未迁移到规范中的显式 Encode、inline/bundle 双 payload 和原始文件字节摘要。当前 C++ reader 只覆盖这套样例中的结构解析和部分检查,OperatorSpec/BND preflight 等语义尚未完整实现;这些文件不能作为 V1 最终格式的权威样例。
+`valid/` 是 reader、verifier 和 Runtime 必须接受的冻结样例；`invalid/` 每份只引入一个错误，必须被拒绝。
 
-迁移完成并正式冻结 V1 后,`valid/` 中的每份文件才是任何符合规范的实现**必须接受**的样例,`invalid/` 中的每份才是**必须拒绝**的样例。当前目录里的 valid/invalid 标签和 FP-1 等编号都属于上一版格式,不表示现有 reader 已经覆盖表中的全部语义检查,也不再与目标规范第 7 节逐项对应。迁移后的每份 invalid 文件仍应只含一个错误。
+合法样例覆盖 inline Encode、bundle Encode、同一 content 多次编码、Host compute、Host decrypt/re-encrypt Boot、Device native Boot、显式 Transfer/Replicate、Rotate、Relinearize 和 Rescale。
 
-当前文件都由 `generate.py` 生成(`python3 generate.py`)。脚本里的排序 JSON 指纹只服务旧样例;迁移后应删除计划和 manifest 的自摘要,在文件最终写完后直接对完整原始字节计算 SHA-256,并把 OperatorSpec/manifest 摘要写入引用它们的计划。**不要手改 JSON**——原始字节哪怕只改格式也会改变摘要;要改样例就改生成脚本重跑。
+`bundles/v005-demo/` 使用冻结的纯 `blobs` manifest。`generate.py` 先写最终 OperatorSpec 和 manifest 字节，再计算原始字节 SHA-256 写入计划。重新生成命令：
 
-## valid
+```bash
+python3 docs/runtime-plan/v1/testdata/generate.py
+```
 
-所有 valid 计划的外部输入都声明在 Host,由 `initialization` 阶段的显式 transfer 上传到设备(IO-2)。
-
-| 文件 | 覆盖内容 |
-| --- | --- |
-| `v001_minimal_single_device.json` | 最小计划:单 rank 单设备,Host 输入经 init transfer 上卡,一条 `add_cc`(输入自加),CPU eager spec |
-| `v002_mul_rescale_transfer.json` | GPU lazy spec:init 上传 → `mul_cc`(scale 相加、分量 2+2−1=3)→ `relinearize`(需 relin key)→ `rescale`(显式 target)→ 跨卡 `transfer` |
-| `v003_replicate_multi_rank.json` | 2 个 rank:init 上传后 `replicate` 一发两收(Device(1,0) + Host(1)),broadcast hint |
-| `v004_host_boot_emulation.json` | `decrypt_reencrypt` boot 全流程:init 上传、Device→Host transfer、Host boot(需 secret key、引用 boot profile)、Host→Device 回传,能力声明齐全 |
-| `v005_plaintext_bundle.json` | 上一版明文数据包引用:明文+密文双输入经 init 上传,`mul_cp`,顶层仍使用旧 `plaintext_bundle.fingerprint` |
-
-`bundles/v005-demo/` 是 v005 引用的上一版最小明文数据包,manifest 仍含 `value_id`。它只是上一版格式样例的一部分,尚未迁移成 [plaintext-bundle.md](../plaintext-bundle.md) 当前定义的纯 `blobs` 清单。
-
-## invalid
-
-| 文件 | 错误(仅一处) | 对应检查 |
-| --- | --- | --- |
-| `i001_unknown_format_version.json` | `format_version: 2` | 第 2 节 |
-| `i002_float_scale_log2.json` | `scale_log2: 40.5`(浮点) | 1.2 节 |
-| `i003_duplicate_value_id.json` | 同一 ValueId 两条描述 | SSA-1 |
-| `i004_comm_list_length_mismatch.json` | replicate 的 `output_kinds` 长度 1,`outputs`/`destinations` 是 2 | 第 6 节 |
-| `i005_boot_mode_mismatch.json` | 头部 `boot_mode: "native"`,指令是 `decrypt_reencrypt` | TGT-3 |
-| `i006_boot_target_desc_mismatch.json` | Boot 声明 `target_level: 12`,输出值描述是 `level: 11` | META-2 |
-| `i007_use_before_define.json` | 指令使用晚于自己才定义的值 | SSA-2 |
-| `i008_bad_fingerprint.json` | 指纹与内容不符(末位翻转) | FP-1 |
-| `i009_unknown_field.json` | 顶层多了未定义字段 `comment` | 第 1 节 |
-| `i010_place_mismatch.json` | 值声明在 Host,指令在 Device 上用它 | PLACE-1 |
-| `i011_missing_required_key.json` | 有 `decrypt_reencrypt` boot 却没声明 Host secret key | TGT-2 |
-| `i012_operator_spec_fingerprint_mismatch.json` | `operator_spec.fingerprint` 与持有的 spec 副本不符 | SPEC-1 |
-| `i013_device_external_input.json` | 外部输入直接声明在 Device 上,无上传指令 | IO-2 |
-| `i014_plaintext_bundle_fingerprint_mismatch.json` | `plaintext_bundle.fingerprint` 与 `bundles/v005-demo/` 清单不符 | BND-1 |
-
-除 `i008`(错误本身就是指纹)外,所有 invalid 文件的指纹对其内容都是**正确**的——保证实现拒绝它们的原因恰好是表中那一个错误,而不是顺带的指纹不符。`i012`/`i014` 需要读取方持有对应的 spec/bundle 副本才能发现,属于 preflight 检查。
-
-结构类错误(i001/i002/i004/i009)应当已被 `schema.json` 拦截;语义类错误(SSA、元信息、一致性)需要读取实现自己检查——Schema 只是第一道网,不是全部。
+非法样例依次覆盖版本、整数类型、重复 ValueId、通信列表、Boot profile/目标、先用后定义、未知字段、Place、external input、OperatorSpec/manifest 摘要、Encode 阶段、Rotate 规范化和未使用 ValueDesc。

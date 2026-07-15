@@ -30,15 +30,13 @@ enum class ComputeKind {
     AddCC, AddCP, SubCC, SubCP, MulCC, MulCP,
     Negate, Rotate, Rescale, ModSwitch, Relinearize, Boot
 };
-
 enum class CommKind { Transfer, Replicate };
 enum class CommHint { Auto, PointToPoint, Broadcast, Tree, Ring, HostStaged };
 enum class Phase { Initialization, Execution, Finalization };
 enum class RescaleMode { Eager, Lazy };
-enum class BootMode { Native, DecryptReencrypt };
 enum class BootImplementation { Native, DecryptReencrypt };
 enum class RequiredCapability {
-    Transfer, Replicate, HostCompute, BootNative, BootDecryptReencrypt
+    Encode, Transfer, Replicate, HostCompute, BootNative, BootDecryptReencrypt
 };
 enum class KeyKind { Secret, Relin, Galois };
 
@@ -54,6 +52,15 @@ struct BootAttrs {
 };
 using ComputeAttrs = std::variant<std::monostate, RotateAttrs, RescaleAttrs,
                                   ModSwitchAttrs, BootAttrs>;
+
+struct InlineEncodePayload { std::vector<double> values; };
+struct BundleEncodePayload { std::string content; };
+using EncodePayload = std::variant<InlineEncodePayload, BundleEncodePayload>;
+
+struct EncodeOp {
+    EncodePayload payload;
+    ValueId output = 0;
+};
 
 struct ComputeOp {
     ComputeKind kind = ComputeKind::AddCC;
@@ -74,7 +81,7 @@ struct CommAction {
     std::vector<ValueKind> output_types;
 };
 
-using InstructionBody = std::variant<ComputeOp, CommAction>;
+using InstructionBody = std::variant<EncodeOp, ComputeOp, CommAction>;
 
 struct Instruction {
     std::size_t ordinal = 0;
@@ -95,19 +102,27 @@ struct ValueDesc {
 struct OperatorSpecRef {
     std::string id;
     int version = 0;
-    std::string fingerprint;
+    std::string source_sha256;
 };
 
-// 计划顶层可选的明文数据包(权重包)引用,见 runtime-plan/v1/plaintext-bundle.md。
 struct PlaintextBundleRef {
     std::string id;
     int version = 0;
-    std::string fingerprint;
+    std::string manifest_sha256;
 };
 
 struct KeyRequirement {
     KeyKind kind = KeyKind::Secret;
     Place place;
+    std::optional<int> rotation_step;
+};
+
+bool operator==(const KeyRequirement &a, const KeyRequirement &b);
+bool operator<(const KeyRequirement &a, const KeyRequirement &b);
+
+struct PlanRequirements {
+    std::vector<RequiredCapability> capabilities;
+    std::vector<KeyRequirement> keys;
 };
 
 struct TargetConfig {
@@ -116,27 +131,26 @@ struct TargetConfig {
     std::vector<int> device_counts;
     int capability_version = 0;
     OperatorSpecRef operator_spec;
-    RescaleMode rescale_mode = RescaleMode::Eager;
-    BootMode boot_mode = BootMode::Native;
-    std::vector<RequiredCapability> required_capabilities;
 };
 
 struct RuntimePlan {
     std::uint32_t format_version = 1;
     std::uint64_t plan_id = 0;
-    std::string fingerprint_sha256;
     TargetConfig target;
     std::optional<PlaintextBundleRef> plaintext_bundle;
     std::vector<ValueDesc> values;
     std::vector<ValueId> external_inputs;
-    std::vector<KeyRequirement> required_keys;
     std::vector<Instruction> initialization;
     std::vector<Instruction> execution;
     std::vector<Instruction> finalization;
     std::vector<ValueId> final_outputs;
 
-    std::uint64_t fingerprint() const;
     void print(std::ostream &out) const;
+};
+
+struct LoadedRuntimePlan {
+    RuntimePlan plan;
+    std::string source_sha256;
 };
 
 std::string to_string(ValueKind kind);
@@ -145,7 +159,6 @@ std::string to_string(CommKind kind);
 std::string to_string(CommHint hint);
 std::string to_string(Phase phase);
 std::string to_string(RescaleMode mode);
-std::string to_string(BootMode mode);
 std::string to_string(BootImplementation implementation);
 std::string to_string(RequiredCapability capability);
 std::string to_string(KeyKind kind);

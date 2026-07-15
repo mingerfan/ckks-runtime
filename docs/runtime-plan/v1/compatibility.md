@@ -13,7 +13,7 @@
 
 **同一个版本号下不允许"看文件内容猜格式"**;也不靠"缺了某字段"或"解析失败"推断这是旧格式文件。版本判断只看 `format_version` 一个字段。
 
-> **V1 当前仍是草案。** 2026-07 的第一次实现把 bundle 固定权重表示成 plaintext external_inputs；在尚无外部使用者、bundle 执行链也未完整实现时，设计改回显式 Encode 指令。Encode 支持 inline 浮点数组和 bundle `content` 引用；external_inputs 保留给每次运行由调用方传入的参数，manifest 不再绑定 ValueId。计划自身不再保存 JCS 语义指纹,改由 Runtime 对发布文件完整原始字节计算 SHA-256。当前 Schema、样例和 C++ 代码仍待迁移；全部对齐并通过端到端测试后再宣布 V1 冻结。在此之前不创建只为保留错误草案的 V2。
+> **V1 已冻结。** V1 使用显式 Encode、inline/bundle payload 和完整原始文件字节 SHA-256。external_inputs 只表示调用方每次运行传入的参数，manifest 不绑定 ValueId。
 
 ## 2. 修改流程
 

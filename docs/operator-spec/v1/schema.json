@@ -1,19 +1,17 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ckks-runtime/operator-spec/v1/schema.json",
-  "title": "CKKS OperatorSpec V1 previous-draft schema",
-  "description": "上一版草案的机器结构约束,仍含自嵌 fingerprint。目标格式改为由 RuntimePlan 保存 OperatorSpec 原始文件 source_sha256;迁移完成前以 specification.md 为准。",
+  "title": "CKKS OperatorSpec V1",
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "spec_format_version", "spec_id", "version", "fingerprint", "status",
+    "spec_format_version", "spec_id", "version", "status",
     "target_id", "rescale_mode", "context", "levels", "operators", "boot_profiles"
   ],
   "properties": {
     "spec_format_version": { "const": 1 },
     "spec_id": { "type": "string", "minLength": 1 },
     "version": { "type": "integer", "minimum": 1 },
-    "fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
     "status": { "enum": ["placeholder", "validated"] },
     "target_id": { "type": "string", "minLength": 1 },
     "rescale_mode": { "enum": ["eager", "lazy"] },
@@ -152,7 +150,7 @@
       }
     },
     "noiseTable": {
-      "description": "RuntimePlan/OperatorSpec V1 草案尚未定义跨后端噪声单位,当前必须显式为 null。",
+      "description": "OperatorSpec V1 不定义跨后端噪声单位，必须显式为 null。",
       "type": "null"
     },
     "bootProfile": {

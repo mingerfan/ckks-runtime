@@ -1,24 +1,17 @@
 {
   "format_version": 1,
-  "plan_id": "3",
+  "plan_id": "2",
   "target": {
     "target_id": "poseidon-ckks-gpu",
     "capability_version": 1,
     "operator_spec": {
       "id": "poseidon-ckks-gpu-v1",
       "version": 1,
-      "fingerprint": "sha256:6d78861376555678db29a3ac21ce5275a7118c98addf298e9ad8b1f4579da71c"
+      "source_sha256": "sha256:9b578bcac67c9ee2cace717ad9a6733053e46dbf574f195329ef1d255c9663eb"
     },
-    "rescale_mode": "lazy",
-    "boot_mode": "native",
-    "world_size": 2,
+    "world_size": 1,
     "device_counts": [
-      1,
       1
-    ],
-    "required_capabilities": [
-      "transfer",
-      "replicate"
     ]
   },
   "values": [
@@ -54,24 +47,66 @@
       "kind": "ciphertext",
       "place": {
         "kind": "device",
-        "rank": 1,
+        "rank": 0,
         "index": 0
       },
       "context": "ctx-main",
       "level": 5,
-      "scale_log2": 40,
+      "scale_log2": 80,
       "ntt": true,
-      "components": 2
+      "components": 3
     },
     {
       "id": "4",
       "kind": "ciphertext",
       "place": {
-        "kind": "host",
-        "rank": 1
+        "kind": "device",
+        "rank": 0,
+        "index": 0
       },
       "context": "ctx-main",
       "level": 5,
+      "scale_log2": 80,
+      "ntt": true,
+      "components": 2
+    },
+    {
+      "id": "5",
+      "kind": "ciphertext",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "context": "ctx-main",
+      "level": 4,
+      "scale_log2": 40,
+      "ntt": true,
+      "components": 2
+    },
+    {
+      "id": "6",
+      "kind": "ciphertext",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "context": "ctx-main",
+      "level": 4,
+      "scale_log2": 40,
+      "ntt": true,
+      "components": 2
+    },
+    {
+      "id": "7",
+      "kind": "ciphertext",
+      "place": {
+        "kind": "host",
+        "rank": 0
+      },
+      "context": "ctx-main",
+      "level": 4,
       "scale_log2": 40,
       "ntt": true,
       "components": 2
@@ -80,18 +115,18 @@
   "external_inputs": [
     "1"
   ],
-  "required_keys": [],
   "initialization": [
     {
       "ordinal": 0,
       "kind": "transfer",
-      "transfer_id": "1",
+      "transfer_id": "100",
       "hint": "auto",
       "inputs": [
         "1"
       ],
       "outputs": [
-        "2"
+        "2",
+        "7"
       ],
       "sources": [
         {
@@ -114,15 +149,80 @@
   "execution": [
     {
       "ordinal": 1,
-      "kind": "replicate",
-      "transfer_id": "7",
-      "hint": "broadcast",
+      "kind": "compute",
+      "op": "mul_cc",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
       "inputs": [
+        "2",
         "2"
       ],
-      "outputs": [
-        "3",
+      "output": "3"
+    },
+    {
+      "ordinal": 2,
+      "kind": "compute",
+      "op": "relinearize",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "inputs": [
+        "3"
+      ],
+      "output": "4"
+    },
+    {
+      "ordinal": 3,
+      "kind": "compute",
+      "op": "rescale",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "inputs": [
         "4"
+      ],
+      "output": "5",
+      "attrs": {
+        "target_level": 4,
+        "target_scale_log2": 40
+      }
+    },
+    {
+      "ordinal": 4,
+      "kind": "compute",
+      "op": "rotate",
+      "place": {
+        "kind": "device",
+        "rank": 0,
+        "index": 0
+      },
+      "inputs": [
+        "5"
+      ],
+      "output": "6",
+      "attrs": {
+        "steps": -1
+      }
+    }
+  ],
+  "finalization": [
+    {
+      "ordinal": 5,
+      "kind": "transfer",
+      "transfer_id": "101",
+      "hint": "auto",
+      "inputs": [
+        "6"
+      ],
+      "outputs": [
+        "7"
       ],
       "sources": [
         {
@@ -133,13 +233,8 @@
       ],
       "destinations": [
         {
-          "kind": "device",
-          "rank": 1,
-          "index": 0
-        },
-        {
           "kind": "host",
-          "rank": 1
+          "rank": 0
         }
       ],
       "output_kinds": [
@@ -147,10 +242,7 @@
       ]
     }
   ],
-  "finalization": [],
   "final_outputs": [
-    "3",
-    "4"
-  ],
-  "fingerprint": "sha256:9e96f89d92344f91caa4ea82841d1e59fdbd21313041a73311697346d112125a"
+    "7"
+  ]
 }

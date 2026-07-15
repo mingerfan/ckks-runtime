@@ -14,6 +14,14 @@ bool operator<(const Place &a, const Place &b) {
     return std::tie(a.kind, a.rank, a.index) < std::tie(b.kind, b.rank, b.index);
 }
 
+bool operator==(const KeyRequirement &a, const KeyRequirement &b) {
+    return a.kind == b.kind && a.place == b.place && a.rotation_step == b.rotation_step;
+}
+bool operator<(const KeyRequirement &a, const KeyRequirement &b) {
+    return std::tie(a.kind, a.place, a.rotation_step) <
+           std::tie(b.kind, b.place, b.rotation_step);
+}
+
 std::string to_string(const Place &p) {
     std::ostringstream os;
     os << (p.kind == PlaceKind::Host ? "Host" : "Device") << "(rank=" << p.rank;
@@ -41,25 +49,21 @@ std::string to_string(CommKind k) {
     throw std::runtime_error("unknown communication kind");
 }
 std::string to_string(CommHint h) {
-    switch (h) { case CommHint::Auto: return "Auto"; case CommHint::PointToPoint: return "PointToPoint";
-    case CommHint::Broadcast: return "Broadcast"; case CommHint::Tree: return "Tree"; case CommHint::Ring: return "Ring"; case CommHint::HostStaged: return "HostStaged"; }
+    switch (h) {
+    case CommHint::Auto: return "Auto"; case CommHint::PointToPoint: return "PointToPoint";
+    case CommHint::Broadcast: return "Broadcast"; case CommHint::Tree: return "Tree";
+    case CommHint::Ring: return "Ring"; case CommHint::HostStaged: return "HostStaged";
+    }
     throw std::runtime_error("unknown communication hint");
 }
 std::string to_string(Phase p) {
     switch (p) { case Phase::Initialization: return "Initialization"; case Phase::Execution: return "Execution"; case Phase::Finalization: return "Finalization"; }
     throw std::runtime_error("unknown phase");
 }
-
 std::string to_string(RescaleMode mode) {
     switch (mode) { case RescaleMode::Eager: return "eager"; case RescaleMode::Lazy: return "lazy"; }
     throw std::runtime_error("unknown rescale mode");
 }
-
-std::string to_string(BootMode mode) {
-    switch (mode) { case BootMode::Native: return "native"; case BootMode::DecryptReencrypt: return "decrypt_reencrypt"; }
-    throw std::runtime_error("unknown boot mode");
-}
-
 std::string to_string(BootImplementation implementation) {
     switch (implementation) {
     case BootImplementation::Native: return "native";
@@ -67,9 +71,9 @@ std::string to_string(BootImplementation implementation) {
     }
     throw std::runtime_error("unknown boot implementation");
 }
-
 std::string to_string(RequiredCapability capability) {
     switch (capability) {
+    case RequiredCapability::Encode: return "encode";
     case RequiredCapability::Transfer: return "transfer";
     case RequiredCapability::Replicate: return "replicate";
     case RequiredCapability::HostCompute: return "host_compute";
@@ -78,93 +82,16 @@ std::string to_string(RequiredCapability capability) {
     }
     throw std::runtime_error("unknown required capability");
 }
-
 std::string to_string(KeyKind kind) {
     switch (kind) { case KeyKind::Secret: return "secret"; case KeyKind::Relin: return "relin"; case KeyKind::Galois: return "galois"; }
     throw std::runtime_error("unknown key kind");
-}
-
-static void append_string(std::ostringstream &os, const std::string &value) {
-    os << value.size() << ':' << value;
-}
-
-static void append_place(std::ostringstream &os, const Place &p) {
-    os << static_cast<int>(p.kind) << ':' << p.rank << ':' << p.index;
-}
-
-static void append_instruction(std::ostringstream &os, const Instruction &inst) {
-    os << '#' << inst.ordinal << ':';
-    if (const auto *op = std::get_if<ComputeOp>(&inst.body)) {
-        os << 'C' << static_cast<int>(op->kind) << ':' << op->output << ':';
-        append_place(os, op->place);
-        for (auto id : op->inputs) os << ':' << id;
-        if (const auto *a = std::get_if<RotateAttrs>(&op->attrs)) os << ":r" << a->steps;
-        if (const auto *a = std::get_if<RescaleAttrs>(&op->attrs)) os << ":s" << a->target_level << ':' << a->target_scale_log2;
-        if (const auto *a = std::get_if<ModSwitchAttrs>(&op->attrs)) os << ":m" << a->target_level;
-        if (const auto *a = std::get_if<BootAttrs>(&op->attrs)) {
-            os << ":b" << a->target_level << ':' << a->target_scale_log2 << ':'
-               << a->target_components << ':' << static_cast<int>(a->implementation) << ':';
-            append_string(os, a->operator_profile);
-        }
-    } else {
-        const auto &a = std::get<CommAction>(inst.body);
-        os << 'M' << a.id << ':' << static_cast<int>(a.kind) << ':' << static_cast<int>(a.hint);
-        for (auto id : a.inputs) os << ":i" << id;
-        for (auto id : a.outputs) os << ":o" << id;
-        for (const auto &p : a.sources) { os << ":s"; append_place(os, p); }
-        for (const auto &p : a.destinations) { os << ":d"; append_place(os, p); }
-        for (auto t : a.output_types) os << ":t" << static_cast<int>(t);
-    }
-    os << ';';
-}
-
-std::uint64_t RuntimePlan::fingerprint() const {
-    std::ostringstream os;
-    os << format_version << ':' << plan_id << ':';
-    append_string(os, fingerprint_sha256);
-    append_string(os, target.target_id);
-    os << ':' << target.capability_version << ':' << target.world_size << ':';
-    append_string(os, target.operator_spec.id);
-    os << ':' << target.operator_spec.version << ':';
-    append_string(os, target.operator_spec.fingerprint);
-    os << ':' << static_cast<int>(target.rescale_mode) << ':' << static_cast<int>(target.boot_mode);
-    if (plaintext_bundle) {
-        os << ":B";
-        append_string(os, plaintext_bundle->id);
-        os << ':' << plaintext_bundle->version << ':';
-        append_string(os, plaintext_bundle->fingerprint);
-    }
-    for (int n : target.device_counts) os << ':' << n;
-    for (auto capability : target.required_capabilities) os << ":c" << static_cast<int>(capability);
-    for (const auto &v : values) {
-        os << "|v" << v.id << ':' << static_cast<int>(v.kind) << ':';
-        append_place(os, v.place);
-        os << ':';
-        append_string(os, v.context);
-        os << ':' << v.level << ':' << v.scale_log2 << ':' << v.ntt << ':' << v.components;
-    }
-    for (auto id : external_inputs) os << "|e" << id;
-    for (const auto &key : required_keys) {
-        os << "|k" << static_cast<int>(key.kind) << ':';
-        append_place(os, key.place);
-    }
-    for (const auto &i : initialization) { os << "|I"; append_instruction(os, i); }
-    for (const auto &i : execution) { os << "|E"; append_instruction(os, i); }
-    for (const auto &i : finalization) { os << "|F"; append_instruction(os, i); }
-    for (auto id : final_outputs) os << "|o" << id;
-    const std::string bytes = os.str();
-    std::uint64_t hash = 1469598103934665603ULL;
-    for (unsigned char c : bytes) { hash ^= c; hash *= 1099511628211ULL; }
-    return hash;
 }
 
 void RuntimePlan::print(std::ostream &out) const {
     out << "RuntimePlan(version=" << format_version << ", id=" << plan_id
         << ", target=" << target.target_id << ", capability=" << target.capability_version
         << ", operator_spec=" << target.operator_spec.id << '@' << target.operator_spec.version
-        << ", rescale=" << to_string(target.rescale_mode)
-        << ", boot=" << to_string(target.boot_mode) << ", world=" << target.world_size
-        << ", fingerprint=0x" << std::hex << fingerprint() << std::dec << ")\n";
+        << ", world=" << target.world_size << ")\n";
     if (plaintext_bundle)
         out << "  plaintext_bundle=" << plaintext_bundle->id << '@' << plaintext_bundle->version << '\n';
     for (const auto &v : values) {
@@ -177,7 +104,12 @@ void RuntimePlan::print(std::ostream &out) const {
         out << name << ":\n";
         for (const auto &inst : list) {
             out << "  #" << inst.ordinal << ' ';
-            if (const auto *op = std::get_if<ComputeOp>(&inst.body)) {
+            if (const auto *encode = std::get_if<EncodeOp>(&inst.body)) {
+                out << '%' << encode->output << " = Encode(";
+                if (const auto *bundle = std::get_if<BundleEncodePayload>(&encode->payload)) out << bundle->content;
+                else out << "inline";
+                out << ")\n";
+            } else if (const auto *op = std::get_if<ComputeOp>(&inst.body)) {
                 out << '%' << op->output << " = " << to_string(op->kind) << '(';
                 for (std::size_t i = 0; i < op->inputs.size(); ++i) { if (i) out << ','; out << '%' << op->inputs[i]; }
                 out << ") @ " << to_string(op->place) << '\n';

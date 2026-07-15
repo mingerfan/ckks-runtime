@@ -10,9 +10,9 @@ namespace fhegpu {
 
 class RuntimePlanJsonReader {
 public:
-    static RuntimePlan read(std::istream &input);
-    static RuntimePlan read_text(std::string_view text);
-    static RuntimePlan read_file(const std::string &path);
+    static LoadedRuntimePlan read(std::istream &input);
+    static LoadedRuntimePlan read_text(std::string_view text);
+    static LoadedRuntimePlan read_file(const std::string &path);
 };
 
 } // namespace fhegpu

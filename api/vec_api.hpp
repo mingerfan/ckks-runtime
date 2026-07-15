@@ -42,6 +42,7 @@ private:
     };
 
     VecPayload compute_now(const ComputeOp &op, const std::vector<VecValue> &inputs);
+    VecMetadata compute_metadata(const ComputeOp &op, const std::vector<VecValue> &inputs) const;
     Worker &worker_for(const Place &place);
     int next_delay_ms();
 

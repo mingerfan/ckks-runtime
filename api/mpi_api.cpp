@@ -65,6 +65,12 @@ MpiVecApi::Value MpiVecApi::compute(const ComputeOp &op, const std::vector<Value
     return executor_.compute(op, inputs);
 }
 
+MpiVecApi::Value MpiVecApi::encode_plaintext(const ValueDesc &output_desc,
+                                             const std::vector<double> &slots) {
+    return make_plain(slots, output_desc.context, poly_degree_, output_desc.level,
+                      output_desc.scale_log2, output_desc.ntt);
+}
+
 MpiVecApi::CommHandle MpiVecApi::communicate_async(const CommAction &action,
                                                     const std::vector<Value> &local_inputs) {
     CommHandle handle;
@@ -141,11 +147,41 @@ std::vector<MpiVecApi::Value> MpiVecApi::wait(CommHandle &handle) {
 
 void MpiVecApi::synchronize(Value &value) { static_cast<void>(value.materialize()); }
 
-void MpiVecApi::preflight(std::uint64_t fingerprint) {
-    std::vector<std::uint64_t> fingerprints(static_cast<std::size_t>(world_size_));
-    check_mpi(MPI_Allgather(&fingerprint, 1, MPI_UINT64_T, fingerprints.data(), 1, MPI_UINT64_T,
-                            communicator_), "MPI_Allgather(fingerprint)");
-    for (std::uint64_t other : fingerprints) if (other != fingerprint) throw std::runtime_error("plan fingerprint mismatch across MPI ranks");
+void MpiVecApi::preflight(std::string_view plan_source_sha256,
+                          bool skip_artifact_digest_checks,
+                          const TargetConfig &target,
+                          const OperatorSpec &operator_spec,
+                          const PlanRequirements &) {
+    poly_degree_ = operator_spec.poly_degree;
+    if (target.capability_version != 1) throw std::runtime_error("MpiVecApi does not support target capability_version");
+    const int local_skip = skip_artifact_digest_checks ? 1 : 0;
+    std::vector<int> skip_values(static_cast<std::size_t>(world_size_));
+    check_mpi(MPI_Allgather(&local_skip, 1, MPI_INT, skip_values.data(), 1, MPI_INT,
+                            communicator_), "MPI_Allgather(skip_artifact_digest_checks)");
+    for (int value : skip_values) if (value != local_skip)
+        throw std::runtime_error("skip_artifact_digest_checks mismatch across MPI ranks");
+    if (skip_artifact_digest_checks) return;
+    if (plan_source_sha256.size() != 71) throw std::runtime_error("invalid plan source SHA-256");
+    std::array<char, 72> local{};
+    std::copy(plan_source_sha256.begin(), plan_source_sha256.end(), local.begin());
+    std::vector<char> all(static_cast<std::size_t>(world_size_) * local.size());
+    check_mpi(MPI_Allgather(local.data(), static_cast<int>(local.size()), MPI_CHAR,
+                            all.data(), static_cast<int>(local.size()), MPI_CHAR,
+                            communicator_), "MPI_Allgather(plan_source_sha256)");
+    for (int rank = 0; rank < world_size_; ++rank) {
+        const char *digest = all.data() + static_cast<std::size_t>(rank) * local.size();
+        if (!std::equal(local.begin(), local.end(), digest))
+            throw std::runtime_error("plan source SHA-256 mismatch across MPI ranks");
+    }
+}
+
+void MpiVecApi::validate_value(const Value &value, const ValueDesc &expected) const {
+    const VecMetadata metadata = value.metadata();
+    if (value.kind() != expected.kind || metadata.context != expected.context ||
+        metadata.degree != poly_degree_ || metadata.level != expected.level ||
+        metadata.scale_log2 != expected.scale_log2 || metadata.ntt != expected.ntt ||
+        metadata.components != expected.components)
+        throw std::runtime_error("Api value metadata does not match ValueDesc " + std::to_string(expected.id));
 }
 
 [[noreturn]] void MpiVecApi::abort_all(int exit_code, const std::string &reason) {

@@ -53,7 +53,7 @@ public:
 
 ## 3. Runtime 的输入
 
-可执行计划提供指令序列、每个值的 ValueDesc、目标配置，以及初始化/执行/收尾三个阶段。完整字段和约束以 [RuntimePlan V1 草案](../runtime-plan/v1/specification.md)为准，这里只说明 Runtime 启动时还需要哪些本地信息。
+可执行计划提供指令序列、每个值的 ValueDesc、目标配置，以及初始化/执行/收尾三个阶段。完整字段和约束以 [RuntimePlan V1](../runtime-plan/v1/specification.md)为准，这里只说明 Runtime 启动时还需要哪些本地信息。
 
 除了计划，每个 Runtime 实例还需要实际运行环境、调用方输入、可选的明文数据包目录和 OperatorSpec 副本。Api 应在创建 Runtime 前完成 context 和密钥配置；Runtime 只检查，不在 initialization 中临时补配置。
 
@@ -75,9 +75,8 @@ struct RuntimeEnvironment {
     const LoadedOperatorSpec *operator_spec;
 };
 
-struct RuntimeInputs {
-    RuntimeEnvironment environment;
-    std::unordered_map<ValueId, Api::Value> external_inputs;
+struct RuntimeResources {
+    const LoadedOperatorSpec &operator_spec;
     std::optional<std::filesystem::path> plaintext_bundle_dir;
     bool skip_artifact_digest_checks = false;
 };
@@ -86,14 +85,14 @@ struct RuntimeInputs {
 `LoadedRuntimePlan` 和 `LoadedOperatorSpec` 都由各自 reader 从文件完整原始字节计算 `source_sha256`,不是调用方随意填写的摘要。RuntimePlan JSON 本身不保存自己的摘要。
 
 - `external_inputs` 放本 rank Host 上由调用方在这次运行中传入的参数。随计划固定发布的权重应由 Encode 产生；如果某份权重本来就是每次调用动态传入的参数，它仍可以是 external input。
-- `plaintext_bundle_dir` 是本机部署路径，不写进计划 JSON。存在 bundle Encode 时，每个 rank 都要拿到完整、可读且 manifest 原始字节摘要相符的数据包；否则不需要这个目录。
+- `plaintext_bundle_dir` 是本机部署路径，不写进计划 JSON。存在 bundle Encode 时，每个 rank 都读取 manifest，但只要求本地存在该 rank 实际使用的 blob；否则不需要这个目录。
 - Runtime 读取计划、OperatorSpec 和 manifest 时保留各自完整原始字节的 SHA-256。计划自身不保存摘要;OperatorSpec 和 manifest 的摘要由计划引用。
 - Runtime 把 `plan_source_sha256`、target、OperatorSpec 和密钥要求交给 Api 做 `preflight`；Api 用自己的实际配置逐项核对。Mock/MPI 参考后端可显式接受 placeholder spec，PoseidonApi 必须拒绝。
 - `skip_artifact_digest_checks` 默认是 `false`。调试时显式设为 `true` 只跳过计划跨 rank、OperatorSpec 和 manifest 的原始字节摘要比较,不跳过其他验证。
 
 启动时如果实际节点数、本地设备数、外部输入集合或数据包不符合计划，直接报错终止。Runtime 不搜索其他目录,也不在缺文件时下载数据。
 
-当前代码的接口仍是 `SequentialRuntime(rank, world_size, local_devices, api)` 加 `run(plan, local_inputs, diff_mode)`。上面的 `RuntimeInputs` 是加入 Encode/bundle 后的目标接口,不是现有声明。
+当前代码使用 `SequentialRuntime(rank, world_size, local_devices, api)`，并调用 `run(loaded_plan, resources, local_inputs, diff_mode)`。
 
 ## 4. ValueStore（值存储）
 

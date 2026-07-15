@@ -10,17 +10,24 @@ bool operator==(const VecMetadata &a, const VecMetadata &b) {
 }
 
 VecValue VecValue::ready(VecPayload payload) {
-    auto state = std::make_shared<State>(payload.kind);
+    auto state = std::make_shared<State>(payload.kind, payload.metadata);
     state->payload = std::move(payload);
     state->ready = true;
     return VecValue(std::move(state));
 }
 
-VecValue VecValue::pending(ValueKind kind) { return VecValue(std::make_shared<State>(kind)); }
+VecValue VecValue::pending(ValueKind kind, VecMetadata metadata) {
+    return VecValue(std::make_shared<State>(kind, std::move(metadata)));
+}
 
 ValueKind VecValue::kind() const {
     if (!state_) throw std::runtime_error("empty VecValue");
     return state_->expected_kind;
+}
+
+VecMetadata VecValue::metadata() const {
+    if (!state_) throw std::runtime_error("empty VecValue");
+    return state_->expected_metadata;
 }
 
 VecPayload VecValue::materialize() const {
@@ -35,7 +42,8 @@ VecValue VecValue::deep_copy() const { return ready(materialize()); }
 
 void VecValue::fulfill(VecPayload payload) const {
     if (!state_) throw std::runtime_error("empty VecValue");
-    if (payload.kind != state_->expected_kind) throw std::runtime_error("VecValue fulfilled with wrong kind");
+    if (payload.kind != state_->expected_kind || !(payload.metadata == state_->expected_metadata))
+        throw std::runtime_error("VecValue fulfilled with wrong kind or metadata");
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
         if (state_->ready || state_->error) throw std::runtime_error("VecValue completed twice");

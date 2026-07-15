@@ -1,12 +1,14 @@
 #pragma once
 
 #include "api/vec_api.hpp"
+#include "runtime/operator_spec.hpp"
 
 #include <mpi.h>
 
 #include <array>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace fhegpu {
@@ -49,13 +51,18 @@ public:
 
     explicit MpiVecApi(MPI_Comm communicator = MPI_COMM_WORLD);
     std::string name() const { return "MpiVecApi"; }
+    Value encode_plaintext(const ValueDesc &output_desc, const std::vector<double> &slots);
     Value compute(const ComputeOp &op, const std::vector<Value> &inputs);
     CommHandle communicate_async(const CommAction &action, const std::vector<Value> &local_inputs);
     std::vector<Value> wait(CommHandle &handle);
     void synchronize(Value &value);
-    void preflight(std::uint64_t fingerprint);
+    void preflight(std::string_view plan_source_sha256,
+                   bool skip_artifact_digest_checks,
+                   const TargetConfig &target,
+                   const OperatorSpec &operator_spec,
+                   const PlanRequirements &requirements);
     [[noreturn]] void abort_all(int exit_code, const std::string &reason);
-    ValueKind kind(const Value &value) const { return value.kind(); }
+    void validate_value(const Value &value, const ValueDesc &expected) const;
 
 private:
     int tag(TransferId id, std::size_t slot, int part) const;
@@ -68,6 +75,7 @@ private:
     int world_size_ = 0;
     int tag_upper_bound_ = 0;
     VecExecutor executor_;
+    std::uint64_t poly_degree_ = 0;
 };
 
 } // namespace fhegpu
