@@ -6,7 +6,7 @@
 
 - 未来逻辑 CKKS dialect 的语义；
 - 目标相关合法化、设备分配和通信显式化这些编译步骤；
-- 可执行 SSA 到 RuntimePlan V1 JSON 的对应关系；
+- 可执行 SSA 到 RuntimePlan V1 草案 JSON 的对应关系；
 - Runtime 内部 `runtime/plan.hpp` 的目标类型映射；
 - runtime 验证器依赖的稳定不变量。
 
@@ -86,7 +86,7 @@
 
 **Dist（或 Comm）dialect**：transfer、replicate、可选的集合通信；位置效果；可选的异步 token。
 
-设备分配 Pass 不需要新 dialect，它只是给 CKKS 算子加属性。跨 Dacapo 和 Runtime 的稳定边界已经确定为 RuntimePlan V1 JSON:可执行 CKKS 直接序列化成 JSON,Runtime 再解析成自己的 C++ 结构。V1 不需要额外创建一个 ckks-runtime MLIR dialect;以后只有在确实出现多个 MLIR 消费方时再考虑。
+设备分配 Pass 不需要新 dialect，它只是给 CKKS 算子加属性。跨 Dacapo 和 Runtime 的目标边界是 RuntimePlan V1 草案 JSON:可执行 CKKS 直接序列化成 JSON,Runtime 再解析成自己的 C++ 结构。V1 不需要额外创建一个 ckks-runtime MLIR dialect;以后只有在确实出现多个 MLIR 消费方时再考虑。
 
 ## 4. 类型设计
 
@@ -101,7 +101,7 @@
 
 Dacapo 当前 Earth 类型里的 `scale` 已经是这个整数指数。对外协议改名为 `scale_log2`,只是把原有含义写清楚。
 
-Dacapo 的 Earth 分析阶段用“已经消耗多少层”的方向记录 level,Rescale 后数值增加;下降到 CKKS PolyType 时会换算成“还剩多少层”,Rescale 后数值下降。RuntimePlan V1 固定采用后者。序列化必须发生在这个换算之后。
+Dacapo 的 Earth 分析阶段用“已经消耗多少层”的方向记录 level,Rescale 后数值增加;下降到 CKKS PolyType 时会换算成“还剩多少层”,Rescale 后数值下降。RuntimePlan V1 草案固定采用后者。序列化必须发生在这个换算之后。
 
 在逻辑和已分配阶段,这些元信息可以放在类型、值属性或分析结果中;导出可执行计划之前必须全部落到每个值的描述符中,不能再是“可选信息”。
 
@@ -137,16 +137,16 @@ Transfer/Replicate 必须产生新的 ValueId 来表示新的物理副本：
 
 ~~~cpp
 enum class OpClass {
-    DataMaterialization, // 数据物化
+    ConstantDefinition,  // 常量定义
     PureCompute,     // 纯计算
     Communication,   // 通信
     ExternalIO       // 外部输入输出
 };
 ~~~
 
-**数据物化**：Encode。它读取指令内联的浮点 slot，或按内容哈希从明文数据包读取 slot，再编码成 Host 上的 CKKS 明文。Encode 没有普通 SSA 输入，但会定义一个新的 plaintext ValueId；它是初始化阶段的显式指令，不是 external input。执行位置直接取输出 ValueDesc 的 Place,不在指令里重复保存。
+**常量定义**：Encode。它读取指令内联的浮点 slot，或按内容哈希从明文数据包读取 slot，再生成 Host 上的 CKKS 明文。Encode 没有普通 SSA 输入，但会定义一个新的 plaintext ValueId；它是初始化阶段的显式指令，不是 external input。执行位置直接取输出 ValueDesc 的 Place,不在指令里重复保存。
 
-**纯计算**：AddCC、AddCP、SubCC、SubCP、MulCC、MulCP、Negate、Rotate、Rescale、ModSwitch、Relinearize、Boot。逻辑上引用透明：`outputs = f(inputs)`。Api 在物理上分配和写入输出 buffer 不算逻辑副作用；计算函数本身不得主动发起通信。计算 Place 可以是 Device,也可以是目标明确支持的 Host;不能在 Runtime 里写死“所有计算只能在 GPU”。
+**纯计算**：AddCC、AddCP、SubCC、SubCP、MulCC、MulCP、Negate、Rotate、Rescale、ModSwitch、Relinearize、Boot。相同输入和属性一定得到相同输出,而且算子本身不发通信。Api 在物理上分配和写入输出 buffer 不算逻辑副作用。计算 Place 可以是 Device,也可以是目标明确支持的 Host;不能在 Runtime 里写死“所有计算只能在 GPU”。
 
 Boot 有两种明确的实现模式:
 
@@ -157,7 +157,7 @@ Boot 有两种明确的实现模式:
 
 **通信**：V1 只有 Transfer 和 Replicate。将来可以增加 Gather、Scatter、AllGather 或分片转换,但要先定义清楚数学关系并升级协议。Transfer/Replicate 对数学值和 CKKS 元信息都是原样搬运,但在位置、资源、错误和完成状态上有实际效果,不能被当成可随意删除的空操作。
 
-**外部输入输出**：运行时的输入绑定、上传/下载、结果发布。
+**外部输入输出**：调用方输入绑定和最终结果发布。Host↔Device 的上传/下载仍然必须由 Transfer/Replicate 表示,不属于 ExternalIO 的隐式行为。
 
 ### 5.1 明文常量与 `ckks.encode`
 
@@ -199,7 +199,9 @@ payload 有两种形态。小数据可以直接内联:
 
 逻辑 CKKS 中的 `ckks.encode` 是确定性的纯算子,没有通信副作用;进入 RuntimePlan 后则是一条显式的初始化指令。它的输出 ValueDesc 必须是 Host plaintext,具体 rank 和编码参数都从该 ValueDesc 读取。当前 Dacapo 的 `ckks.encode` 是 destination-style 算子,数据来自旧 `.cst` 文件索引;新管线保留名字和编码语义,但要**重做这个 op 的载荷接口**,让它直接持有内联浮点数组或内容哈希引用。也就是说,这不是在描述现有 EncodeOp 已经具备的接口。如果后端仍需要 destination-style 形式,在更低层 bufferization 时再下降。
 
-内联形态适合小 mask 和手写测试;引用形态适合模型权重。明文数据外化 pass 可以按字节阈值把大的内联 payload 写入数据包并改写为引用形态,但 RuntimePlan 不要求全部外化,两种 payload 都是合法协议形式。内容寻址只负责原始数据去重;两个 `ckks.encode` 只有在 payload 和完整输出元信息都相同时才能被 CSE。
+内联形态适合小 mask 和手写测试；引用形态适合模型权重。明文数据外化 pass 可以按字节阈值把大的内联 payload 写入数据包并改写为引用形态，但 RuntimePlan 不要求全部外化，两种 payload 都是合法协议形式。
+
+判断两个 `ckks.encode` 能否合并时，要先把 inline/bundle 都还原成同一套 float64 字节再比较，并同时比较完整输出描述。placement 完成后，输出 Place 也必须相同；否则即使原始数据相同，也不能共用一个 ValueId。
 
 ## 6. 提示与强制指令的区别
 
@@ -226,7 +228,7 @@ payload 有两种形态。小数据可以直接内联:
 
 ### 7.2 目标相关合法化
 
-这个 Pass 读取 TargetSpec 和版本化的 CKKS OperatorSpec,把通用 CKKS 图变成目标真正能执行的图。OperatorSpec 至少给出 context/RNS 限制、算子支持范围、元信息变化、代价、rescale 模式和 boot profile。
+这个 Pass 读取 TargetSpec 和版本化的 CKKS OperatorSpec，把通用 CKKS 图变成目标真正能执行的图。OperatorSpec 给出 context/RNS 限制、算子支持边界、代价、rescale 模式和 Boot profile；普通算子的元信息变化规则仍由 RuntimePlan 规范定义。
 
 rescale 的规则是:
 
@@ -269,7 +271,7 @@ Boot 内部如果也需要 lazy-rescale,其合法输入范围、实际 level 消
 
 - 把计算输出规范化到计算位置；
 - 对跨位置的使用插入 Transfer/Replicate；
-- 同一个目标位置只物化一次，复用已有的 ValueId；
+- 同一个目标位置只生成一个副本，复用已有的 ValueId；
 - Replicate 的每个目标生成不同的输出 ValueId；
 - 把每个使用者的操作数改写成其所在位置对应的 ValueId；
 - 生成稳定的传输来历信息；
@@ -279,11 +281,16 @@ Boot 内部如果也需要 lazy-rescale,其合法输入范围、实际 level 消
 
 ### 7.5 可执行验证
 
-检查：所有计算指令有唯一 Place；该 Place 支持对应算子和 boot implementation；每个 Encode 都在 initialization 中,输出 ValueDesc 是 Host plaintext；内联 payload 是合法的有限 float64 数组；引用 payload 的 `content` 能在数据包 manifest 中找到；每个 ValueId 恰好定义一次；所有计算操作数都在本地；每个值都有完整的 context、level、`scale_log2`、NTT 和分量数；算子目标元信息与输出值描述一致；OperatorSpec/profile 引用有效；不再有未满足的 `result_places`；transfer 的源已定义且位置合法；传输前后数学类型和 CKKS 元信息一致；来源/目标属于编译目标；通信动作的输入输出关系合法；Replicate 的输出数等于目标数且一一对应；不允许一个输出 ValueId 对应多个目标。
+检查分成四组:
 
-### 7.6 导出 RuntimePlan V1
+- **Encode**:只在 initialization,输出是 Host plaintext,inline/bundle payload 合法;
+- **计算**:唯一 Place、操作数都在本地、类型和 CKKS 元信息合法、OperatorSpec/profile 引用有效;
+- **SSA**:每个 ValueId 恰好定义一次,没有未满足的 `result_places`,所有使用都被定义支配;
+- **通信**:源和目标属于编译目标,Transfer/Replicate 前后数学类型与元信息一致,输出和目标一一对应。
 
-把可执行 CKKS 序列化成 RuntimePlan V1 JSON。`ckks.encode` 一对一变成 initialization 中的 Encode 指令:内联 payload 写成浮点数组,引用 payload 写成 `content` 哈希,输出仍使用原来的 ValueId。JSON 是 Dacapo 与 Runtime 之间唯一的稳定协议。Runtime 读取后可以转成自己的 C++ `RuntimePlan`,但两边不共享 C++ 类型。首期不需要新 MLIR dialect。
+### 7.6 导出 RuntimePlan V1 草案
+
+把可执行 CKKS 序列化成 RuntimePlan V1 草案 JSON。`ckks.encode` 一对一变成 initialization 中的 Encode 指令:内联 payload 写成浮点数组,引用 payload 写成 `content` 哈希,输出仍使用原来的 ValueId。JSON 是 Dacapo 与 Runtime 之间唯一的稳定协议。Runtime 读取后可以转成自己的 C++ `RuntimePlan`,但两边不共享 C++ 类型。首期不需要新 MLIR dialect。
 
 ## 8. 等待与异步的表示
 

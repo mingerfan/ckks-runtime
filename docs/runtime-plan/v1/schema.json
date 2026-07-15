@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ckks-runtime/runtime-plan/v1/schema.json",
-  "title": "RuntimePlan V1",
-  "description": "机器可检查的结构约束。语义不变量(SSA、元信息规则、一致性检查)见 specification.md,Schema 只覆盖结构层。",
+  "title": "RuntimePlan V1 previous-draft schema",
+  "description": "上一版草案的机器结构约束:尚无显式 Encode,也不允许 inline 浮点 payload。目标格式见 specification.md;迁移完成前不要把本 Schema 当作最终 V1。",
   "type": "object",
   "additionalProperties": false,
   "required": [

@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""重新生成协议测试样例集(profiles + testdata)。
+"""重新生成上一版 RuntimePlan 草案样例集(profiles + testdata)。
 
 用法: python3 generate.py  (在本目录下运行)
 
-指纹按 RuntimePlan V1 规范第 8 节计算:删除顶层 fingerprint 字段后,
+这些样例尚无显式 Encode,也不允许 inline 浮点 payload。它们用于当前旧 reader 的
+结构解析和部分检查回归;OperatorSpec/BND 等语义尚未完整覆盖,不能作为目标 V1 格式的生成器。
+
+旧样例的指纹计算:删除顶层 fingerprint 字段后,
 按 JCS 等价的 canonical form(sort_keys、无空白、ensure_ascii=False)
 序列化为 UTF-8,取 SHA-256。协议中所有数字都是整数,无需浮点规范化。
 

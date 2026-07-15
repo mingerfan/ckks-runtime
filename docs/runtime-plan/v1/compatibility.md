@@ -13,7 +13,7 @@
 
 **同一个版本号下不允许"看文件内容猜格式"**;也不靠"缺了某字段"或"解析失败"推断这是旧格式文件。版本判断只看 `format_version` 一个字段。
 
-> **V1 当前仍是草案。** 2026-07 的第一次实现把 bundle 权重表示成 plaintext external_inputs;在尚无外部使用者、bundle 执行链也未实现完整时,设计改回显式 Encode 指令。Encode 支持 inline 浮点数组和 bundle `content` 引用,external_inputs 只表示调用方参数,manifest 不再绑定 ValueId。当前 Schema、样例和 C++ 代码仍待迁移;全部对齐并通过端到端测试后再宣布 V1 冻结。在此之前不创建只为保留错误草案的 V2。
+> **V1 当前仍是草案。** 2026-07 的第一次实现把 bundle 固定权重表示成 plaintext external_inputs；在尚无外部使用者、bundle 执行链也未完整实现时，设计改回显式 Encode 指令。Encode 支持 inline 浮点数组和 bundle `content` 引用；external_inputs 保留给每次运行由调用方传入的参数，manifest 不再绑定 ValueId。当前 Schema、样例和 C++ 代码仍待迁移；全部对齐并通过端到端测试后再宣布 V1 冻结。在此之前不创建只为保留错误草案的 V2。
 
 ## 2. 修改流程
 
@@ -36,7 +36,7 @@
 `format_version` 之外还有两个正交的兼容轴:
 
 - `target_id` + `capability_version`:Runtime 的每个 Api 实现声明自己支持哪些组合。计划要求的组合不在支持列表里,执行前直接拒绝;
-- `operator_spec` 的 id/version/fingerprint:Runtime 持有一份已联调验证的 spec 副本,三项都相符才接受。**指纹不符时即使 id 和 version 相同也拒绝**——这抓的是"同一个版本号下内容被悄悄改动"的情况。
+- `operator_spec` 的 id/version/fingerprint：Runtime 持有一份明确选择的 spec 副本，三项都相符才接受。生产部署还要求其状态为 `validated`；placeholder 只能由测试显式允许。**指纹不符时即使 id 和 version 相同也拒绝**——这抓的是“同一个版本号下内容被悄悄改动”的情况。
 
 这两轴升级不需要动 `format_version`:新增一个 target 或一版 OperatorSpec,只是新的取值,文件格式没变。
 

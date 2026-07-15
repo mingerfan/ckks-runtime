@@ -69,6 +69,48 @@
       "items": { "$ref": "#/$defs/bootProfile" }
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "operators": {
+            "properties": {
+              "boot": {
+                "properties": {
+                  "supported": { "const": true }
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "boot_profiles": { "minItems": 1 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operators": {
+            "properties": {
+              "boot": {
+                "properties": {
+                  "supported": { "const": false }
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "boot_profiles": { "maxItems": 0 }
+        }
+      }
+    }
+  ],
   "$defs": {
     "latencyTable": {
       "oneOf": [
@@ -87,7 +129,7 @@
       "properties": {
         "supported": { "type": "boolean" },
         "latency_us_by_level": { "$ref": "#/$defs/latencyTable" },
-        "noise_by_level": { "$ref": "#/$defs/latencyTable" }
+        "noise_by_level": { "$ref": "#/$defs/noiseTable" }
       }
     },
     "rescaleEntry": {
@@ -98,7 +140,7 @@
         "supported": { "type": "boolean" },
         "max_levels_per_op": { "type": "integer", "minimum": 1 },
         "latency_us_by_level": { "$ref": "#/$defs/latencyTable" },
-        "noise_by_level": { "$ref": "#/$defs/latencyTable" }
+        "noise_by_level": { "$ref": "#/$defs/noiseTable" }
       }
     },
     "bootEntry": {
@@ -108,6 +150,10 @@
       "properties": {
         "supported": { "type": "boolean" }
       }
+    },
+    "noiseTable": {
+      "description": "RuntimePlan/OperatorSpec V1 草案尚未定义跨后端噪声单位,当前必须显式为 null。",
+      "type": "null"
     },
     "bootProfile": {
       "type": "object",

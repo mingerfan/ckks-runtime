@@ -1,13 +1,13 @@
 # profiles 目录说明
 
-这里是本仓库集成测试**固定使用**的 OperatorSpec 副本。`testdata/` 里的合法计划样例通过 `target.operator_spec` 的 id/version/fingerprint 引用它们,所以这两份文件的内容一变,样例计划的指纹核对就会失败——这是刻意的,提醒你同步升 `version` 并重算指纹。
+这里保存 RuntimePlan 样例引用的 OperatorSpec 副本。计划 JSON 只保存 id/version/fingerprint;目标 Runtime 应读取对应 spec 文件并核对三项。**当前 C++ reader 尚未实现这一步**,所以改动 profile 后必须由维护者主动升 `version`、重算 spec 指纹并更新所有引用样例,不能依赖现有测试自动发现。
 
 | 文件 | spec_id | rescale_mode | 状态 |
 | --- | --- | --- | --- |
 | `poseidon-ckks-cpu.v1.json` | `poseidon-ckks-cpu-v1` | eager | placeholder |
 | `poseidon-ckks-gpu.v1.json` | `poseidon-ckks-gpu-v1` | lazy | placeholder |
 
-**两份都是 placeholder**:结构完整、符合 Schema,但所有延迟数值都是虚构的占位,`noise_by_level` 全部为 `null`。它们的用途是冻结格式、驱动协议测试,不能用于真实的编译代价决策。
+**两份都是 placeholder**:结构完整、符合 Schema,但所有延迟数值都是虚构的占位,`noise_by_level` 按当前 V1 草案要求全部为 `null`。它们只用于设计和样例,不能用于真实的编译代价决策。
 
 等 Poseidon 实测数据可用后:
 
