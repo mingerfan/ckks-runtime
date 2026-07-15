@@ -1,6 +1,6 @@
 # Dacapo、Runtime 与 Poseidon 集成方案
 
-> 本文描述目标集成结构和迁移顺序。当前仓库还没有 Dacapo submodule、`integrations/dacapo/` 或 Poseidon 后端；Runtime 自身的完成情况见[实现状态](implementation-status.md)。
+> 本文描述目标集成结构和迁移顺序。当前仓库已经加入可选的 Dacapo submodule；`integrations/dacapo/` 和 Poseidon 后端尚未实现。Runtime 自身的完成情况见[实现状态](implementation-status.md)。
 
 ## 1. 这份方案要解决什么问题
 
@@ -45,7 +45,7 @@ Runtime 不反向依赖 Dacapo 或 Poseidon。Poseidon 只依赖 Runtime;Dacapo 
 
 ## 2. 仓库怎么摆
 
-目标仓库结构如下。当前仓库尚未加入 `integrations/dacapo/` 和 Dacapo submodule,它们属于迁移阶段二:
+目标仓库结构如下。当前仓库已加入 Dacapo submodule，`integrations/dacapo/` 属于后续阶段二工作:
 
 ~~~text
 ckks-runtime/

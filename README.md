@@ -44,3 +44,13 @@ MPI 可用时还可以运行：
 mpiexec -n 2 ./build/mpi_runtime_test
 mpiexec -n 4 ./build/mpi_runtime_test
 ~~~
+
+## 可选的 Dacapo 集成
+
+Dacapo 只用于编译器集成开发和端到端测试，不参与 Runtime 的默认构建。普通开发不需要下载它；需要时再显式初始化固定版本：
+
+~~~bash
+git submodule update --init third_party/dacapo
+~~~
+
+Dacapo 是独立的 CMake/MLIR 工程，初始化 submodule 不会让 xmake 自动编译它。当前固定的是 `mingerfan/dacapo-modified` fork；后续阶段二的生成 Pass 和集成测试会基于这个目录接入。

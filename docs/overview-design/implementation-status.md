@@ -12,9 +12,13 @@
 
 仓库内 OperatorSpec 仍是 `placeholder`，只用于协议测试。
 
+## 阶段二进行中
+
+- 已把 `mingerfan/dacapo-modified` 作为可选 submodule 固定在 `third_party/dacapo/`。它不参与默认 xmake 构建，需要时用 `git submodule update --init third_party/dacapo` 显式初始化。
+- 待完成：Dacapo 的 RuntimePlan 生成 Pass 和真实编译产物集成测试。
+
 ## 后续阶段
 
-- 阶段二：Dacapo submodule 和 RuntimePlan 生成 Pass。
 - 阶段三：PoseidonCpuApi、PoseidonGpuApi 和生产测量 profile。
 
 这些内容不属于 RuntimePlan V1 冻结条件。
