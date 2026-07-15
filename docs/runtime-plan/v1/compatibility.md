@@ -36,7 +36,7 @@
 `format_version` 之外还有两个正交的兼容轴:
 
 - `target_id` + `capability_version`:Runtime 的每个 Api 实现声明自己支持哪些组合。计划要求的组合不在支持列表里,执行前直接拒绝;
-- `operator_spec` 的 id/version/source_sha256：Runtime 持有一份明确选择的 spec 文件，默认要求三项都相符。`source_sha256` 直接覆盖完整原始文件字节;生产部署还要求其状态为 `validated`，placeholder 只能由测试显式允许。
+- `operator_spec` 的 id/version/source_sha256：Runtime 持有一份明确选择的 spec 文件，默认要求三项都相符。`source_sha256` 直接覆盖完整原始文件字节;生产部署还要求其状态为 `validated`，`placeholder` 和 `imported` 只能由测试或迁移工具显式允许。
 
 这两轴升级不需要动 `format_version`:新增一个 target 或一版 OperatorSpec,只是新的取值,文件格式没变。
 

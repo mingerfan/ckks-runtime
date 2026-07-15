@@ -171,7 +171,8 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                                       bool skip_artifact_digest_checks) {
     const auto &spec = loaded_spec.spec;
     if (plan.format_version != 1) fail("unsupported format version");
-    if (spec.format_version != 1) fail("unsupported OperatorSpec format version");
+    if (spec.format_version != 1 && spec.format_version != 2)
+        fail("unsupported OperatorSpec format version");
     if (plan.target.target_id.empty()) fail("target id is empty");
     if (plan.target.capability_version <= 0) fail("capability version must be positive");
     if (plan.target.world_size <= 0) fail("world size must be positive");

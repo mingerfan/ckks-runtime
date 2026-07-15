@@ -34,11 +34,25 @@ LoadedOperatorSpec make_test_operator_spec() {
     for (ComputeKind kind : {ComputeKind::AddCC, ComputeKind::AddCP, ComputeKind::SubCC,
              ComputeKind::SubCP, ComputeKind::MulCC, ComputeKind::MulCP, ComputeKind::Negate,
              ComputeKind::Rotate, ComputeKind::Rescale, ComputeKind::ModSwitch,
-             ComputeKind::Relinearize, ComputeKind::Boot})
-        spec.operators.emplace(kind, OperatorSupport{true, std::nullopt,
-            kind == ComputeKind::Rescale ? std::optional<int>{2} : std::nullopt});
-    spec.boot_profiles.push_back(BootProfile{"test-boot", BootImplementation::DecryptReencrypt,
-        0, 4, 2, 4, 1, 2, 1, true, true});
+             ComputeKind::Relinearize, ComputeKind::Boot}) {
+        OperatorSupport support;
+        support.supported = true;
+        if (kind == ComputeKind::Rescale) support.max_levels_per_op = 2;
+        spec.operators.emplace(kind, std::move(support));
+    }
+    BootProfile boot;
+    boot.profile_id = "test-boot";
+    boot.implementation = BootImplementation::DecryptReencrypt;
+    boot.input_level_min = 0;
+    boot.input_level_max = 4;
+    boot.input_components = 2;
+    boot.output_level = 4;
+    boot.output_scale_log2 = 1;
+    boot.output_components = 2;
+    boot.latency_us = 1;
+    boot.needs_secret_key = true;
+    boot.needs_host_compute = true;
+    spec.boot_profiles.push_back(std::move(boot));
     return {std::move(spec), "sha256:0000000000000000000000000000000000000000000000000000000000000000"};
 }
 

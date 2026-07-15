@@ -157,6 +157,8 @@ hint 合法值为 `auto`、`point_to_point`、`broadcast`、`tree`、`ring`、`h
 
 ## 6. OperatorSpec 和启动要求
 
+RuntimePlan V1 不把 OperatorSpec 的格式版本写死在计划结构中。当前 Runtime 明确支持 OperatorSpec V1 和 V2；遇到其他 `spec_format_version` 直接拒绝。
+
 Runtime 必须检查：
 
 - spec id/version/target/context 与计划一致；默认模式下原始字节摘要一致。

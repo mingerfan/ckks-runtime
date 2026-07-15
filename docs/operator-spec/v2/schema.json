@@ -1,0 +1,194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ckks-runtime/operator-spec/v2/schema.json",
+  "title": "CKKS OperatorSpec V2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "spec_format_version", "spec_id", "version", "status", "target_id",
+    "rescale_mode", "noise_unit", "provenance", "context", "levels",
+    "operators", "boot_profiles"
+  ],
+  "properties": {
+    "spec_format_version": { "const": 2 },
+    "spec_id": { "type": "string", "minLength": 1 },
+    "version": { "type": "integer", "minimum": 1 },
+    "status": { "enum": ["imported", "validated"] },
+    "target_id": { "type": "string", "minLength": 1 },
+    "rescale_mode": { "enum": ["eager", "lazy"] },
+    "noise_unit": {
+      "oneOf": [
+        { "type": "null" },
+        { "type": "string", "minLength": 1 }
+      ]
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "repository", "revision", "path", "source_sha256"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 },
+        "repository": { "type": "string", "minLength": 1 },
+        "revision": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "source_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["context_id", "poly_degree", "rns_moduli_log2", "max_modulus_log2", "default_scale_log2"],
+      "properties": {
+        "context_id": { "type": "string", "minLength": 1 },
+        "poly_degree": { "type": "integer", "minimum": 2 },
+        "rns_moduli_log2": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "integer", "minimum": 1, "maximum": 64 }
+        },
+        "max_modulus_log2": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "default_scale_log2": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "levels": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lower_bound", "upper_bound"],
+      "properties": {
+        "lower_bound": { "type": "integer", "minimum": 0 },
+        "upper_bound": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "operators": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "add_cc", "add_cp", "sub_cc", "sub_cp", "mul_cc", "mul_cp",
+        "negate", "rotate", "rescale", "mod_switch", "relinearize", "boot"
+      ],
+      "properties": {
+        "add_cc": { "$ref": "#/$defs/operatorEntry" },
+        "add_cp": { "$ref": "#/$defs/operatorEntry" },
+        "sub_cc": { "$ref": "#/$defs/operatorEntry" },
+        "sub_cp": { "$ref": "#/$defs/operatorEntry" },
+        "mul_cc": { "$ref": "#/$defs/operatorEntry" },
+        "mul_cp": { "$ref": "#/$defs/operatorEntry" },
+        "negate": { "$ref": "#/$defs/operatorEntry" },
+        "rotate": { "$ref": "#/$defs/operatorEntry" },
+        "rescale": { "$ref": "#/$defs/rescaleEntry" },
+        "mod_switch": { "$ref": "#/$defs/operatorEntry" },
+        "relinearize": { "$ref": "#/$defs/operatorEntry" },
+        "boot": { "$ref": "#/$defs/bootEntry" }
+      }
+    },
+    "boot_profiles": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/bootProfile" }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "operators": {
+            "properties": {
+              "boot": { "properties": { "supported": { "const": true } } }
+            }
+          }
+        }
+      },
+      "then": { "properties": { "boot_profiles": { "minItems": 1 } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "operators": {
+            "properties": {
+              "boot": { "properties": { "supported": { "const": false } } }
+            }
+          }
+        }
+      },
+      "then": { "properties": { "boot_profiles": { "maxItems": 0 } } }
+    }
+  ],
+  "$defs": {
+    "latencyTable": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "integer", "minimum": 0 }
+        }
+      ]
+    },
+    "noiseTable": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "number", "minimum": 0 }
+        }
+      ]
+    },
+    "operatorEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["supported", "latency_us_by_level", "noise_by_level"],
+      "properties": {
+        "supported": { "type": "boolean" },
+        "latency_us_by_level": { "$ref": "#/$defs/latencyTable" },
+        "noise_by_level": { "$ref": "#/$defs/noiseTable" }
+      }
+    },
+    "rescaleEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["supported", "max_levels_per_op", "latency_us_by_level", "noise_by_level"],
+      "properties": {
+        "supported": { "type": "boolean" },
+        "max_levels_per_op": { "type": "integer", "minimum": 1 },
+        "latency_us_by_level": { "$ref": "#/$defs/latencyTable" },
+        "noise_by_level": { "$ref": "#/$defs/noiseTable" }
+      }
+    },
+    "bootEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["supported"],
+      "properties": { "supported": { "type": "boolean" } }
+    },
+    "bootProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile_id", "implementation", "input_level_min", "input_level_max",
+        "input_components", "output_level", "output_scale_log2", "output_components",
+        "latency_us_by_input_level", "noise_by_input_level", "host_requirements"
+      ],
+      "properties": {
+        "profile_id": { "type": "string", "minLength": 1 },
+        "implementation": { "enum": ["native", "decrypt_reencrypt"] },
+        "input_level_min": { "type": "integer", "minimum": 0 },
+        "input_level_max": { "type": "integer", "minimum": 0 },
+        "input_components": { "type": "integer", "minimum": 1 },
+        "output_level": { "type": "integer", "minimum": 0 },
+        "output_scale_log2": { "type": "integer", "minimum": 0 },
+        "output_components": { "type": "integer", "minimum": 1 },
+        "latency_us_by_input_level": { "$ref": "#/$defs/latencyTable" },
+        "noise_by_input_level": { "$ref": "#/$defs/noiseTable" },
+        "host_requirements": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["needs_secret_key", "needs_host_compute"],
+          "properties": {
+            "needs_secret_key": { "type": "boolean" },
+            "needs_host_compute": { "type": "boolean" }
+          }
+        }
+      }
+    }
+  }
+}

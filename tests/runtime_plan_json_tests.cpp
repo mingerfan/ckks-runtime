@@ -144,6 +144,81 @@ void test_strict_json_and_operator_spec() {
     require(level_position != std::string::npos, "level fixture was not found");
     level_text.replace(level_position, std::string("\"upper_bound\": 13").size(), "\"upper_bound\": 14");
     expect_throw([&] { OperatorSpecReader::read_text(level_text); }, "modulus chain");
+
+    std::ifstream v1_noise_input(cpu_path);
+    std::string v1_noise_text((std::istreambuf_iterator<char>(v1_noise_input)),
+                              std::istreambuf_iterator<char>());
+    const std::string null_noise = "\"noise_by_level\": null";
+    const auto noise_position = v1_noise_text.find(null_noise);
+    require(noise_position != std::string::npos, "V1 noise fixture was not found");
+    v1_noise_text.replace(noise_position, null_noise.size(), "\"noise_by_level\": [0]");
+    expect_throw([&] { OperatorSpecReader::read_text(v1_noise_text); }, "must be null in V1");
+}
+
+void test_dacapo_operator_spec_v2_profiles() {
+    const auto profile_dir = source_dir / "docs/operator-spec/v2/profiles";
+    const auto cpu = OperatorSpecReader::read_file((profile_dir / "dacapo-heaan-cpu.v1.json").string());
+    require(cpu.spec.format_version == 2 && cpu.spec.boot_profiles.at(0).output_level == 16,
+            "Dacapo HEAAN CPU profile was not read");
+    const auto gpu_path = profile_dir / "dacapo-heaan-gpu.v1.json";
+    const auto gpu = OperatorSpecReader::read_file(gpu_path.string());
+    require(gpu.spec.format_version == 2 && gpu.spec.status == "imported",
+            "Dacapo HEAAN GPU profile version/status was not read");
+    require(gpu.spec.poly_degree == 131072 && gpu.spec.level_lower_bound == 1 &&
+                gpu.spec.level_upper_bound == 29,
+            "Dacapo HEAAN GPU CKKS parameters were not migrated");
+    require(gpu.spec.provenance &&
+                gpu.spec.provenance->source_sha256 ==
+                    "sha256:678e3d0225236e1f44fac4eb1bcc76513940ffabcfbe74d2c920b4362d08b23d",
+            "Dacapo HEAAN GPU provenance was not read");
+    const auto &gpu_add = gpu.spec.operators.at(ComputeKind::AddCC);
+    require(gpu_add.latency_us_by_level && gpu_add.latency_us_by_level->at(2) == 25 &&
+                gpu_add.latency_us_by_level->at(29) == 280,
+            "Dacapo table indexing was not migrated with reader-compatible normalization");
+    const auto &gpu_boot = gpu.spec.boot_profiles.at(0);
+    require(gpu_boot.input_level_min == 3 && gpu_boot.input_level_max == 16 &&
+                gpu_boot.output_level == 16,
+            "Dacapo Earth-to-CKKS bootstrap level conversion is wrong");
+    require(gpu_boot.latency_us_by_input_level &&
+                gpu_boot.latency_us_by_input_level->at(5) == 294928,
+            "Dacapo per-level bootstrap latency was not migrated");
+    RuntimePlan v2_plan;
+    v2_plan.plan_id = 2001;
+    v2_plan.target.target_id = gpu.spec.target_id;
+    v2_plan.target.capability_version = 1;
+    v2_plan.target.operator_spec = {gpu.spec.id, gpu.spec.version, gpu.source_sha256};
+    v2_plan.target.world_size = 1;
+    v2_plan.target.device_counts = {0};
+    v2_plan.values.push_back({1, ValueKind::Ciphertext, {PlaceKind::Host, 0, 0},
+                              gpu.spec.context_id, 3, 40, true, 2});
+    v2_plan.external_inputs = {1};
+    v2_plan.final_outputs = {1};
+    PlanVerifier::verify(v2_plan, gpu);
+
+    const auto seal_path = profile_dir / "dacapo-seal-cpu.v1.json";
+    const auto seal = OperatorSpecReader::read_file(seal_path.string());
+    require(seal.spec.noise_unit && *seal.spec.noise_unit == "dacapo-legacy-estimator",
+            "Dacapo SEAL noise unit was not read");
+    const auto &seal_add = seal.spec.operators.at(ComputeKind::AddCC);
+    require(seal_add.latency_us_by_level && seal_add.latency_us_by_level->at(1) == 85 &&
+                seal_add.latency_us_by_level->at(13) == 3120,
+            "Dacapo SEAL latency table was not migrated");
+    const auto &seal_rotate = seal.spec.operators.at(ComputeKind::Rotate);
+    require(seal_rotate.noise_by_level &&
+                std::abs(seal_rotate.noise_by_level->at(1) - 1243767652.125024) < 1e-6 &&
+                std::abs(seal_rotate.noise_by_level->at(13) - 19223819509.410683) < 1e-6,
+            "Dacapo SEAL noise table was not migrated");
+    require(seal.spec.boot_profiles.at(0).implementation == BootImplementation::DecryptReencrypt &&
+                !seal.spec.boot_profiles.at(0).latency_us_by_input_level,
+            "Dacapo SEAL Boot semantics were not migrated");
+
+    std::ifstream input(seal_path);
+    std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    const std::string unit = "\"noise_unit\": \"dacapo-legacy-estimator\"";
+    const auto position = text.find(unit);
+    require(position != std::string::npos, "V2 noise unit fixture was not found");
+    text.replace(position, unit.size(), "\"noise_unit\": null");
+    expect_throw([&] { OperatorSpecReader::read_text(text); }, "must be set exactly");
 }
 
 void copy_fixture(const std::filesystem::path &source, const std::filesystem::path &destination) {
@@ -209,6 +284,7 @@ int main() {
         run_test("valid RuntimePlan V1 samples", test_valid_samples);
         run_test("invalid RuntimePlan V1 samples", test_invalid_samples);
         run_test("strict JSON and OperatorSpec constraints", test_strict_json_and_operator_spec);
+        run_test("Dacapo OperatorSpec V2 profiles", test_dacapo_operator_spec_v2_profiles);
         run_test("rank-local bundle loading", test_rank_local_bundle_loading);
         std::cout << "ALL " << tests_run << " JSON TEST GROUPS PASSED\n";
         return 0;

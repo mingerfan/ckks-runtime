@@ -15,6 +15,7 @@
 ## 阶段二进行中
 
 - 已把 `mingerfan/dacapo-modified` 作为可选 submodule 固定在 `third_party/dacapo/`。它不参与默认 xmake 构建，需要时用 `git submodule update --init third_party/dacapo` 显式初始化。
+- 已把 Dacapo 的 HEAAN CPU/GPU、SEAL CPU profile 迁到 OperatorSpec V2，保留 CKKS 参数、逐 level 延迟/噪声、来源 SHA-256，并显式完成 Earth→CKKS bootstrap level 换算。V1 保持冻结。
 - 待完成：Dacapo 的 RuntimePlan 生成 Pass 和真实编译产物集成测试。
 
 ## 后续阶段
