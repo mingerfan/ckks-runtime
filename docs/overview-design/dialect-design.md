@@ -406,13 +406,13 @@ struct Instruction {
 struct OperatorSpecRef {
     std::string id;
     std::uint32_t version;
-    std::string fingerprint;
+    std::string source_sha256;
 };
 
 struct PlaintextBundleRef {
     std::string id;
     std::uint32_t version;
-    std::string fingerprint;
+    std::string manifest_sha256;
 };
 
 enum class RescaleMode {
@@ -459,7 +459,6 @@ struct TargetConfig {
 struct RuntimePlan {
     std::uint32_t format_version;
     std::uint64_t plan_id;
-    std::string fingerprint;
     TargetConfig target;
     std::optional<PlaintextBundleRef> plaintext_bundle;
     std::vector<ValueDesc> values;
@@ -474,7 +473,7 @@ struct RuntimePlan {
 
 Rescale 和 Boot 不再使用 `double scale_divisor` 或 `double scale`;它们直接写目标 level 和整数 `target_scale_log2`。对 Replicate，`outputs.size()` 必须等于 `destinations.size()`，且 `outputs[i]` 的值描述符必须指向 `destinations[i]`。实现可以用模板或更严格的分类型算子，但要避免所有算子共用一组含义不明的平铺字段。
 
-bundle 的本机目录不属于 `RuntimePlan`,所以不放进 `plan.hpp` 的计划结构。计划只保存 id/version/fingerprint 和 Encode 的 `content`;真正的目录路径由部署方在调用 Runtime 时另外传入。这样同一份计划可以在不同节点使用不同挂载路径,同时又不会把部署细节混进可复现的计划指纹。
+bundle 的本机目录不属于 `RuntimePlan`,所以不放进 `plan.hpp` 的计划结构。计划只保存 id/version/manifest_sha256 和 Encode 的 `content`;真正的目录路径由部署方在调用 Runtime 时另外传入。`manifest_sha256` 直接覆盖 manifest 完整原始字节,各节点路径可以不同。计划自身的 `plan_source_sha256` 由 reader 读取文件时计算,不放进 `RuntimePlan` JSON。
 
 单位置和显式拷贝这两个核心不变量仍与 poseidon::mgpu 的 `MgpuOp` 兼容:`Place{rank=0, index=d}` 退化后就是 mgpu 的 `device_id=d`,Transfer 对应 CopyCipher/CopyPlain。但 mgpu 当前没有完整 CKKS 元信息、Host compute 和 OperatorSpec,所以迁移时只能复用它的拷贝与执行能力,不能把旧的整数属性表原样当成 V1 协议。
 

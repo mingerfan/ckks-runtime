@@ -30,7 +30,7 @@ Runtime<Api>
         v
 Api
 ├── Value               值类型
-├── preflight           协议指纹、target/context/密钥启动检查
+├── preflight           计划原始字节摘要、target/context/密钥启动检查
 ├── validate_value      按 ValueDesc 核对实际值
 ├── encode_plaintext    把 float64 slots 编码成 Host plaintext
 ├── 计算函数
@@ -58,23 +58,38 @@ public:
 除了计划，每个 Runtime 实例还需要实际运行环境、调用方输入、可选的明文数据包目录和 OperatorSpec 副本。Api 应在创建 Runtime 前完成 context 和密钥配置；Runtime 只检查，不在 initialization 中临时补配置。
 
 ~~~cpp
+struct LoadedRuntimePlan {
+    RuntimePlan plan;
+    std::string source_sha256;
+};
+
+struct LoadedOperatorSpec {
+    OperatorSpec spec;
+    std::string source_sha256;
+};
+
 struct RuntimeEnvironment {
     int rank;
     int world_size;
     int local_device_count;
-    const OperatorSpec *operator_spec;
+    const LoadedOperatorSpec *operator_spec;
 };
 
 struct RuntimeInputs {
     RuntimeEnvironment environment;
     std::unordered_map<ValueId, Api::Value> external_inputs;
     std::optional<std::filesystem::path> plaintext_bundle_dir;
+    bool skip_artifact_digest_checks = false;
 };
 ~~~
 
+`LoadedRuntimePlan` 和 `LoadedOperatorSpec` 都由各自 reader 从文件完整原始字节计算 `source_sha256`,不是调用方随意填写的摘要。RuntimePlan JSON 本身不保存自己的摘要。
+
 - `external_inputs` 放本 rank Host 上由调用方在这次运行中传入的参数。随计划固定发布的权重应由 Encode 产生；如果某份权重本来就是每次调用动态传入的参数，它仍可以是 external input。
-- `plaintext_bundle_dir` 是本机部署路径，不写进计划 JSON。存在 bundle Encode 时，每个 rank 都要拿到完整、可读且指纹相符的数据包；否则不需要这个目录。
-- Runtime 把协议 SHA-256、target、OperatorSpec 和密钥要求交给 Api 做 `preflight`；Api 用自己的实际配置逐项核对。Mock/MPI 参考后端可显式接受 placeholder spec，PoseidonApi 必须拒绝。
+- `plaintext_bundle_dir` 是本机部署路径，不写进计划 JSON。存在 bundle Encode 时，每个 rank 都要拿到完整、可读且 manifest 原始字节摘要相符的数据包；否则不需要这个目录。
+- Runtime 读取计划、OperatorSpec 和 manifest 时保留各自完整原始字节的 SHA-256。计划自身不保存摘要;OperatorSpec 和 manifest 的摘要由计划引用。
+- Runtime 把 `plan_source_sha256`、target、OperatorSpec 和密钥要求交给 Api 做 `preflight`；Api 用自己的实际配置逐项核对。Mock/MPI 参考后端可显式接受 placeholder spec，PoseidonApi 必须拒绝。
+- `skip_artifact_digest_checks` 默认是 `false`。调试时显式设为 `true` 只跳过计划跨 rank、OperatorSpec 和 manifest 的原始字节摘要比较,不跳过其他验证。
 
 启动时如果实际节点数、本地设备数、外部输入集合或数据包不符合计划，直接报错终止。Runtime 不搜索其他目录,也不在缺文件时下载数据。
 
@@ -143,7 +158,7 @@ struct PendingGroup {
 - 传输 ID 唯一；
 - 节点数和本地设备数符合目标；
 - 调用方的 external_inputs 都已绑定；
-- 所有 rank 加载的是同一份计划;使用 bundle 时,各自目录中的 id/version/fingerprint 和完整 blob 集合也一致。
+- 默认模式下所有 rank 加载的计划原始字节 SHA-256 相同;使用 bundle 时,各自目录中的 id/version/manifest_sha256 和完整 blob 集合也一致。
 
 验证器只拒绝非法计划，不会插入传输或重新分配。
 
@@ -327,6 +342,8 @@ Value &ensure_ready(ValueId id, Place expected_place):
 多个 runtime 之间不加逐指令同步，它们可以以不同速度推进，只通过通信动作和最终的测试汇合点协调。这样才能测出"接收方先到/发送方先到""并发等待""全组终止"这些真实场景。
 
 目标 Runtime 启动时检查节点数、rank、设备数、计划版本、target/capability、OperatorSpec、rescale/boot 模式，以及 Api 的 capability 和密钥配置。不设计能力协商；不匹配就直接终止。
+
+调试选项 `skip_artifact_digest_checks` 由部署方统一设置,不属于 RuntimePlan。开启时 Runtime 必须打印警告,并继续执行全部结构、语义、能力、密钥和 blob 内容检查;各 rank 的选项值不一致仍属于启动错误。
 
 > **当前实现：** 只检查 world size、rank 和本地设备数。
 

@@ -83,7 +83,7 @@ Api
 - 定义值类型
 - encode_plaintext：把 float64 slots 编码成 Host plaintext
 - add / mul / rotate / rescale / boot 等计算
-- preflight：用协议 SHA-256 核对各 rank 的计划，并检查 target/context/密钥配置
+- preflight：默认用计划完整原始字节的 SHA-256 核对各 rank，并检查 target/context/密钥配置
 - validate_value：按 ValueDesc 核对后端实际值
 - communicate_async / wait / 最终输出 synchronize
 - 适配 MPI / NCCL / CUDA / 向量模拟
@@ -215,7 +215,7 @@ public:
 
 Runtime 理解计划声明的 CKKS 元信息,包括 context、level、`scale_log2`、NTT 状态和分量数,因为验证器要靠它们检查算子是否合法。Runtime 不理解的是这些元信息在具体 C++ 对象和 buffer 里怎样布局,也不展开一个密文的各段显存。
 
-Api 负责：定义值类型；在 `preflight` 中核对计划指纹和后端配置；用 `validate_value(value, expected_desc)` 核对不透明值的实际元信息；实现 Encode、计算、通信、等待、最终同步和 `abort_all`。CPU/GPU 对象布局和通信降级都留在 Api 内部。
+Api 负责：定义值类型；在 `preflight` 中核对计划原始字节摘要、调试策略和后端配置；用 `validate_value(value, expected_desc)` 核对不透明值的实际元信息；实现 Encode、计算、通信、等待、最终同步和 `abort_all`。CPU/GPU 对象布局和通信降级都留在 Api 内部。
 
 Api 不负责把一个不支持的 GPU Boot 偷偷改成 CPU 路径。这种替换会改变 Place、需要两次 Transfer,必须由 Dacapo 的目标合法化 Pass 明确生成。
 

@@ -8,12 +8,12 @@
 
 - 增删字段,或改变字段的类型、编码、约束;
 - 改变枚举的取值集合;
-- 改变指纹的计算规则;
+- 改变原始文件摘要字段或计算规则;
 - 改变任何执行语义(算子元信息规则、通信语义、阶段划分)。
 
 **同一个版本号下不允许"看文件内容猜格式"**;也不靠"缺了某字段"或"解析失败"推断这是旧格式文件。版本判断只看 `format_version` 一个字段。
 
-> **V1 当前仍是草案。** 2026-07 的第一次实现把 bundle 固定权重表示成 plaintext external_inputs；在尚无外部使用者、bundle 执行链也未完整实现时，设计改回显式 Encode 指令。Encode 支持 inline 浮点数组和 bundle `content` 引用；external_inputs 保留给每次运行由调用方传入的参数，manifest 不再绑定 ValueId。当前 Schema、样例和 C++ 代码仍待迁移；全部对齐并通过端到端测试后再宣布 V1 冻结。在此之前不创建只为保留错误草案的 V2。
+> **V1 当前仍是草案。** 2026-07 的第一次实现把 bundle 固定权重表示成 plaintext external_inputs；在尚无外部使用者、bundle 执行链也未完整实现时，设计改回显式 Encode 指令。Encode 支持 inline 浮点数组和 bundle `content` 引用；external_inputs 保留给每次运行由调用方传入的参数，manifest 不再绑定 ValueId。计划自身不再保存 JCS 语义指纹,改由 Runtime 对发布文件完整原始字节计算 SHA-256。当前 Schema、样例和 C++ 代码仍待迁移；全部对齐并通过端到端测试后再宣布 V1 冻结。在此之前不创建只为保留错误草案的 V2。
 
 ## 2. 修改流程
 
@@ -36,10 +36,12 @@
 `format_version` 之外还有两个正交的兼容轴:
 
 - `target_id` + `capability_version`:Runtime 的每个 Api 实现声明自己支持哪些组合。计划要求的组合不在支持列表里,执行前直接拒绝;
-- `operator_spec` 的 id/version/fingerprint：Runtime 持有一份明确选择的 spec 副本，三项都相符才接受。生产部署还要求其状态为 `validated`；placeholder 只能由测试显式允许。**指纹不符时即使 id 和 version 相同也拒绝**——这抓的是“同一个版本号下内容被悄悄改动”的情况。
+- `operator_spec` 的 id/version/source_sha256：Runtime 持有一份明确选择的 spec 文件，默认要求三项都相符。`source_sha256` 直接覆盖完整原始文件字节;生产部署还要求其状态为 `validated`，placeholder 只能由测试显式允许。
 
 这两轴升级不需要动 `format_version`:新增一个 target 或一版 OperatorSpec,只是新的取值,文件格式没变。
 
 ## 5. 拒绝优先于兼容
 
-所有兼容判断的默认答案是拒绝:未知版本、未知 target、未知 capability、指纹不符、能力集合对不上,一律报错退出并给出具体原因。宁可让用户显式升级工具链,不做任何形式的静默降级。
+所有兼容判断的默认答案是拒绝:未知版本、未知 target、未知 capability、摘要不符、能力集合对不上,一律报错退出并给出具体原因。宁可让用户显式升级工具链,不做任何形式的静默降级。
+
+唯一例外是部署方显式设置 `skip_artifact_digest_checks=true` 的调试运行。它只跳过 RuntimePlan、OperatorSpec 和 bundle manifest 的原始字节摘要比较,不能跳过版本、结构、语义、blob 内容或后端能力检查;生产配置不得启用。

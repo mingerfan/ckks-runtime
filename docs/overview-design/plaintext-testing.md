@@ -1,6 +1,6 @@
 # 明文测试方案
 
-> 本文同时记录当前测试设施和 RuntimePlan V1 草案的目标测试。当前已有 VecExecutor、MockVecApi、MockCluster 和 MpiVecApi。待补部分包括显式 Encode、bundle preflight、Host compute 和浮点 JCS 测试，详见[实现状态](implementation-status.md)。
+> 本文同时记录当前测试设施和 RuntimePlan V1 草案的目标测试。当前已有 VecExecutor、MockVecApi、MockCluster 和 MpiVecApi。待补部分包括显式 Encode、bundle preflight、Host compute、原始文件摘要和调试跳过策略测试，详见[实现状态](implementation-status.md)。
 
 ## 1. 目标
 
@@ -48,7 +48,7 @@ class VecValue {
 
 - 当前 `VecExecutor` 已实现 add/sub/mul、明密文混合运算、negate、rotate、rescale、modswitch、relinearize 和 boot。
 - `MockVecApi`/`MpiVecApi` 当前提供内部 64 位摘要 `preflight`、通信、等待、最终同步和全组终止。
-- 目标接口还要把 `preflight` 扩展到协议 SHA-256、target/context/密钥检查，并增加 `validate_value` 和 `encode_plaintext`。Vec 后端不做密码学编码，只把 slots 和输出 ValueDesc 组装成 Host plaintext。
+- 目标接口还要把 `preflight` 扩展到计划原始字节 SHA-256、摘要调试策略和 target/context/密钥检查，并增加 `validate_value` 和 `encode_plaintext`。Vec 后端不做密码学编码，只把 slots 和输出 ValueDesc 组装成 Host plaintext。
 
 数值部分逐元素模拟即可，但元信息不能全部空转，否则非法的计算图也能通过测试：
 
@@ -221,7 +221,12 @@ rank 1 -> Runtime1(RuntimeEnvironment{rank=1, ...}, ValueStore1, Api1)
 
 当前注入：计算抛错；`communicate_async` 抛错；`wait` 抛错；输出数量不匹配；输出类型不匹配；Place 不匹配；节点数不匹配；不支持的通信类型；无等价降级。
 
-加入 Encode 后还要注入：bundle 目录/manifest/blob 读取失败、哈希不符、`encode_plaintext` 失败、跨 rank `preflight` 不一致和最终 `synchronize` 失败。它们必须进入同一条 fail-fast 路径。
+加入 Encode 后还要注入：bundle 目录/manifest/blob 读取失败、摘要或内容哈希不符、`encode_plaintext` 失败、跨 rank `preflight` 不一致和最终 `synchronize` 失败。它们必须进入同一条 fail-fast 路径。
+
+摘要策略还要单独测试两种模式:
+
+- 默认模式:计划原始字节、OperatorSpec 或 manifest 摘要不符时必须拒绝;
+- `skip_artifact_digest_checks=true`:只允许上述摘要不符继续执行,其他任一结构、语义、id/version 或 blob `content` 错误仍必须拒绝,并检查所有 rank 的开关值一致且日志包含调试警告。
 
 检查：打印指令序号/类型、ValueId/传输 ID、来源/目标 Place、本地 rank 和 Api 名称；`abort_all` 被调用；所有模拟 runtime 停止；不继续执行后续指令。
 

@@ -68,7 +68,7 @@ Poseidon 仓库里已有一套单机多卡的静态调度代码（`src/poseidon/
 
 ### 协议规范(V1 草案,机器文件待迁移)
 
-- [RuntimePlan V1 规范](runtime-plan/v1/specification.md):计划文件的字段语义、编码规则、SSA/元信息不变量和指纹计算。V1 当前仍是设计草案,Markdown 已采用显式 Encode,Schema、样例和 C++ 实现尚待迁移。配套 [schema.json](runtime-plan/v1/schema.json)、[明文数据包格式](runtime-plan/v1/plaintext-bundle.md)、[版本兼容规则](runtime-plan/v1/compatibility.md) 和 [合法/非法样例集](runtime-plan/v1/testdata/README.md)。
+- [RuntimePlan V1 规范](runtime-plan/v1/specification.md):计划文件的字段语义、编码规则、SSA/元信息不变量和原始文件字节摘要。V1 当前仍是设计草案,Markdown 已采用显式 Encode 和原始字节 SHA-256,Schema、样例和 C++ 实现尚待迁移。配套 [schema.json](runtime-plan/v1/schema.json)、[明文数据包格式](runtime-plan/v1/plaintext-bundle.md)、[版本兼容规则](runtime-plan/v1/compatibility.md) 和 [合法/非法样例集](runtime-plan/v1/testdata/README.md)。
 - [CKKS OperatorSpec V1 规范](operator-spec/v1/specification.md):目标后端的算子能力、level/`scale_log2` 边界、boot profile 和代价模型。配套 [schema.json](operator-spec/v1/schema.json) 和 [占位 profile](operator-spec/v1/profiles/README.md)(CPU eager / GPU lazy)。
 
 协议冻结后,JSON 读取器、Schema 和样例集都必须与规范一致。当前迁移差距见[实现状态](overview-design/implementation-status.md)。
@@ -105,23 +105,24 @@ Poseidon 仓库里已有一套单机多卡的静态调度代码（`src/poseidon/
 16. GPU boot 的 CPU 解密再加密模拟必须由编译器生成显式 Device→Host、Host Boot、Host→Device 指令，只用于测试与联调。
 17. 编译期常量由 initialization 中的显式 Encode 定义;小数据内联,大数据通过 `content` 引用 bundle。
 18. `content` 标识编码前的原始浮点字节，Encode 的 output ValueId 标识编码后的 CKKS plaintext；external inputs 表示每次运行由调用方传入的参数。
+19. 计划、OperatorSpec 和 manifest 的发布一致性使用完整原始文件字节 SHA-256,不使用 JCS;部署方可在调试时显式跳过这三类摘要比较,但不能关闭其他验证。
 
 ## 代码对应关系
 
 | 路径 | 职责 |
 | --- | --- |
 | `runtime/plan.*` | 当前内存版 RuntimePlan、强类型计算/通信动作、内部 64 位摘要与计划打印 |
-| `runtime/json_plan_reader.*`、`runtime/utils/sha256.*` | 上一版 RuntimePlan JSON 的严格读取和协议 SHA-256 指纹核对 |
+| `runtime/json_plan_reader.*`、`runtime/utils/sha256.*` | 上一版 RuntimePlan JSON 的严格读取和旧语义指纹核对 |
 | `runtime/verifier.*` | SSA、Place、类型、目标配置和 Transfer/Replicate 合法性检查 |
 | `runtime/runtime.hpp` | ValueStore、Ready/Pending、SequentialRuntime 和 RunArtifact |
 | `api/vec_*` | VecValue 元信息语义及同步/异步计算 |
 | `api/mock_api.*` | MockCluster、多 runtime 通信、延迟/故障注入和全组终止 |
-| `api/mpi_api.*` | MPI 非阻塞通信、序列化、fingerprint preflight 与 MPI_Abort |
+| `api/mpi_api.*` | MPI 非阻塞通信、序列化、内部摘要 preflight 与 MPI_Abort |
 | `testing/` | 计划构造器、顺序参考执行器、DiffMap、比较和 Mock 测试驱动 |
 | `tests/` | 普通测试与 MPI 端到端测试 |
 | `tools/`、`benchmarks/` | MPI 环境自检与通信基准 |
 
-这里有两个容易混淆的“指纹”：JSON 顶层 `fingerprint` 是协议规定的 SHA-256;`RuntimePlan::fingerprint()` 是当前 C++ 代码为 Mock/MPI 多 rank 同计划检查计算的内部 64 位摘要。后者不是协议字段,也不是密码学哈希。
+当前代码仍有两个旧摘要:JSON 顶层 `fingerprint` 是上一版 reader 核对的 SHA-256;`RuntimePlan::fingerprint()` 是 Mock/MPI 多 rank 检查使用的内部 64 位摘要。目标 V1 会删除 JSON 自嵌 `fingerprint`,改为读取文件时直接对完整原始字节计算 `plan_source_sha256`;调试时可显式跳过产物摘要比较,但不能关闭其他验证。
 
 旧文档中的 `VecApi` 和 `MockCommunicationApi` 是早期统称。当前代码分别拆成 `VecExecutor`、`MockVecApi + MockCluster` 和 `MpiVecApi`;测试驱动是 `run_mock_cluster()`,没有单独的 `MultiRuntimeHarness` 类。
 

@@ -1,10 +1,10 @@
 # 协议测试样例集
 
-> **迁移提示:** 当前 JSON 样例和 `generate.py` 仍对应上一版“bundle plaintext 作为 external_input”的格式,尚未迁移到规范中的显式 Encode 指令和 inline/bundle 双 payload。当前 C++ reader 只覆盖这套样例中的结构解析和部分检查,OperatorSpec/BND preflight 等语义尚未完整实现;这些文件不能作为 V1 最终格式的权威样例。
+> **迁移提示:** 当前 JSON 样例和 `generate.py` 仍对应上一版“bundle plaintext 作为 external_input + 自嵌 JCS 等价 fingerprint”的格式,尚未迁移到规范中的显式 Encode、inline/bundle 双 payload 和原始文件字节摘要。当前 C++ reader 只覆盖这套样例中的结构解析和部分检查,OperatorSpec/BND preflight 等语义尚未完整实现;这些文件不能作为 V1 最终格式的权威样例。
 
-迁移完成并正式冻结 V1 后,`valid/` 中的每份文件才是任何符合规范的实现**必须接受**的样例,`invalid/` 中的每份才是**必须拒绝**的样例。当前目录里的 valid/invalid 标签描述的是上一版格式想表达的预期,不表示现有 reader 已经覆盖表中的全部语义检查。最终每份 invalid 文件仍应只含一个错误,错误编号对应 [specification.md](../specification.md) 第 7 节的检查项。
+迁移完成并正式冻结 V1 后,`valid/` 中的每份文件才是任何符合规范的实现**必须接受**的样例,`invalid/` 中的每份才是**必须拒绝**的样例。当前目录里的 valid/invalid 标签和 FP-1 等编号都属于上一版格式,不表示现有 reader 已经覆盖表中的全部语义检查,也不再与目标规范第 7 节逐项对应。迁移后的每份 invalid 文件仍应只含一个错误。
 
-当前文件都由 `generate.py` 生成(`python3 generate.py`)。因为旧格式没有浮点 payload,脚本用普通排序 JSON 计算的结果恰好满足这些旧样例;它还没有实现新草案要求的完整 RFC 8785 浮点规范化。迁移样例时必须先修生成器。**不要手改 JSON**——改了指纹就不符了;要改样例就改生成脚本重跑。valid 计划引用的 OperatorSpec 是 [`profiles/`](../../../operator-spec/v1/profiles/) 下的两份占位 spec,它们的指纹也由同一脚本维护。
+当前文件都由 `generate.py` 生成(`python3 generate.py`)。脚本里的排序 JSON 指纹只服务旧样例;迁移后应删除计划和 manifest 的自摘要,在文件最终写完后直接对完整原始字节计算 SHA-256,并把 OperatorSpec/manifest 摘要写入引用它们的计划。**不要手改 JSON**——原始字节哪怕只改格式也会改变摘要;要改样例就改生成脚本重跑。
 
 ## valid
 
@@ -16,7 +16,7 @@
 | `v002_mul_rescale_transfer.json` | GPU lazy spec:init 上传 → `mul_cc`(scale 相加、分量 2+2−1=3)→ `relinearize`(需 relin key)→ `rescale`(显式 target)→ 跨卡 `transfer` |
 | `v003_replicate_multi_rank.json` | 2 个 rank:init 上传后 `replicate` 一发两收(Device(1,0) + Host(1)),broadcast hint |
 | `v004_host_boot_emulation.json` | `decrypt_reencrypt` boot 全流程:init 上传、Device→Host transfer、Host boot(需 secret key、引用 boot profile)、Host→Device 回传,能力声明齐全 |
-| `v005_plaintext_bundle.json` | 引用明文数据包(`bundles/v005-demo/`):明文+密文双输入经 init 上传,`mul_cp`,顶层 `plaintext_bundle` 指纹引用 |
+| `v005_plaintext_bundle.json` | 上一版明文数据包引用:明文+密文双输入经 init 上传,`mul_cp`,顶层仍使用旧 `plaintext_bundle.fingerprint` |
 
 `bundles/v005-demo/` 是 v005 引用的上一版最小明文数据包,manifest 仍含 `value_id`。它只是上一版格式样例的一部分,尚未迁移成 [plaintext-bundle.md](../plaintext-bundle.md) 当前定义的纯 `blobs` 清单。
 
