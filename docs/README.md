@@ -39,6 +39,9 @@ Poseidon 仓库里已有一套单机多卡的静态调度代码（`src/poseidon/
 | 可执行计划（executable plan） | 编译器输出的最终产物：每条指令在哪算、数据怎么搬都已经定死，runtime 照着执行即可 |
 | 物化（materialize） | 让一个值在某个位置上真实存在（分配内存并填入数据） |
 | 通信动作（CommAction） | 计划中的一条搬运指令，如 Transfer（点对点搬运）、Replicate（一发多收） |
+| Encode | 把编码前的浮点 slots 变成 Host CKKS 明文的初始化指令；数据可以直接内联，也可以用 `content` 哈希引用 bundle |
+| `content` | 原始 float64 字节的 SHA-256，标识“用哪份数据”，不是 ValueId |
+| external input | 调用方每次运行时传入的函数参数；模型权重由 Encode 产生，不算 external input |
 | Ready / Pending | 一个值的两种状态：数据已就绪 / 通信还在路上 |
 | OperatorSpec | 版本化的 CKKS 算子配置：参数限制、level/`scale_log2` 变化、lazy-rescale、boot profile 和代价 |
 | `scale_log2` | scale 的二进制指数；40 表示逻辑 scale 为 `2^40` |
@@ -47,12 +50,12 @@ Poseidon 仓库里已有一套单机多卡的静态调度代码（`src/poseidon/
 
 ## 文档导航
 
-### 协议规范(权威,机器可检查)
+### 协议规范(V1 草案,机器文件待迁移)
 
-- [RuntimePlan V1 规范](runtime-plan/v1/specification.md):计划文件的字段语义、编码规则、SSA/元信息不变量和指纹计算。配套 [schema.json](runtime-plan/v1/schema.json)、[明文数据包格式](runtime-plan/v1/plaintext-bundle.md)、[版本兼容规则](runtime-plan/v1/compatibility.md) 和 [合法/非法样例集](runtime-plan/v1/testdata/README.md)。
+- [RuntimePlan V1 规范](runtime-plan/v1/specification.md):计划文件的字段语义、编码规则、SSA/元信息不变量和指纹计算。V1 当前仍是设计草案,Markdown 已采用显式 Encode,Schema、样例和 C++ 实现尚待迁移。配套 [schema.json](runtime-plan/v1/schema.json)、[明文数据包格式](runtime-plan/v1/plaintext-bundle.md)、[版本兼容规则](runtime-plan/v1/compatibility.md) 和 [合法/非法样例集](runtime-plan/v1/testdata/README.md)。
 - [CKKS OperatorSpec V1 规范](operator-spec/v1/specification.md):目标后端的算子能力、level/`scale_log2` 边界、boot profile 和代价模型。配套 [schema.json](operator-spec/v1/schema.json) 和 [占位 profile](operator-spec/v1/profiles/README.md)(CPU eager / GPU lazy)。
 
-协议实现(JSON 读取器、验证器扩展)以规范为准;实现与样例集冲突时,先怀疑实现。
+协议冻结后,JSON 读取器、Schema 和样例集都必须与规范一致。当前迁移差距见[实现状态](overview-design/implementation-status.md)。
 
 ### 总体设计(背景与决策)
 

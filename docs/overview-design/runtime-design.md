@@ -28,6 +28,7 @@ Runtime<Api>
         v
 Api
 ├── Value               值类型
+├── encode_plaintext    把 float64 slots 编码成 Host plaintext
 ├── 计算函数
 ├── communicate_async   发起异步通信
 ├── wait                等待通信完成
@@ -47,17 +48,25 @@ public:
 
 ## 3. Runtime 的输入
 
-可执行计划已经包含：固定的计划/版本 ID、目标 capability、OperatorSpec 的 id/版本/指纹、rescale/boot 模式、每条指令的稳定序号、纯计算指令、通信动作、来源/目标的物理 Place、每个值的 context/level/`scale_log2`/NTT/分量数、可选的通信 hint、初始化/执行/收尾三个阶段的划分、编译目标要求的节点数和本地设备数。
+可执行计划已经包含：固定的计划/版本 ID、目标 capability、OperatorSpec 的 id/版本/指纹、rescale/boot 模式、每条指令的稳定序号、Encode/纯计算/通信指令、可选的明文数据包引用、来源/目标的物理 Place、每个值的 context/level/`scale_log2`/NTT/分量数、可选的通信 hint、初始化/执行/收尾三个阶段的划分、编译目标要求的节点数和本地设备数。
 
-Runtime 自己只需要一个运行时身份：
+除了计划,每个 Runtime 实例启动时还要收到三样本地输入：本 rank 的身份、由调用方提供的本 rank external inputs、以及可选的明文数据包目录。
 
 ~~~cpp
 struct LocalIdentity {
     int rank;
 };
+
+struct RuntimeInputs {
+    LocalIdentity identity;
+    std::unordered_map<ValueId, Api::Value> external_inputs;
+    std::optional<std::filesystem::path> plaintext_bundle_dir;
+};
 ~~~
 
-启动时如果实际节点数或本地设备数和编译目标不符，直接报错终止。
+`external_inputs` 只放 ValueDesc 位于本 rank Host 的调用方参数,不能拿它传模型权重。`plaintext_bundle_dir` 是部署路径,所以不写进计划 JSON:同一个逻辑数据包在不同节点上的路径可以不同。计划含 bundle Encode 时,每个 rank 都必须拿到一个完整、可读且指纹相符的数据包目录;没有 bundle Encode 时不需要它。
+
+启动时如果实际节点数、本地设备数、外部输入集合或数据包不符合计划，直接报错终止。Runtime 不搜索其他目录,也不在缺文件时下载数据。
 
 ## 4. ValueStore（值存储）
 
@@ -104,6 +113,8 @@ struct PendingGroup {
 - ValueId 唯一定义，且每个 ValueId 恰好绑定一个 Place；
 - 不允许"先用后定义"；
 - 指令的参数个数和值类型正确；
+- Encode 只在 initialization,输出是 Host plaintext,payload 两种形态严格二选一;
+- inline Encode 的 float64 数组合法;bundle manifest 中所有 blob 的文件、长度、哈希和有限值都通过 preflight,每个 Encode 引用的 content 和 slot 容量也分别合法;
 - 每个值都有完整的 CKKS 元信息,`level` 和 `scale_log2` 都是非负整数；
 - 计算指令必须是纯计算，且只有一个执行 Place；该 Place 必须支持这个算子和实现模式；
 - 计算指令的输入已在该 Place 上物化；
@@ -115,12 +126,32 @@ struct PendingGroup {
 - 来源/目标 Place 属于编译目标；
 - 传输 ID 唯一；
 - 节点数和本地设备数符合目标；
-- 外部输入都已绑定；
-- 所有 rank 加载的是同一份计划。
+- 调用方的 external_inputs 都已绑定；
+- 所有 rank 加载的是同一份计划;使用 bundle 时,各自目录中的 id/version/fingerprint 和完整 blob 集合也一致。
 
 验证器只拒绝非法计划，不会插入传输或重新分配。
 
-## 6. 计算指令的执行
+## 6. Encode 与计算指令的执行
+
+Encode 没有普通 SSA 输入。Runtime 先从指令内联数组或 bundle `content` 得到 float64 slots,再按输出 ValueDesc 调 Api:
+
+~~~cpp
+execute_encode(op):
+    desc = value_desc(op.output)
+    assert desc.kind == Plaintext
+    assert desc.place.kind == Host
+
+    if desc.place.rank != local_identity.rank:
+        return
+
+    slots = resolve_inline_or_bundle_payload(op.payload)
+    output = api.encode_plaintext(desc, slots)
+    value_store.define_ready(op.output, desc.place, output)
+~~~
+
+所有 rank 都按同一顺序解释 Encode,但只有输出 Host Place 所属的 rank 真正执行;其他 rank 明确跳过。同一个 `content` 可以被多个 Encode 引用。Runtime 可以缓存已经校验和读取的原始 slots,但每个 Encode 仍按自己的输出 ValueDesc 单独编码和定义 ValueId。
+
+### 普通计算
 
 伪代码：
 
@@ -201,7 +232,8 @@ Value &ensure_ready(ValueId id, Place expected_place):
 
 ### 初始化
 
-- 绑定 Host 上的输入和明文/密文常量；
+- 绑定调用方提供的 Host external_inputs；
+- 执行 Encode,从 inline 或 bundle 数据生成 Host 明文常量；
 - 执行编译器生成的 Host 到 Device 的 Transfer；
 - 上传 Api 需要的上下文和密钥；
 - 等待初始化涉及的值全部就绪。
@@ -243,6 +275,7 @@ Value &ensure_ready(ValueId id, Place expected_place):
 本 demo 采用 SPMD 方式（Single Program Multiple Data，所有节点跑同一个程序，各自处理自己的部分）：
 
 - 所有 rank 读同一份计划，指令顺序完全一致；
+- Encode 按输出 Host Place 的 rank 决定由谁执行,其他 rank 跳过；
 - 计算指令按 `op.place.rank` 决定本 rank 是否执行；
 - 通信动作在所有 rank 上都会被解释，Api 按本地角色执行或跳过；
 - 集合通信的顺序由全局计划保证一致。

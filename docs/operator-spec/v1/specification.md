@@ -4,7 +4,7 @@ OperatorSpec 回答一个问题:**在某个具体后端上,每种 CKKS 算子的
 
 字段含义和 Schema 由本仓库(Runtime)维护,因为 Runtime 要按同一规则验证计划。具体数值来自 Poseidon 的实现和测量;本仓库只固定一份已联调验证的副本(`profiles/`)。Dacapo 读取 spec,不拥有也不猜测这些数值。
 
-编码规则与 [RuntimePlan 规范](../../runtime-plan/v1/specification.md)第 1 节完全一致:UTF-8、未知字段拒绝、缺字段拒绝、无浮点数(延迟等测量值用整数微秒/纳秒表示)、枚举用固定小写字符串。指纹计算规则同 RuntimePlan 第 8 节。
+基础编码规则与 [RuntimePlan 规范](../../runtime-plan/v1/specification.md)第 1 节一致:UTF-8、未知字段拒绝、缺字段拒绝、枚举用固定小写字符串。RuntimePlan 只在 Encode 的 inline payload 中允许浮点数,OperatorSpec **任何位置都不允许浮点数**(延迟等测量值用整数微秒/纳秒表示)。指纹计算规则同 RuntimePlan 第 8 节。
 
 ## 1. 顶层结构
 
@@ -48,7 +48,7 @@ OperatorSpec 回答一个问题:**在某个具体后端上,每种 CKKS 算子的
 - `poly_degree`:多项式度数,2 的幂;
 - `rns_moduli_log2`:模数链上每个 RNS 模数的 bit 数,**下标 = level**(下标 0 是链的最底层)。链长决定 level 的合法上界;
 - `max_modulus_log2`:单模数 bit 数上限。低 bit GPU 实现的限制就体现在这里,它是"GPU profile 为什么必须 lazy"的物理原因;
-- `default_scale_log2`:编码新明文时的默认 scale 指数。
+- `default_scale_log2`:编译器规划新明文时优先采用的 scale 指数。RuntimePlan 中每个 Encode 输出仍必须把 `scale_log2` 明确写在 ValueDesc 里,Runtime 不靠这个字段补默认值。
 
 ## 3. levels
 
@@ -59,7 +59,7 @@ OperatorSpec 回答一个问题:**在某个具体后端上,每种 CKKS 算子的
 }
 ~~~
 
-计划中任何密文的 `level` 必须落在 `[lower_bound, upper_bound]`。**方向与 RuntimePlan 一致:大 level = 剩余模数多**。注意 Dacapo 现有 profile JSON(`profiled_*.json`)里的 bootstrap 范围是 Earth 方向的数字,迁移到本格式时必须做层号换算,不能照抄。
+计划中任何明文或密文的 `level` 都必须落在 `[lower_bound, upper_bound]`。这也包括 Encode 产生的 plaintext。**方向与 RuntimePlan 一致:大 level = 剩余模数多**。注意 Dacapo 现有 profile JSON(`profiled_*.json`)里的 bootstrap 范围是 Earth 方向的数字,迁移到本格式时必须做层号换算,不能照抄。
 
 ## 4. operators
 
@@ -89,7 +89,7 @@ OperatorSpec 回答一个问题:**在某个具体后端上,每种 CKKS 算子的
 - `noise_by_level`:同上形状的整数数组(噪声模型的定点表示,单位由 profile 自己在数值上保持一致即可)或 `null`。**字段必须出现**,`null` 是显式的"未提供"——现状 CPU profile 有噪声表而 GPU 没有是漂移不是设计,新格式不允许再用缺字段表达含义;
 - `rescale` 独有 `max_levels_per_op`:单条 rescale 指令允许的最大降层数。eager 模式通常为 1;lazy 模式可以更大(合并的 rescale)。
 
-算子怎样改变元信息(scale 相加、components 变化等)由 RuntimePlan 规范 5.1 节统一定义,**不在 spec 中重复**——spec 只提供数值边界和代价,规则本身是协议的一部分。
+计算算子怎样改变元信息(scale 相加、components 变化等)由 RuntimePlan 规范 5.3 节统一定义,**不在 spec 中重复**——spec 只提供数值边界和代价,规则本身是协议的一部分。
 
 ## 5. boot_profiles
 

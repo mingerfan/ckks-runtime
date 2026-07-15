@@ -1,8 +1,10 @@
 # 协议测试样例集
 
-`valid/` 中的每份文件,任何符合规范的实现**必须接受**;`invalid/` 中的每份**必须拒绝**。每份 invalid 文件只含一个错误,错误编号对应 [specification.md](../specification.md) 第 7 节的检查项。
+> **迁移提示:** 当前 JSON 样例和 `generate.py` 仍对应上一版“bundle plaintext 作为 external_input”的格式,尚未迁移到规范中的显式 Encode 指令和 inline/bundle 双 payload。当前 C++ reader 只覆盖这套样例中的结构解析和部分检查,OperatorSpec/BND preflight 等语义尚未完整实现;这些文件不能作为 V1 最终格式的权威样例。
 
-所有文件由 `generate.py` 生成(`python3 generate.py`),指纹按规范第 8 节实算。**不要手改 JSON**——改了指纹就不符了;要改样例就改生成脚本重跑。valid 计划引用的 OperatorSpec 是 [`profiles/`](../../../operator-spec/v1/profiles/) 下的两份占位 spec,它们的指纹也由同一脚本维护。
+迁移完成并正式冻结 V1 后,`valid/` 中的每份文件才是任何符合规范的实现**必须接受**的样例,`invalid/` 中的每份才是**必须拒绝**的样例。当前目录里的 valid/invalid 标签描述的是上一版格式想表达的预期,不表示现有 reader 已经覆盖表中的全部语义检查。最终每份 invalid 文件仍应只含一个错误,错误编号对应 [specification.md](../specification.md) 第 7 节的检查项。
+
+当前文件都由 `generate.py` 生成(`python3 generate.py`)。因为旧格式没有浮点 payload,脚本用普通排序 JSON 计算的结果恰好满足这些旧样例;它还没有实现新草案要求的完整 RFC 8785 浮点规范化。迁移样例时必须先修生成器。**不要手改 JSON**——改了指纹就不符了;要改样例就改生成脚本重跑。valid 计划引用的 OperatorSpec 是 [`profiles/`](../../../operator-spec/v1/profiles/) 下的两份占位 spec,它们的指纹也由同一脚本维护。
 
 ## valid
 
@@ -16,7 +18,7 @@
 | `v004_host_boot_emulation.json` | `decrypt_reencrypt` boot 全流程:init 上传、Device→Host transfer、Host boot(需 secret key、引用 boot profile)、Host→Device 回传,能力声明齐全 |
 | `v005_plaintext_bundle.json` | 引用明文数据包(`bundles/v005-demo/`):明文+密文双输入经 init 上传,`mul_cp`,顶层 `plaintext_bundle` 指纹引用 |
 
-`bundles/v005-demo/` 是 v005 引用的最小明文数据包(manifest + 一个内容寻址数据文件),格式见 [plaintext-bundle.md](../plaintext-bundle.md),同样由 `generate.py` 维护。
+`bundles/v005-demo/` 是 v005 引用的上一版最小明文数据包,manifest 仍含 `value_id`。它只是上一版格式样例的一部分,尚未迁移成 [plaintext-bundle.md](../plaintext-bundle.md) 当前定义的纯 `blobs` 清单。
 
 ## invalid
 

@@ -40,7 +40,7 @@ using VecValue =
     std::variant<VecPlaintext<double>, VecCiphertext<double>>;
 ~~~
 
-VecApi 实现：add/sub/mul、add_plain/sub_plain/mul_plain、negate、rotate、rescale、modswitch、relinearize、boot，以及 communicate_async、wait、最终输出 synchronize、abort_all。
+VecApi 实现：`encode_plaintext`、add/sub/mul、add_plain/sub_plain/mul_plain、negate、rotate、rescale、modswitch、relinearize、boot，以及 communicate_async、wait、最终输出 synchronize、abort_all。VecApi 的 `encode_plaintext` 不做密码学编码,只把输入 slots 和输出 ValueDesc 的元信息组装成 Host plaintext,供 Runtime 路径测试使用。
 
 数值部分逐元素模拟即可，但元信息不能全部空转，否则非法的计算图也能通过测试：
 
@@ -51,7 +51,7 @@ VecApi 实现：add/sub/mul、add_plain/sub_plain/mul_plain、negate、rotate、
 - boot 按测试配置重置 level 和 `scale_log2`；
 - rotate 对步数做规范化。
 
-V1 的元信息测试统一使用整数 `scale_log2`:值 40 表示逻辑 scale 为 `2^40`。当前 VecValue 里的浮点 scale 是待迁移实现,不能进入 RuntimePlan V1 或协议指纹。
+V1 的元信息测试统一使用整数 `scale_log2`:值 40 表示逻辑 scale 为 `2^40`。当前 VecValue、RuntimePlan 和 MPI 元信息都已经使用整数 `scale_log2`;inline payload 中的浮点数只是待编码的 slot 数据,不是 scale。
 
 还要为 `Boot(implementation=decrypt_reencrypt)` 建一条明文模拟路径。测试计划必须显式包含 Device→Host、Host Boot、Host→Device,并检查两次 Transfer 保持元信息、Host Boot 精确产出目标 level 和 `scale_log2`。不能用“GPU Boot 失败后自动改走 CPU”来通过测试。
 
@@ -153,7 +153,7 @@ rank 1 -> Runtime1(LocalIdentity{1}, ValueStore1, Api1)
 
 ### 5.2 计划验证器
 
-重复 ValueId；一个 ValueId 绑到多个 Place；先用后定义；未定义输入；错误的值类型；计算指令带通信效果；计算 Place 非法；隐式跨 Place 操作数；重复传输 ID；通信类型的输入输出数量错误；Replicate 输出数和目标数不一致；多个目标复用同一个输出 ValueId；来源/目标 Place 非法；V1 中出现不支持的 Gather；未知 hint；节点数与编译目标不符。
+重复 ValueId；一个 ValueId 绑到多个 Place；先用后定义；未定义输入；Encode 不在 initialization；Encode 输出不是 Host plaintext 或 `components != 1`；Encode 输出又被列为 external input；inline/bundle 字段混写；inline 数组为空、含 NaN/Infinity/负零或超过 slot 容量；bundle 缺目录、id/version/fingerprint 不符、缺被引用的 content、manifest 任一 blob 缺文件、长度/哈希不符、小端 float64 数据非法或输出元信息超出 OperatorSpec；错误的值类型；计算指令带通信效果；计算 Place 非法；隐式跨 Place 操作数；重复传输 ID；通信类型的输入输出数量错误；Replicate 输出数和目标数不一致；多个目标复用同一个输出 ValueId；来源/目标 Place 非法；V1 中出现不支持的 Gather；未知 hint；节点数与编译目标不符。
 
 ### 5.3 单设备 runtime
 
@@ -162,12 +162,12 @@ rank 1 -> Runtime1(LocalIdentity{1}, ValueStore1, Api1)
 ### 5.4 Host/Device 初始化
 
 ~~~text
-%w_host = input @Host0
+%w_host = encode inline_or_bundle_payload @Host0
 %w_gpu = transfer %w_host Host0->Device0
 %y = mul_plain %x, %w_gpu @Device0
 ~~~
 
-检查：Host 输入正确绑定；初始化阶段执行了 transfer；执行阶段开始前所需的值都 Ready；Host→Device 保持数学值和类型不变；明文不因为"它是明文"就自动上传，必须走计划里的动作；同一个常量上传到多个设备时，每个目标有独立 ValueId，数学值一致。
+检查：inline 和 bundle 两种 Encode 都能生成正确 Host 明文；同一 `content` 用不同 level/scale 编码时产生两个不同 ValueId；调用方输入与 Encode 输出不会混淆；多 rank 计划中每个 rank 都先完成同一 bundle 的 preflight,但只有输出 Host 所属 rank 执行 Encode,其他 rank 跳过；初始化阶段执行了 transfer；执行阶段开始前所需的值都 Ready；Host→Device 保持数学值和类型不变；明文不因为"它是明文"就自动上传，必须走计划里的动作；同一个常量上传到多个设备时，每个目标有独立 ValueId，数学值一致。
 
 ### 5.5 多设备 Transfer
 
