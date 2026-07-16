@@ -20,7 +20,7 @@
 - SEAL 的模数链可由旧 HEVM 代码确认是 14 个 60-bit 模数；
 - SEAL 噪声使用旧 Dacapo estimator 的内部数值，不能跨后端比较；
 - HEAAN CPU/GPU profile 都来自同一套 eager-rescale 编译语义，GPU 文件不因此变成 Poseidon lazy-rescale profile；
-- `earth.mul_double` 的旧测量包含旧 HEVM 的乘法实现语义，没有独立的 Relinearize 测量；导入 profile 因此把 `relinearize` 标为不支持，不能直接当成 RuntimePlan 生产执行 profile；
+- `earth.mul_double` 的旧测量包含乘法和重线性化的整体语义，没有独立的 Relinearize 测量。为了验证新的拆分式 RuntimePlan，导入 profile 把 `relinearize` 标为支持，并在合法 level 上填写固定的 `1 us` 开发期占位延迟；这个数值不是测量结果，不能用于生产调度或性能比较；
 - SEAL profile 没有 Boot 延迟测量，V2 中保持 `null`，不把未知代价伪装成 0。
 
 校验生成结果：

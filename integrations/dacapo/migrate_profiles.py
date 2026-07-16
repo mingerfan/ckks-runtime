@@ -13,6 +13,7 @@ DACAPO = ROOT / "third_party" / "dacapo"
 OUTPUT = ROOT / "docs" / "operator-spec" / "v2" / "profiles"
 DACAPO_REVISION = "a2c9ce41a57062cdf77ea4bac5b02be747109448"
 DACAPO_REPOSITORY = "git@github.com:mingerfan/dacapo-modified.git"
+RELINEARIZE_PLACEHOLDER_LATENCY_US = 1
 
 
 @dataclass(frozen=True)
@@ -172,6 +173,14 @@ def migrate(config: ProfileConfig) -> dict:
     operators = {}
     for name, key in OPERATOR_KEYS.items():
         operators[name] = operator_entry(profile, key, level_count, name == "rescale")
+    operators["relinearize"] = {
+        "supported": True,
+        "latency_us_by_level": [
+            0 if level < level_lower else RELINEARIZE_PLACEHOLDER_LATENCY_US
+            for level in range(level_count)
+        ],
+        "noise_by_level": None,
+    }
     operators["boot"] = {"supported": True}
 
     boot_input_min, boot_input_max, boot_output = convert_boot_levels(profile)

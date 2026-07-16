@@ -175,6 +175,11 @@ void test_dacapo_operator_spec_v2_profiles() {
     require(gpu_add.latency_us_by_level && gpu_add.latency_us_by_level->at(2) == 25 &&
                 gpu_add.latency_us_by_level->at(29) == 280,
             "Dacapo table indexing was not migrated with reader-compatible normalization");
+    const auto &gpu_relinearize = gpu.spec.operators.at(ComputeKind::Relinearize);
+    require(gpu_relinearize.supported && gpu_relinearize.latency_us_by_level &&
+                gpu_relinearize.latency_us_by_level->at(3) == 1 &&
+                !gpu_relinearize.noise_by_level,
+            "Dacapo relinearize placeholder support was not migrated");
     const auto &gpu_boot = gpu.spec.boot_profiles.at(0);
     require(gpu_boot.input_level_min == 3 && gpu_boot.input_level_max == 16 &&
                 gpu_boot.output_level == 16,
@@ -189,10 +194,19 @@ void test_dacapo_operator_spec_v2_profiles() {
     v2_plan.target.operator_spec = {gpu.spec.id, gpu.spec.version, gpu.source_sha256};
     v2_plan.target.world_size = 1;
     v2_plan.target.device_counts = {0};
-    v2_plan.values.push_back({1, ValueKind::Ciphertext, {PlaceKind::Host, 0, 0},
+    const Place host{PlaceKind::Host, 0, 0};
+    v2_plan.values.push_back({1, ValueKind::Ciphertext, host,
+                              gpu.spec.context_id, 3, 20, true, 2});
+    v2_plan.values.push_back({2, ValueKind::Ciphertext, host,
+                              gpu.spec.context_id, 3, 20, true, 2});
+    v2_plan.values.push_back({3, ValueKind::Ciphertext, host,
+                              gpu.spec.context_id, 3, 40, true, 3});
+    v2_plan.values.push_back({4, ValueKind::Ciphertext, host,
                               gpu.spec.context_id, 3, 40, true, 2});
-    v2_plan.external_inputs = {1};
-    v2_plan.final_outputs = {1};
+    v2_plan.external_inputs = {1, 2};
+    v2_plan.execution.push_back({0, ComputeOp{ComputeKind::MulCC, {1, 2}, 3, host, {}}});
+    v2_plan.execution.push_back({1, ComputeOp{ComputeKind::Relinearize, {3}, 4, host, {}}});
+    v2_plan.final_outputs = {4};
     PlanVerifier::verify(v2_plan, gpu);
 
     const auto seal_path = profile_dir / "dacapo-seal-cpu.v1.json";

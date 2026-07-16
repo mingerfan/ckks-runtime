@@ -19,7 +19,9 @@ OperatorSpec V2 用于保存 Dacapo 旧 profile 中 V1 无法表达的逐 level 
 
 Dacapo 旧 reader 会先在 profile 数组前补一个 level 0，再把数组截断或用最后一个值补齐到 `levelUpperBound + 1`。迁移脚本严格复现这个行为，使 V2 中的代价表等于旧编译器实际使用的表，而不是按源 JSON 的表面下标猜测。
 
-缺少测量时写 `null`，不能把未知代价写成 0。旧 profile 没有对应算子的延迟和噪声时，该算子写 `supported=false`。
+缺少测量时写 `null`，不能把未知代价写成 0。通常旧 profile 没有对应算子的延迟和噪声时，该算子写 `supported=false`。
+
+Dacapo 导入 profile 的 `relinearize` 是一个明确标注的开发期例外。旧 `earth.mul_double` 已经包含乘法和重线性化语义，但没有独立的重线性化测量；新的 CKKS MLIR 又把两步拆成了 `mul_cc` 和 `relinearize`。为了让这批 `status=imported` 的 profile 能验证开发期 RuntimePlan，迁移脚本把 `relinearize` 标为支持，并在合法 level 上填写固定的 `1 us` 占位延迟，噪声保持 `null`。这个数值不代表测量结果，不能用于生产调度或性能比较；Poseidon profile 必须换成真实支持范围和测量数据。
 
 ## 噪声
 
