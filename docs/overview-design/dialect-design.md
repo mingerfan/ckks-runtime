@@ -103,6 +103,8 @@ Dacapo 当前 Earth 类型里的 `scale` 已经是这个整数指数。对外协
 
 Dacapo 的 Earth 分析阶段用“已经消耗多少层”的方向记录 level，Rescale 后数值增加；下降到 CKKS PolyType 时会换算成“还剩多少层”，Rescale 后数值下降。RuntimePlan V1 固定采用后者。序列化必须发生在这个换算之后。
 
+当前 Dacapo fork 已把这三个整数固定进类型，文本形式是 `!ckks.poly<components * scale_log2 * level>`。`ckks.mulcc` 的 2×2 分量输入产生 3 分量输出，scale 指数相加；随后显式的 `ckks.relinearize` 把 3 分量恢复为 2 分量，scale 和 level 不变。
+
 在逻辑和已分配阶段,这些元信息可以放在类型、值属性或分析结果中;导出可执行计划之前必须全部落到每个值的描述符中,不能再是“可选信息”。
 
 **不建议把 Place 编进 CKKS 数学类型。** Place 是执行属性，不是密文数学性质的一部分；混在一起会产生大量的位置转换 cast 和类型组合爆炸。静态类型放不下的元信息，放在值描述符、算子属性或分析结果里。
@@ -197,7 +199,7 @@ payload 有两种形态。小数据可以直接内联:
 
 两个 Encode 可以引用同一个 `content`,但输出不同的 ValueId。`content` 标识编码前的原始浮点数据;ValueId 标识按某组 context、level、`scale_log2` 和 NTT 参数编码后的 CKKS 明文。这两个身份不能混在一起。
 
-逻辑 CKKS 中的 `ckks.encode` 是确定性的纯算子,没有通信副作用;进入 RuntimePlan 后则是一条显式的初始化指令。它的输出 ValueDesc 必须是 Host plaintext,具体 rank 和编码参数都从该 ValueDesc 读取。当前 Dacapo 的 `ckks.encode` 是 destination-style 算子,数据来自旧 `.cst` 文件索引;新管线保留名字和编码语义,但要**重做这个 op 的载荷接口**,让它直接持有内联浮点数组或内容哈希引用。也就是说,这不是在描述现有 EncodeOp 已经具备的接口。如果后端仍需要 destination-style 形式,在更低层 bufferization 时再下降。
+逻辑 CKKS 中的 `ckks.encode` 是确定性的纯算子,没有通信副作用;进入 RuntimePlan 后则是一条显式的初始化指令。它的输出 ValueDesc 必须是 Host plaintext,具体 rank 和编码参数都从该 ValueDesc 读取。当前 Dacapo fork 已让 destination-style `ckks.encode` 直接携带 MLIR `DenseElementsAttr`，旧 `.cst` 整数索引会被导出器拒绝。bundle 内容引用和大常量外化 Pass 仍是后续工作。
 
 内联形态适合小 mask 和手写测试；引用形态适合模型权重。明文数据外化 pass 可以按字节阈值把大的内联 payload 写入数据包并改写为引用形态，但 RuntimePlan 不要求全部外化，两种 payload 都是合法协议形式。
 
@@ -290,7 +292,7 @@ Boot 内部如果也需要 lazy-rescale,其合法输入范围、实际 level 消
 
 ### 7.6 导出 RuntimePlan V1
 
-把可执行 CKKS 序列化成 RuntimePlan V1 JSON。`ckks.encode` 一对一变成 initialization 中的 Encode 指令：内联 payload 写成浮点数组，引用 payload 写成 `content` 哈希，输出仍使用原来的 ValueId。JSON 是 Dacapo 与 Runtime 之间唯一的稳定协议。Runtime 读取后可以转成自己的 C++ `RuntimePlan`，但两边不共享 C++ 类型。首期不需要新 MLIR dialect。
+把可执行 CKKS 序列化成 RuntimePlan V1 JSON。当前 `emit-runtime-plan` Pass 先支持单 Host、单 block、无通信的线性函数；`ckks.encode` 一对一变成 initialization 中的 inline Encode，计算进入 execution。导出器不重算 level/scale、不插入算子，遇到未消除的 Upscale、旧 `.cst` 索引、控制流或未知算子直接报错。JSON 是 Dacapo 与 Runtime 之间唯一的稳定协议。
 
 ## 8. 等待与异步的表示
 

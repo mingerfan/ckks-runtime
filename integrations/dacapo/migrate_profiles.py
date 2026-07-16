@@ -72,8 +72,16 @@ OPERATOR_KEYS = {
 }
 
 
-def source_sha256(path: Path) -> str:
-    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+def read_source_bytes(path: str) -> bytes:
+    return subprocess.run(
+        ["git", "-C", str(DACAPO), "show", f"{DACAPO_REVISION}:{path}"],
+        check=True,
+        capture_output=True,
+    ).stdout
+
+
+def source_sha256(content: bytes) -> str:
+    return "sha256:" + hashlib.sha256(content).hexdigest()
 
 
 def require_integer(value, path: str) -> int:
@@ -133,8 +141,8 @@ def operator_entry(profile: dict, key: str | None, level_count: int, rescale: bo
 
 
 def migrate(config: ProfileConfig) -> dict:
-    source_path = DACAPO / config.source_name
-    profile = json.loads(source_path.read_text(encoding="utf-8"))
+    source_content = read_source_bytes(config.source_name)
+    profile = json.loads(source_content.decode("utf-8"))
     required = {
         "runtime",
         "rescalingFactor",
@@ -190,7 +198,7 @@ def migrate(config: ProfileConfig) -> dict:
             "repository": DACAPO_REPOSITORY,
             "revision": DACAPO_REVISION,
             "path": config.source_name,
-            "source_sha256": source_sha256(source_path),
+            "source_sha256": source_sha256(source_content),
         },
         "context": {
             "context_id": config.context_id,
@@ -227,14 +235,10 @@ def main() -> None:
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
 
-    revision = subprocess.run(
-        ["git", "-C", str(DACAPO), "rev-parse", "HEAD"],
+    subprocess.run(
+        ["git", "-C", str(DACAPO), "cat-file", "-e", f"{DACAPO_REVISION}^{{commit}}"],
         check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    if revision != DACAPO_REVISION:
-        raise RuntimeError(f"Dacapo submodule is {revision}, expected {DACAPO_REVISION}")
+    )
 
     for config in PROFILES:
         content = json.dumps(migrate(config), indent=2, ensure_ascii=False) + "\n"
