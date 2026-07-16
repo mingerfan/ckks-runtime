@@ -331,21 +331,19 @@ MPI 版 Api 可以用 `MPI_Abort`；单进程的 MockVecApi 可以抛出 Cluster
 15. Api 的通信降级不得改变通信动作的数学语义或 Place。
 16. 任意错误都会终止整个执行组。
 
-## 12. 与 poseidon::mgpu 的对接
+## 12. Poseidon 后端边界
 
-Poseidon 已有一套单机多卡静态调度代码（`src/poseidon/mgpu`）。本框架是它的演进目标——后续会把其中的通信层和调度产物迁移过来对接，冗余部分删除。为了让迁移顺畅，本设计在这些关键点上和 mgpu 保持一致：
+Poseidon 后端只实现 Runtime 的 Api，不再定义自己的计划格式、placement、验证器、ValueId 存储或执行器：
 
-- **单位置 SSA**：mgpu 的 `CopyCipher`/`CopyPlain` 也是显式的拷贝指令，拷贝产生新的 ValueId，和本框架"一个 ValueId 一个位置"的规则一致。
-- **不透明对象存储**：mgpu 用 `MgpuObjectStore` 存 `shared_ptr<void>`，用 `ScheduleExecutionBackend` 虚基类隔离计算实现；本框架用 `Runtime<Api>` 模板 + `Api::Value` 达到同样的隔离效果。未来 PoseidonApi 可以直接包住 mgpu 的执行后端和对象拷贝层。
-- **对象级拷贝**：mgpu 的 `GpuObjectCopyMaterializer` 已经解决了"密文在显存里不是单段连续 buffer、需要分段拷贝"的问题。这正是本框架把 buffer 细节留在 Api 内部的原因——迁移时这层可以直接复用。
+- **计算**：`PoseidonCpuApi` 调 Poseidon CPU 算子，`PoseidonGpuApi` 直接调 `GpuEvaluator` 等 GPU 库接口；
+- **值存储**：Runtime 的 `ValueStore<Api>` 管 ValueId 和 Ready/Pending，Poseidon 的 `Api::Value` 只持有 CPU/GPU 对象；
+- **通信**：对象拆分、目标端分配、Host/Device 转换、CUDA P2P、NCCL 和 GPU-aware MPI 放在 `src/poseidon/runtime_api/communication/`，作为 Api 内部实现；
+- **位置**：所有 Host、device、rank 和 index 都来自 RuntimePlan 的 `Place`，后端不重新做 placement；
+- **元信息**：context、level、`scale_log2`、NTT、分量数和 OperatorSpec/profile 都按 RuntimePlan 检查，不能依赖无类型的整数属性；
+- **Host compute**：GPU 目标中的 Host 算子必须由计划明确写出，Device→Host 和 Host→Device 仍是普通 Transfer；
+- **异步**：同步实现可以直接完成操作，异步实现用 stream/event 填充 `CommHandle`，两者都遵守下一节的可见性契约。
 
-需要在迁移时补齐的差异（mgpu 目前没有，本框架要求）：
-
-- **rank 概念**：mgpu 只有 `int device_id`（单进程单节点），本框架的 `Place{rank, index}` 是它的超集。跨节点传输在 mgpu 里只是一个会明确报错的占位后端，真正的实现要在这里补。
-- **完整 CKKS 元信息**：mgpu 的整数属性表不足以表达 V1 的 context、level、`scale_log2`、NTT、分量数和 OperatorSpec/profile。迁移时要按 V1 类型补齐,不能继续依赖无类型的属性名约定。
-- **Host compute**：GPU boot 的 CPU 模拟需要显式的 Device→Host、Host Boot、Host→Device。mgpu 当前的 `BootstrapFallback` 只是未实现占位,不能直接当成新方案。
-- **异步执行**：mgpu 的执行器逐指令同步执行，拷贝是阻塞的。本框架的 Pending/`wait` 模型更进一步（见下一节的契约说明），迁移时 PoseidonApi 需要用 stream/event 把同步执行包装成异步接口。
-- **NCCL/MPI 通信**：mgpu 目前没有集成，这部分从本框架的 MpiApi/NcclApi 开始建。
+低层 GPU data、参数、上传下载、算子和 kernel 属于 Poseidon GPU 库，继续维护。历史执行系统不属于目标架构，其处置统一写在[集成方案的迁移章节](dacapo-runtime-integration.md#阶段四弃用并删除旧执行系统)，其他设计不再以它为兼容目标。
 
 ## 13. 计算与通信的异步契约
 

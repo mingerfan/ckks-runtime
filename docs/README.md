@@ -33,9 +33,9 @@
 
 当前代码已经实现 Encode、Compute、Transfer 和 Replicate，以及 OperatorSpec/bundle 读取和完整 preflight。
 
-## 与 poseidon::mgpu 的关系
+## Poseidon 后端
 
-Poseidon 仓库里已有一套单机多卡的静态调度代码（`src/poseidon/mgpu`，包含 schedule IR、placement、copy 插入、verifier、对象级 GPU 拷贝）。**本框架是它的演进目标**：mgpu 目前只覆盖单节点、同步拷贝、无 rank 概念，后续会把其中有价值的部分（GPU 对象拷贝层、verifier 不变量、Dacapo 前端产物）迁移过来，作为本框架下的一个 Api 实现接入；冗余部分会删除。因此本文档中的 SSA 不变量刻意与 mgpu 的做法保持兼容，细节见[总体架构](overview-design/architecture.md)最后一节。
+Poseidon 通过 `PoseidonCpuApi` 和 `PoseidonGpuApi` 接入 Runtime。GPU 计算直接调用 Poseidon GPU 库；对象拆分、Host/Device 搬运、跨卡和跨进程通信放在独立的 Runtime Api 通信模块中。RuntimePlan、ValueStore、验证器和执行器只保留本仓库这一套。旧执行系统的弃用与删除要求见[集成方案的迁移章节](overview-design/dacapo-runtime-integration.md#阶段四弃用并删除旧执行系统)。
 
 ## 常用术语
 
@@ -76,7 +76,7 @@ V1/V2 规范、JSON 读取器、Schema 和样例集已经对齐。
 
 ### 总体设计(背景与决策)
 
-- [总体架构](overview-design/architecture.md):目标、分层、编译流水线、核心约束、与 poseidon::mgpu 的对接。
+- [总体架构](overview-design/architecture.md):目标、分层、编译流水线、核心约束和 Poseidon 后端边界。
 - [Dialect 与 SSA 设计](overview-design/dialect-design.md):逻辑算子、目标合法化、设备分配、通信显式化和 RuntimePlan 映射。
 - [Runtime 设计](overview-design/runtime-design.md):执行流程、值状态管理、异步等待和错误终止。
 - [通信设计](overview-design/communication-design.md):通信动作、实现提示（hint）、Host/Device 搬运和无死锁论证。

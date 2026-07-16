@@ -193,7 +193,7 @@ PoseidonGpuApi: variant<CpuPlaintextData, CpuCiphertextData,
                         GpuPlaintextData, GpuCiphertextData>
 ~~~
 
-GPU 目标计划可能包含显式的 Host compute，例如 CPU 解密再加密模拟 boot，所以同一个 PoseidonGpuApi 必须同时容纳 Host 和 Device 值。Poseidon 的 Api 可以在内部展开密文的多段 buffer、在目标端分配、复制元信息、转换 CPU/GPU 表示、调 MPI/NCCL/CUDA、管理锁页内存——这些都不进 runtime 的公共接口。poseidon::mgpu 现有的 `GpuObjectCopyMaterializer` 已经实现了"把不透明对象拆成一组分段 buffer 拷贝"这件事，迁移对接时可以直接复用在 Api 内部。
+GPU 目标计划可能包含显式的 Host compute，例如 CPU 解密再加密模拟 boot，所以同一个 PoseidonGpuApi 必须同时容纳 Host 和 Device 值。Poseidon 的 Api 可以在内部展开密文的多段 buffer、在目标端分配、复制元信息、转换 CPU/GPU 表示、调 MPI/NCCL/CUDA、管理锁页内存——这些都不进 runtime 的公共接口。对象拆分和分段拷贝放在 `src/poseidon/runtime_api/communication/`，作为 PoseidonApi 的内部模块，不暴露给 Runtime。
 
 因此首期不引入 ObjectHandle、ObjectDescriptor、ObjectAdapter、BufferView、MemoryKind 或通用序列化接口。如果未来确实要让一个通用的 MPI 传输层独立复用多种对象布局，再把对象适配器作为 Api 的内部模块加进去，而不是提前进入 Runtime 接口。
 

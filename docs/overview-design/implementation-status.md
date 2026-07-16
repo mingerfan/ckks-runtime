@@ -18,8 +18,10 @@
 - 已把 Dacapo 的 HEAAN CPU/GPU、SEAL CPU profile 迁到 OperatorSpec V2，保留 CKKS 参数、逐 level 延迟/噪声、来源 SHA-256，并显式完成 Earth→CKKS bootstrap level 换算。V1 保持冻结。
 - 待完成：Dacapo 的 RuntimePlan 生成 Pass 和真实编译产物集成测试。
 
-## 后续阶段
+## 阶段三进行中
 
-- 阶段三：PoseidonCpuApi、PoseidonGpuApi 和生产测量 profile。
+- Poseidon 仓库已经通过可选构建路径接入本 Runtime，并实现单进程、Host-only 的 `PoseidonCpuApi` 及最小端到端测试。
+- 下一步是单进程单卡的 `PoseidonGpuApi`：使用 Poseidon 的 `GpuUploader`、`GpuParameterData` 和 `GpuEvaluator`，支持 Host↔Device Transfer 与当前 GPU 库已有的普通 CKKS 算子。
+- 生产 GPU OperatorSpec 尚未完成。当前 placeholder profile 使用 28-bit 模数且只允许两层 Rescale，不符合实际 30-bit 模数和 lazy Rescale 连续下降 4 层的设计；ModSwitch 和 Boot 也尚未实现，不能被真实 GPUApi 接受。
 
 这些内容不属于 RuntimePlan V1 冻结条件。
