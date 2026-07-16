@@ -20,7 +20,7 @@ nix develop --command cmake --build --preset nix
 nix develop --command ctest --test-dir build/nix --output-on-failure
 ```
 
-当前 `emit-runtime-plan` Pass 输出单 Host RuntimePlan V1，文件名是 `<prefix>.<func>.runtime-plan.json`。target、OperatorSpec 引用和 context 必须通过 Pass option 明确提供。大常量 bundle 外化、OperatorSpec 读取、placement 和通信仍留给后续 Pass。
+当前 `emit-runtime-plan` Pass 输出单 Host RuntimePlan V1，文件名是 `<prefix>.<func>.runtime-plan.json`。target、OperatorSpec 引用和 context 必须通过 Pass option 明确提供。Encode payload 默认以 4096 字节为界：不超过阈值的常量内联到 JSON，超过阈值的 float64 常量写入 `<prefix>.<func>.bundle/`；相同内容按 SHA-256 复用同一个 blob。直接读取 OperatorSpec、placement 和通信仍留给后续 Pass。
 
 ## 生成模型审阅产物
 
@@ -40,7 +40,7 @@ python3 integrations/dacapo/generate_model_artifacts.py resnet20 \
   --operator-spec docs/operator-spec/v2/profiles/dacapo-heaan-gpu.v1.json
 ```
 
-默认输出到 `third_party/dacapo/review_artifacts/<model>/`，该目录不会进入 Git。Python tracing 需要安装 `requirements.txt` 中的模型依赖；Dacapo C++ 编译器仍可独立离线构建，不把 PyTorch 加入默认构建依赖。
+默认输出到 `third_party/dacapo/review_artifacts/<model>/`，该目录不会进入 Git。大常量同时生成 `.bundle/manifest.json` 和 `.bundle/data/*.bin`。可以用 `--inline-payload-max-bytes` 调整阈值；设为 `0` 会外化所有非空 float64 Encode payload。Python tracing 需要安装 `requirements.txt` 中的模型依赖；Dacapo C++ 编译器仍可独立离线构建，不把 PyTorch 加入默认构建依赖。
 
 如果已经有 Earth MLIR，可以跳过 Python tracing：
 

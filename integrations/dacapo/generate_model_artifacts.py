@@ -144,6 +144,7 @@ def build_optimizer_command(args, traced: Path, spec: dict,
         "--runtime-plan-ntt=true",
         f"--runtime-plan-boot-profile={boot['profile_id']}",
         f"--runtime-plan-boot-implementation={boot['implementation']}",
+        f"--runtime-plan-inline-payload-max-bytes={args.inline_payload_max_bytes}",
         str(traced),
         "-o",
         str(optimized),
@@ -166,6 +167,7 @@ def main() -> None:
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument("--waterline", type=int, default=40)
     parser.add_argument("--plan-id", type=int, default=1)
+    parser.add_argument("--inline-payload-max-bytes", type=int, default=4096)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -173,6 +175,10 @@ def main() -> None:
         raise ValueError("--waterline must be nonnegative")
     if args.plan_id < 0:
         raise ValueError("--plan-id must be nonnegative")
+    if args.inline_payload_max_bytes < 0:
+        raise ValueError("--inline-payload-max-bytes must be nonnegative")
+    if args.inline_payload_max_bytes > (1 << 53) - 1:
+        raise ValueError("--inline-payload-max-bytes exceeds the safe JSON integer range")
 
     args.operator_spec = args.operator_spec.resolve()
     args.hecate_build = args.hecate_build.resolve()
@@ -214,6 +220,12 @@ def main() -> None:
     print(f"optimized MLIR: {output_dir / f'{args.model}.optimized.mlir'}")
     for path in runtime_plans:
         print(f"RuntimePlan: {path}")
+        plan = json.loads(path.read_text(encoding="utf-8"))
+        if "plaintext_bundle" in plan:
+            bundle = Path(str(path).removesuffix(".runtime-plan.json") + ".bundle")
+            if not bundle.is_dir():
+                raise FileNotFoundError(f"RuntimePlan bundle directory not found: {bundle}")
+            print(f"plaintext bundle: {bundle}")
 
 
 if __name__ == "__main__":

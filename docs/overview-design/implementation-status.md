@@ -17,9 +17,9 @@
 - 已把 `mingerfan/dacapo-modified` 作为可选 submodule 固定在 `third_party/dacapo/`。它不参与默认 xmake 构建，需要时用 `git submodule update --init third_party/dacapo` 显式初始化。
 - 已把 Dacapo 的 HEAAN CPU/GPU、SEAL CPU profile 迁到 OperatorSpec V2，保留 CKKS 参数、逐 level 延迟/噪声、来源 SHA-256，并显式完成 Earth→CKKS bootstrap level 换算。V1 保持冻结。
 - Dacapo 的 CKKS `PolyType` 已保存 components、`scale_log2` 和 Runtime 方向的 level；Earth 密文乘法下降为独立的 `ckks.mulcc` 和 `ckks.relinearize`。
-- 已加入单 Host 的 `emit-runtime-plan` Pass：保留 inline Encode payload，输出严格的 RuntimePlan V1 JSON，并用 Runtime verifier 与 MockVecApi 跑通 Mul/Relinearize、Upscale、常量和 Boot 层号换算。
+- 已加入单 Host 的 `emit-runtime-plan` Pass：小 Encode payload 保持 inline，大 float64 payload 按阈值写入内容寻址 bundle，相同内容只保存一次；输出严格的 RuntimePlan V1 JSON，并覆盖 Mul/Relinearize、Upscale、常量、bundle 复用和 Boot 层号换算。
 - `RemoveLevel`、`ReuseBuffer` 保留注册但不再进入新管线；`emit-hevm` 调用会直接报错。Python frontend 不再生成 `.cst` 索引。
-- 待完成：大常量 bundle 外化、直接读取 OperatorSpec、目标合法化、placement 和 Transfer/Replicate 插入。
+- 待完成：直接读取 OperatorSpec、目标合法化、placement 和 Transfer/Replicate 插入。
 
 ## 阶段三进行中
 
