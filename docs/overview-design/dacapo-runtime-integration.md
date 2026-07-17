@@ -1,6 +1,6 @@
 # Dacapo、Runtime 与 Poseidon 集成方案
 
-> 本文描述目标集成结构和迁移顺序。当前仓库已经加入可选的 Dacapo submodule。Poseidon 仓库已经实现向下兼容的单进程/MPI `PoseidonCpuApi` 和单进程单卡 `PoseidonGpuApi`；Dacapo 已能对完整 CKKS 值做多 rank、多 device placement，并插入点对点通信。Runtime 自身的完成情况见[实现状态](implementation-status.md)。
+> 本文描述目标集成结构和迁移顺序。当前仓库已经加入可选的 Dacapo submodule。Poseidon 仓库已经实现向下兼容的单进程/MPI `PoseidonCpuApi` 和单进程单卡/多卡 `PoseidonGpuApi`；Dacapo 已能对完整 CKKS 值做多 rank、多 device placement，并插入点对点通信。Runtime 自身的完成情况见[实现状态](implementation-status.md)。
 
 ## 1. 这份方案要解决什么问题
 
@@ -463,23 +463,23 @@ PoseidonGpuApi  = Poseidon GPU 算子 + 必要的 Host 算子
 
 `PoseidonGpuApi` 不是说所有指令都必须在 GPU 上执行,而是说这份 Api 能执行 GPU 目标计划。普通计算仍在 Device;只有计划明确放到 Host 的算子,例如 `decrypt_reencrypt` Boot,才调用它内部组合的 Poseidon CPU 实现。Runtime 仍然只调用一个 Api,也不会根据算子失败情况临时换后端。
 
-单卡 GPUApi 直接调用 Poseidon 的 GPU data、参数、上传下载和算子接口。多卡阶段把对象拆分、跨卡与跨进程通信放进 `src/poseidon/runtime_api/communication/`，由 `communicate_async` 使用。新 Api 不依赖任何旧调度表示、object store、placement、验证器或执行器。
+GPUApi 直接调用 Poseidon 的 GPU data、参数、上传下载和算子接口。本机多卡把完整目标对象物化、跨卡复制和拓扑选择放进 `src/poseidon/runtime_api/communication/`，由 `communicate_async` 使用；未来跨进程通信也留在这条边界内。新 Api 不依赖任何旧调度表示、object store、placement、验证器或执行器。
 
-### 8.1 单进程单卡首版的边界
+### 8.1 单进程 GPU API 的边界
 
-首版只解决一件事：让 `SequentialRuntime<PoseidonGpuApi>` 用 Poseidon GPU 库执行一份明确的单卡 RuntimePlan。支持范围固定为：
+当前实现让 `SequentialRuntime<PoseidonGpuApi>` 用同一套接口执行单卡或本机多卡 RuntimePlan。支持范围固定为：
 
 - `target_id="poseidon-ckks-gpu"`、`capability_version=1`；
-- `world_size=1`、`device_counts=[1]`；
-- 计划里只允许 `Host(rank=0)` 和 `Device(rank=0,index=0)`；
-- RuntimePlan 的逻辑设备 0 映射到 Api 构造时指定的 CUDA device id，不能直接假设计划里的 index 就是进程看到的物理卡号；
+- `world_size=1`、`device_counts=[N]`，其中 `N` 必须和 Api 构造时配置的本地设备数一致；
+- 计划里只允许 `Host(rank=0,index=0)` 和 `Device(rank=0,index=0..N-1)`；
+- RuntimePlan 的逻辑设备 `i` 映射到 Api 构造时 `cuda_device_ids[i]` 指定的物理卡，物理 id 必须存在且不能重复；旧单卡构造函数等价于传入只含一个 id 的列表；
 - Encode 和 external input 仍先产生 Host 值，进卡和出卡都必须使用显式 Transfer；
-- Device 上支持当前 Poseidon GPU 库已经实现的普通 CKKS 算子；Host 上首版只做 Encode，不支持 Host compute；
-- 不支持 Replicate、跨卡、跨进程、原生 Boot 和 `decrypt_reencrypt` Boot。
+- Device 上支持当前 Poseidon GPU 库已经实现的普通 CKKS 算子；每个算子仍消费和产生位于一张卡上的完整对象，Host 上只做 Encode，不支持 Host compute；
+- 本机支持 Host↔Device、Device↔Device、Transfer 和 Replicate；不支持跨进程、原生 Boot 和 `decrypt_reencrypt` Boot。
 
-单卡目标只有 Host 和一张 Device 两个 Place，而 Replicate 要求至少两个不同目的地，所以首版本来就没有合法的 Replicate 用例。收到这些范围之外的 target、能力或指令时直接拒绝，不创建第二套调度逻辑，也不临时改走 CPU。
+单卡仍可沿用原构造和原计划；多卡只增加逻辑设备映射和显式通信，不创建第二套调度逻辑，也不临时改走 CPU。Replicate 按计划中的 destinations 顺序产生多个独立对象，目的 Place 重复或等于源 Place 时直接拒绝。
 
-首版以正确性和报错位置为先。每个 GPU compute 在返回前完成 `cudaDeviceSynchronize`，Host↔Device 拷贝也使用 `GpuUploader` 当前的同步拷贝。这样 CUDA 执行错误会落在当前 RuntimePlan 指令上，而不是拖到最终输出同步时才出现。以后改成 stream/event 只改 Api 内部，不改 Runtime 接口和计划格式。
+GPU compute 在各物理卡的默认 stream 上提交，并为输出 Value 记录 completion event，不再在每个算子末尾无条件执行 `cudaDeviceSynchronize`。Value 的 completion 同时持有输入 Value 和每卡设备状态，避免异步 kernel 尚未完成时提前释放输入、参数或 scratch。Runtime 仍按编译器给出的静态顺序调用 Api；同卡依赖由默认 stream 顺序保证，不同卡上的相邻独立算子可以重叠。跨卡通信、下载和最终输出等待对应 completion。一个 RuntimePlan Rescale 连续下降多层时，为保护本次调用中的中间对象仍保留一次同步。
 
 ### 8.2 Value、资源和生命周期
 
@@ -492,17 +492,17 @@ Device plaintext -> poseidon::gpu::GpuPlaintextData
 Device ciphertext-> poseidon::gpu::GpuCiphertextData
 ~~~
 
-实现上用一个可复制的小包装，内部保存上述四种对象的 `shared_ptr` variant。Runtime 在收集输入时会复制 `Value`，而 GPU data 自身持有不可复制的设备内存，所以不能把 `GpuCiphertextData` 直接按值塞进 `Value`。所有计算都读取旧对象并产生新对象，不做原地覆盖，和 RuntimePlan 的 SSA 语义保持一致。
+实现上用一个可复制的小包装，内部保存上述四种对象的 `shared_ptr` variant；异步 Device 计算结果还保存共享 completion event。Runtime 在收集输入时会复制 `Value`，而 GPU data 自身持有不可复制的设备内存，所以不能把 `GpuCiphertextData` 直接按值塞进 `Value`。所有计算都读取旧对象并产生新对象，不做原地覆盖，和 RuntimePlan 的 SSA 语义保持一致。
 
 首版不再引入第二套按 ValueId 存对象的容器。`SequentialRuntime` 已经用 `ValueStore<Api>` 管 ValueId、Ready/Pending 和生命周期，再包一层只会形成两份状态。`PoseidonGpuApi` 直接在 `Value` 中持有 Poseidon CPU/GPU 对象即可。
 
 Api 构造时由部署方一次性提供：
 
 - `context_id` 和 `PoseidonContext`；
-- 逻辑设备 0 对应的 CUDA device id；
+- 逻辑设备列表对应的物理 CUDA device ids；旧构造仍可只提供一个 id；
 - 可选的 `RelinKeys` 和 `GaloisKeys`。
 
-构造或 preflight 阶段在指定设备上建立一个 `GpuParameterData` 和一个 `GpuEvaluator`，并把提供的评估密钥上传一次。Api 不接管进程级 RMM 配置，也不在每条指令里重复建立参数或上传密钥。
+构造阶段为每张指定设备建立独立的 `GpuParameterData`、`GpuEvaluator` 和按 q-count 缓存的评估密钥。CPU context、encoder 和原始密钥继续共享。Api 不接管进程级 RMM 配置，也不在每条指令里重复建立参数。
 
 ### 8.3 Compute 直接调用 Poseidon GPU 库
 
@@ -529,34 +529,35 @@ Api 构造时由部署方一次性提供：
 
 当前仓库的 `poseidon-ckks-gpu.v1.json` 是协议测试用 placeholder，里面的 28-bit 模数、两层 Rescale、ModSwitch 和 Boot 声明都不能代表真实 GPUApi。接 GPUApi 前必须先生成一份和实测 GPU context 一致的非 placeholder OperatorSpec：数据模数按当前实现记录为 30 bit，`rescale.max_levels_per_op` 至少覆盖当前 lazy Rescale 所需的 4 层，并把尚未实现的 ModSwitch、Boot 标成 unsupported。Api preflight 也要拒绝 `status="placeholder"`，并拒绝任何把未实现算子标成 supported 的 spec。
 
-### 8.4 单卡 Transfer
+### 8.4 本机 Transfer 与 Replicate
 
-单卡首版只需要两种传输：
+当前本机实现支持三种传输：
 
 ~~~text
 Host -> Device: GpuUploader::upload_plaintext / upload_ciphertext
 Device -> Host: GpuUploader::download_plaintext / download_ciphertext
+Device(i) -> Device(j): 完整目标对象物化 + CUDA P2P/HostStaged copy
 ~~~
 
-传输必须产生一个新的 `Value`，不能让输出和输入共享同一个可变对象。上传和下载只转换表示与位置，`context`、level、`scale_log2`、NTT 状态和 components 必须保持不变。
+传输必须产生一个新的 `Value`，不能让输出和输入共享同一个可变对象。Replicate 对每个 destination 产生一个新对象并保持输出顺序。通信只转换表示与位置，`context`、level、`scale_log2`、NTT 状态和 components 必须保持不变。跨卡只接受单 field、单完整 shard 对象；`HostStaged` hint 强制 pinned Host 中转，其他 hint 由本机拓扑选择 P2P 或 Host 中转，P2P 实际执行失败时不隐藏错误重试。
 
-`communicate_async` 可以同步完成拷贝，再把结果放进一个很小的 `CommHandle`；`wait` 只负责按目标顺序交出结果，并拒绝同一个 handle 被等待两次。首版不为同步 `GpuUploader` 额外造线程池或伪异步层。以后引入 CUDA stream 后，handle 再改成持有 event 和目标对象。
+当前 `communicate_async` 在开始 Device 源传输前等待源 Value 的 compute completion，然后同步完成拷贝并把结果放进 `CommHandle`；`wait` 只负责按目标顺序交出结果，并拒绝同一个 handle 被等待两次。也就是说，compute 已能跨设备重叠，通信本身还不能和计算重叠。后续把 CUDA P2P、HostStaged 和 uploader 改成 stream/event 时，只改 Api/通信层内部，不改 RuntimePlan 或静态调度语义。
 
 ### 8.5 Preflight 与 Value 校验
 
 `PoseidonGpuApi::preflight` 至少检查：
 
-- target 必须严格等于单进程单卡配置，CUDA device id 存在且可用；
+- target 必须是单进程配置，`device_counts=[N]` 和 Api 的逻辑/物理设备映射一致；
 - OperatorSpec 的 context id、poly degree、每层模数 bit 数、默认 scale 和实际 `PoseidonContext` 一致，所有数据模数都能放进 32 位 `GpuWord`；
 - `rescale_mode=lazy`，spec 不是 placeholder，Rescale 至少允许下降 4 层，且它声明支持的算子没有超出 8.3 节的真实能力；
-- `PlanRequirements` 只包含首版可提供的 Encode 和 Transfer，不包含 Replicate、HostCompute 或两种 Boot；
-- Relin/Galois key 只允许要求在 `Device(rank=0,index=0)`，并且构造时提供的 CPU key 中确实有计划需要的 key，之后使用对应的 GPU 上传版本。
+- `PlanRequirements` 只包含当前可提供的 Encode、Transfer 和 Replicate，不包含 HostCompute 或两种 Boot；
+- Relin/Galois key 可以要求在任意已配置逻辑设备，并且构造时提供的 CPU key 中确实有计划需要的 key，之后使用该物理卡对应的 GPU 上传版本。
 
 `validate_value` 不能只看 variant 类型。Host 值按现有 `PoseidonCpuApi` 的规则检查；Device 值还要检查：
 
 - `parms_id` 能在 context 中找到，映射出的 level 和 ValueDesc 一致；
 - degree、scale、NTT 状态和 components 一致；
-- data object 只有一个完整 shard，且实际 CUDA device id 等于逻辑设备 0 的映射；
+- data object 只有一个完整 shard，且实际 CUDA device id 等于 ValueDesc 中逻辑设备的物理映射；
 - ciphertext/plaintext 的 q limb 数和该 level 一致，普通数据不携带 P limbs。
 
 任何不一致都直接报错。不要下载到 CPU 后“修正”GPU 元信息，也不要在 GPU 算子失败后调用 `PoseidonCpuApi` 重算。
@@ -653,9 +654,9 @@ Dacapo 测试模型
 1. 已完成：Poseidon 通过可选构建路径引入 Runtime;
 2. 已完成：向下兼容的 PoseidonCpuApi；默认构造保持单进程 Host-only，MPI 构造支持 Host rank 间的 Transfer/Replicate，并已通过手工 2/4 rank RuntimePlan 测试;
 3. 先用真实 GPU context 和测量结果替换 placeholder GPU OperatorSpec，未实现的 ModSwitch/Boot 必须标成 unsupported;
-4. 已完成：按 8.1～8.7 节实现单进程单卡的 PoseidonGpuApi，打通 Host↔Device Transfer 和普通 GPU compute;
+4. 已完成：按 8.1～8.7 节实现向下兼容的单进程单卡/多卡 PoseidonGpuApi，打通普通 GPU compute 和本机显式通信;
 5. 让 PoseidonGpuApi 支持计划明确要求的 Host Boot 模拟:Device→Host、CPU 解密再加密、Host→Device;
-6. 迁移同进程跨卡的对象拷贝并开放 Replicate;
+6. 已完成：迁移同进程跨卡的完整对象拷贝并开放 Replicate；compute completion event 已允许不同设备的静态顺序提交发生重叠，通信异步化仍待完成;
 7. CPU 已接入跨进程 MPI 通信；GPU 跨进程通信仍待实现;
 8. GPU 计划在 MockVecApi/PoseidonGpuApi 下结果一致，等价 Host 计划在 PoseidonCpuApi 下给出同样的数学结果。
 
@@ -691,7 +692,7 @@ Dacapo 测试模型
 - `level` 是整数模数链层号,`scale_log2` 是整数 scale 指数;V1 不传浮点 scale;
 - CPU 和 GPU 使用不同的 OperatorSpec。CPU 默认 eager rescale,当前 30-bit GPU profile 使用 lazy-rescale;GPU boot 的内部 level 消耗也由独立 boot profile 给出;
 - GPU 原生 boot 不可用时,只能由 Dacapo 的可选 Pass 明确生成 Device→Host、CPU 解密再加密、Host→Device 的计划,Runtime 不做隐式回退;
-- 单进程单卡 PoseidonGpuApi 首版支持真实 GPU 库已有的普通算子、普通/多层 lazy Rescale 和 Host↔Device Transfer；每次物理 Rescale 丢一个 30-bit 模数，当前 lazy 路径执行四次、共下降 4 个 level 和约 120 bit；ModSwitch、Boot、Replicate、多卡和多进程直接拒绝;
+- 单进程 PoseidonGpuApi 向下兼容单卡并支持本机多卡：普通 GPU 算子、普通/多层 lazy Rescale、Host↔Device、Device↔Device、Transfer 和 Replicate 已接通；每次物理 Rescale 丢一个 30-bit 模数，当前 lazy 路径执行四次、共下降 4 个 level 和约 120 bit；ModSwitch、Boot 和 GPU 多进程仍拒绝;
 - 协议测试用 placeholder GPU OperatorSpec 不能被真实 PoseidonGpuApi 接受，生产 profile 必须和 GPU context 及已实现能力一致;
 - Dacapo 是 Runtime 的可选 submodule(指向 `dacapo-modified` fork),只用于锁版本和集成测试;
 - 计划产出走 MLIR 原生管线直接输出 RuntimePlan,HEVM 字节码及其解释器/解析器整条链退役;

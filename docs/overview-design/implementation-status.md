@@ -26,8 +26,11 @@
 ## 阶段三进行中
 
 - Poseidon 仓库已经通过可选构建路径接入本 Runtime。`PoseidonCpuApi` 同时支持不依赖 MPI 的单进程模式和可选的 MPI 多进程模式；MPI 模式支持 Host rank 间的明文/密文 Transfer、Replicate、计划与 context 一致性检查及全组终止，手工 RuntimePlan 已在 2/4 rank 下通过端到端测试。
-- 单进程单卡 `PoseidonGpuApi` 已实现：使用 Poseidon 的 `GpuUploader`、`GpuParameterData` 和 `GpuEvaluator`，支持 Host↔Device Transfer 与当前 GPU 库已有的普通 CKKS 算子。
-- Dacapo 已生成多 rank/device placement 和点对点 Transfer；Poseidon CPU MPI 的既有测试仍使用手工 RuntimePlan，Dacapo 产出的 Device 计划目前由 MockVecApi 验证，后续等 GPU 多卡/跨进程通信接入后再交给 PoseidonGpuApi。
+- 单进程 `PoseidonGpuApi` 已从单卡兼容扩展到本机多卡：`Device(rank=0,index=i)` 映射到构造时给出的第 `i` 个物理 CUDA device，每张卡独立持有参数、Evaluator 和密钥缓存；旧单卡构造函数保持兼容。
+- 本机 GPU 通信已支持 Host↔Device、Device↔Device、Transfer 和 Replicate。跨卡复制先物化完整目标对象，再按拓扑使用 CUDA P2P 或 pinned Host 中转；V1 仍只接受单 field、单完整 shard 的值。
+- GPU compute 结果现在记录 CUDA completion event，不再在每个算子末尾无条件执行 `cudaDeviceSynchronize`。Runtime 继续按 Dacapo 的静态顺序提交，因此不同设备上的独立算子可以重叠；跨卡通信、下载和最终输出会等待源 Value。多级 Rescale 为保护本次调用中的临时对象仍保留一次同步。
+- 手工双卡 RuntimePlan 已覆盖反向逻辑/物理设备映射、Replicate、明文/密文跨卡传输和两卡计算；当前单卡开发机只编译并跳过该用例，仍需在真实双卡机器上完成运行验收。
+- Dacapo 已生成多 rank/device placement 和点对点 Transfer；Poseidon CPU MPI 的既有测试仍使用手工 RuntimePlan。Dacapo 产出的 Device 计划目前由 MockVecApi 验证，交给真实 PoseidonGpuApi 还需要生产 GPU OperatorSpec、受支持算子合法化和多卡硬件验收。
 - 生产 GPU OperatorSpec 尚未完成。当前 placeholder profile 使用 28-bit 模数且只允许两层 Rescale，不符合实际 30-bit 模数和 lazy Rescale 连续下降 4 层的设计；ModSwitch 和 Boot 也尚未实现，不能被真实 GPUApi 接受。
 
 这些内容不属于 RuntimePlan V1 冻结条件。
