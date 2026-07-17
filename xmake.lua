@@ -45,6 +45,17 @@ target("runtime_plan_json_tests")
     add_deps("runtime_plan_json")
     add_defines("CKKS_RUNTIME_SOURCE_DIR=\"$(projectdir)\"")
 
+target("dacapo_mlp_vec_experiment")
+    set_kind("binary")
+    add_files("experiments/dacapo_mlp_vec.cpp")
+    add_deps("runtime_plan_json")
+
+target("dacapo_mlp_mpi_isolation_experiment")
+    set_kind("binary")
+    add_files("experiments/dacapo_mlp_mpi_isolation.cpp", "api/mpi_api.cpp")
+    add_deps("runtime_plan_json")
+    add_packages("mpi")
+
 target("mpi_runtime_test")
     set_kind("binary")
     add_files("tests/mpi_runtime_test.cpp", "api/mpi_api.cpp")
