@@ -50,6 +50,11 @@ public:
         return it->second;
     }
     const std::unordered_map<ValueId, Entry> &entries() const { return entries_; }
+    void erase(ValueId id) {
+        if (entries_.erase(id) != 1)
+            throw std::runtime_error("ValueId cannot be released from ValueStore: " +
+                                     std::to_string(id));
+    }
 
 private:
     std::unordered_map<ValueId, Entry> entries_;
@@ -75,6 +80,8 @@ public:
         store_ = ValueStore<Api>{};
         groups_.clear();
         bundle_slots_.clear();
+        retain_all_values_ = diff_mode == DiffMode::AllValuesAfterRun;
+        remaining_uses_.clear();
         try {
             if (resources.skip_artifact_digest_checks) {
                 std::cerr << "WARNING: rank " << rank_
@@ -84,6 +91,7 @@ public:
             const PlanRequirements requirements = PlanVerifier::verify(
                 *plan_, resources.operator_spec, resources.skip_artifact_digest_checks);
             PlanVerifier::verify_runtime_target(*plan_, rank_, world_size_, local_devices_);
+            initialize_use_counts();
             load_bundle(resources);
             api_.preflight(loaded_plan.source_sha256,
                            resources.skip_artifact_digest_checks,
@@ -107,6 +115,7 @@ public:
 private:
     struct PendingGroup {
         CommAction action;
+        std::vector<ValueId> local_input_ids;
         std::vector<ValueId> local_output_ids;
         CommHandle handle;
         bool completed = false;
@@ -197,6 +206,7 @@ private:
         const auto &output_desc = desc(op.output);
         api_.validate_value(output, output_desc);
         store_.define_ready(op.output, op.place, std::move(output));
+        for (ValueId id : op.inputs) release_after_use(id);
     }
 
     void execute_communication(const CommAction &action) {
@@ -205,6 +215,9 @@ private:
             if (action.sources[i].rank == rank_) local_inputs.push_back(ensure_ready(action.inputs[i], action.sources[i]));
         PendingGroup group;
         group.action = action;
+        for (std::size_t i = 0; i < action.inputs.size(); ++i)
+            if (action.sources[i].rank == rank_)
+                group.local_input_ids.push_back(action.inputs[i]);
         group.handle = api_.communicate_async(action, local_inputs);
         const std::size_t group_id = groups_.size();
         for (std::size_t i = 0; i < action.outputs.size(); ++i) {
@@ -227,7 +240,39 @@ private:
             api_.validate_value(outputs[i], expected_desc);
             store_.lookup(id) = typename ValueStore<Api>::Ready{expected_desc.place, std::move(outputs[i])};
         }
+        for (ValueId id : group.local_input_ids) release_after_use(id);
         group.completed = true;
+    }
+
+    void initialize_use_counts() {
+        if (retain_all_values_) return;
+        const auto count_phase = [&](const std::vector<Instruction> &instructions) {
+            for (const auto &instruction : instructions) {
+                if (const auto *op = std::get_if<ComputeOp>(&instruction.body)) {
+                    if (op->place.rank != rank_) continue;
+                    for (ValueId id : op->inputs) ++remaining_uses_[id];
+                } else if (const auto *action =
+                               std::get_if<CommAction>(&instruction.body)) {
+                    for (std::size_t i = 0; i < action->inputs.size(); ++i)
+                        if (action->sources[i].rank == rank_)
+                            ++remaining_uses_[action->inputs[i]];
+                }
+            }
+        };
+        count_phase(plan_->initialization);
+        count_phase(plan_->execution);
+        count_phase(plan_->finalization);
+        for (ValueId id : plan_->final_outputs)
+            if (desc(id).place.rank == rank_) ++remaining_uses_[id];
+    }
+
+    void release_after_use(ValueId id) {
+        if (retain_all_values_) return;
+        auto found = remaining_uses_.find(id);
+        if (found == remaining_uses_.end() || found->second == 0)
+            throw std::runtime_error("ValueId has no remaining local use: " +
+                                     std::to_string(id));
+        if (--found->second == 0) store_.erase(id);
     }
 
     void finish_all_groups() {
@@ -293,6 +338,8 @@ private:
     ValueStore<Api> store_;
     std::vector<PendingGroup> groups_;
     std::map<std::string, std::vector<double>> bundle_slots_;
+    std::unordered_map<ValueId, std::size_t> remaining_uses_;
+    bool retain_all_values_ = false;
 };
 
 } // namespace fhegpu

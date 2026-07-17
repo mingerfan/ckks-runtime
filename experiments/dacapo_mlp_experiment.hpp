@@ -56,6 +56,34 @@ inline std::vector<double> make_input(std::size_t slot_count) {
     return input;
 }
 
+inline std::vector<double> pack_mlp_input(const std::vector<double> &logical) {
+    if (logical.size() != 784)
+        throw std::runtime_error("MLP logical input must contain 784 values");
+    std::vector<double> packed;
+    packed.reserve(1600);
+    for (std::size_t block_index = 0; block_index < 8; ++block_index) {
+        std::vector<double> block(100, 0.0);
+        const std::size_t begin = block_index * 100;
+        const std::size_t count = std::min<std::size_t>(100, logical.size() - begin);
+        std::copy_n(logical.begin() + begin, count, block.begin());
+        packed.insert(packed.end(), block.begin(), block.end());
+        packed.insert(packed.end(), block.begin(), block.end());
+    }
+    return packed;
+}
+
+inline void set_input(Context &context, std::vector<double> input) {
+    if (input.size() > context.slot_capacity)
+        throw std::runtime_error("MLP input exceeds CKKS slot capacity");
+    input.resize(context.slot_capacity, 0.0);
+    const auto &input_desc =
+        find_value(context.loaded_plan.plan, context.input_id);
+    context.input = make_cipher(
+        std::move(input), input_desc.context,
+        context.operator_spec.spec.poly_degree, input_desc.level,
+        input_desc.scale_log2, input_desc.ntt, input_desc.components);
+}
+
 inline Context load_context(const std::filesystem::path &plan_path,
                             const std::filesystem::path &operator_spec_path,
                             std::filesystem::path bundle_dir) {
@@ -66,13 +94,9 @@ inline Context load_context(const std::filesystem::path &plan_path,
     if (context.loaded_plan.plan.external_inputs.size() != 1)
         throw std::runtime_error("experiment requires exactly one external input");
     context.input_id = context.loaded_plan.plan.external_inputs.front();
-    const auto &input_desc = find_value(context.loaded_plan.plan, context.input_id);
     context.slot_capacity =
         static_cast<std::size_t>(context.operator_spec.spec.poly_degree / 2);
-    context.input = make_cipher(
-        make_input(context.slot_capacity), input_desc.context,
-        context.operator_spec.spec.poly_degree, input_desc.level,
-        input_desc.scale_log2, input_desc.ntt, input_desc.components);
+    set_input(context, make_input(context.slot_capacity));
     return context;
 }
 

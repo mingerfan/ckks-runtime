@@ -49,13 +49,13 @@ def parse_device_counts(value: Optional[str]) -> list[int]:
     return counts
 
 
-def read_operator_spec(path: Path) -> tuple[dict, str, Path]:
+def read_operator_spec(path: Path) -> tuple[dict, str]:
     content = path.read_bytes()
     spec = json.loads(content)
     if not isinstance(spec, dict):
         raise ValueError("OperatorSpec root must be an object")
-    if spec.get("spec_format_version") != 2:
-        raise ValueError("Dacapo artifact generation requires OperatorSpec V2")
+    if spec.get("spec_format_version") not in {1, 2}:
+        raise ValueError("Dacapo artifact generation requires OperatorSpec V1 or V2")
     require_string(spec.get("spec_id"), "$.spec_id")
     require_positive_integer(spec.get("version"), "$.version")
     require_string(spec.get("target_id"), "$.target_id")
@@ -72,9 +72,16 @@ def read_operator_spec(path: Path) -> tuple[dict, str, Path]:
     if not isinstance(relinearize, dict) or relinearize.get("supported") is not True:
         raise ValueError("OperatorSpec must support relinearize")
 
+    return spec, sha256(content)
+
+
+def compiler_profile_from_provenance(spec: dict) -> Path:
     provenance = spec.get("provenance")
     if not isinstance(provenance, dict) or provenance.get("kind") != "dacapo-profile-json":
-        raise ValueError("OperatorSpec provenance must reference a Dacapo profile JSON")
+        raise ValueError(
+            "--compiler-profile is required when OperatorSpec provenance "
+            "does not reference a Dacapo profile JSON"
+        )
     source_path = require_string(provenance.get("path"), "$.provenance.path")
     source_digest = require_string(
         provenance.get("source_sha256"), "$.provenance.source_sha256"
@@ -85,20 +92,36 @@ def read_operator_spec(path: Path) -> tuple[dict, str, Path]:
     if sha256(compiler_profile.read_bytes()) != source_digest:
         raise ValueError("Dacapo compiler profile does not match OperatorSpec provenance")
 
+    return compiler_profile
+
+
+def select_boot_profile(spec: dict, profile_id: Optional[str]) -> dict:
     boot_profiles = spec.get("boot_profiles")
-    if not isinstance(boot_profiles, list) or len(boot_profiles) != 1:
-        raise ValueError("Dacapo artifact generation requires exactly one boot profile")
-    boot = boot_profiles[0]
+    if not isinstance(boot_profiles, list) or not boot_profiles:
+        raise ValueError("OperatorSpec must contain a boot profile")
+    if profile_id is None:
+        if len(boot_profiles) != 1:
+            raise ValueError(
+                "--boot-profile is required when OperatorSpec has multiple boot profiles"
+            )
+        boot = boot_profiles[0]
+    else:
+        matches = [
+            profile for profile in boot_profiles
+            if isinstance(profile, dict) and profile.get("profile_id") == profile_id
+        ]
+        if len(matches) != 1:
+            raise ValueError("--boot-profile does not name exactly one profile")
+        boot = matches[0]
     if not isinstance(boot, dict):
-        raise ValueError("$.boot_profiles[0] must be an object")
-    require_string(boot.get("profile_id"), "$.boot_profiles[0].profile_id")
+        raise ValueError("boot profile must be an object")
+    require_string(boot.get("profile_id"), "boot profile id")
     implementation = require_string(
-        boot.get("implementation"), "$.boot_profiles[0].implementation"
+        boot.get("implementation"), "boot profile implementation"
     )
     if implementation not in {"native", "decrypt_reencrypt"}:
         raise ValueError("unsupported boot implementation")
-
-    return spec, sha256(content), compiler_profile
+    return boot
 
 
 def trace_model(model: str, output_dir: Path, python: Path,
@@ -135,8 +158,8 @@ def trace_model(model: str, output_dir: Path, python: Path,
 
 def build_optimizer_command(args, traced: Path, spec: dict,
                             spec_digest: str, compiler_profile: Path,
+                            boot: dict,
                             output_dir: Path) -> list[str]:
-    boot = spec["boot_profiles"][0]
     optimized = output_dir / f"{args.model}.optimized.mlir"
     command = [
         str(args.hecate_opt),
@@ -182,6 +205,14 @@ def main() -> None:
     )
     parser.add_argument("model", choices=sorted(MODELS))
     parser.add_argument("--operator-spec", type=Path, required=True)
+    parser.add_argument(
+        "--compiler-profile", type=Path,
+        help="Dacapo profile used for level and scale analysis; defaults to OperatorSpec provenance",
+    )
+    parser.add_argument(
+        "--boot-profile",
+        help="Boot profile id; required when OperatorSpec contains more than one profile",
+    )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--traced-mlir", type=Path,
                         help="Use an existing Earth MLIR file instead of running Python tracing")
@@ -227,6 +258,8 @@ def main() -> None:
         raise ValueError("--inter-rank-communication-cost must be positive")
 
     args.operator_spec = args.operator_spec.resolve()
+    if args.compiler_profile:
+        args.compiler_profile = args.compiler_profile.resolve()
     args.placement_operator_spec = (
         args.placement_operator_spec or args.operator_spec
     ).resolve()
@@ -235,7 +268,15 @@ def main() -> None:
     args.python = Path(os.path.abspath(args.python))
     output_dir = (args.output_dir or
                   (DACAPO / "review_artifacts" / args.model)).resolve()
-    spec, spec_digest, compiler_profile = read_operator_spec(args.operator_spec)
+    spec, spec_digest = read_operator_spec(args.operator_spec)
+    compiler_profile = (
+        args.compiler_profile or compiler_profile_from_provenance(spec)
+    )
+    if not compiler_profile.is_file():
+        raise FileNotFoundError(f"Dacapo compiler profile not found: {compiler_profile}")
+    boot = select_boot_profile(spec, args.boot_profile)
+    if args.device_counts and spec["spec_format_version"] != 2:
+        raise ValueError("placement requires OperatorSpec V2")
 
     if args.traced_mlir:
         traced = args.traced_mlir.resolve()
@@ -249,7 +290,7 @@ def main() -> None:
                              args.hecate_build)
 
     command = build_optimizer_command(
-        args, traced, spec, spec_digest, compiler_profile, output_dir
+        args, traced, spec, spec_digest, compiler_profile, boot, output_dir
     )
     if args.dry_run:
         print(shlex.join(command))

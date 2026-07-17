@@ -26,7 +26,7 @@ nix develop --command ctest --test-dir build/nix --output-on-failure
 
 ## 生成模型审阅产物
 
-`generate_model_artifacts.py` 从选定的 OperatorSpec V2 读取 target、spec id/version、context 和 Boot 配置，并根据 OperatorSpec 文件的完整原始字节计算 RuntimePlan 使用的 SHA-256。它还会校验 `provenance` 指向的旧 Dacapo profile，摘要不一致时直接失败。
+`generate_model_artifacts.py` 从选定的 OperatorSpec V1 或 V2 读取 target、spec id/version、context 和 Boot 配置，并根据 OperatorSpec 文件的完整原始字节计算 RuntimePlan 使用的 SHA-256。V2 默认校验 `provenance` 指向的旧 Dacapo profile；没有这份 provenance 时必须显式传入 `--compiler-profile`。多个 Boot profile 必须用 `--boot-profile` 选定一个。placement 仍只接受 V2。
 
 生成 MLP：
 
