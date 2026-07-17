@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -32,6 +33,20 @@ def require_positive_integer(value, path: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"{path} must be a positive integer")
     return value
+
+
+def parse_device_counts(value: Optional[str]) -> list[int]:
+    if value is None:
+        return []
+    parts = value.split("x")
+    if not parts or any(not part.isdecimal() for part in parts):
+        raise ValueError(
+            "--device-counts must contain positive integers separated by x"
+        )
+    counts = [int(part) for part in parts]
+    if any(count < 1 or count > (1 << 31) - 1 for count in counts):
+        raise ValueError("--device-counts entries must be positive int32 values")
+    return counts
 
 
 def read_operator_spec(path: Path) -> tuple[dict, str, Path]:
@@ -123,7 +138,7 @@ def build_optimizer_command(args, traced: Path, spec: dict,
                             output_dir: Path) -> list[str]:
     boot = spec["boot_profiles"][0]
     optimized = output_dir / f"{args.model}.optimized.mlir"
-    return [
+    command = [
         str(args.hecate_opt),
         "--dacapo",
         f"--ckks-config={compiler_profile}",
@@ -140,15 +155,25 @@ def build_optimizer_command(args, traced: Path, spec: dict,
         f"--runtime-plan-operator-spec-version={spec['version']}",
         f"--runtime-plan-operator-spec-sha256={spec_digest}",
         f"--runtime-plan-context-id={spec['context']['context_id']}",
-        "--runtime-plan-device-count=0",
         "--runtime-plan-ntt=true",
         f"--runtime-plan-boot-profile={boot['profile_id']}",
         f"--runtime-plan-boot-implementation={boot['implementation']}",
         f"--runtime-plan-inline-payload-max-bytes={args.inline_payload_max_bytes}",
-        str(traced),
-        "-o",
-        str(optimized),
     ]
+    if args.device_counts:
+        command.extend([
+            f"--runtime-plan-device-counts={args.device_counts}",
+            "--runtime-plan-operator-spec-path="
+            f"{args.placement_operator_spec}",
+            "--runtime-plan-intra-rank-communication-cost="
+            f"{args.intra_rank_communication_cost}",
+            "--runtime-plan-inter-rank-communication-cost="
+            f"{args.inter_rank_communication_cost}",
+        ])
+    else:
+        command.append("--runtime-plan-device-count=0")
+    command.extend([str(traced), "-o", str(optimized)])
+    return command
 
 
 def main() -> None:
@@ -168,6 +193,22 @@ def main() -> None:
     parser.add_argument("--waterline", type=int, default=40)
     parser.add_argument("--plan-id", type=int, default=1)
     parser.add_argument("--inline-payload-max-bytes", type=int, default=4096)
+    parser.add_argument(
+        "--device-counts",
+        help="Enable placement with x-separated per-rank counts, e.g. 8 or 8x8",
+    )
+    parser.add_argument(
+        "--placement-operator-spec", type=Path,
+        help="OperatorSpec V2 used for placement latency; defaults to --operator-spec",
+    )
+    parser.add_argument(
+        "--intra-rank-communication-cost", type=int, default=1000,
+        help="Fixed point-to-point cost between devices in one rank",
+    )
+    parser.add_argument(
+        "--inter-rank-communication-cost", type=int, default=10000,
+        help="Fixed point-to-point cost between ranks",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -179,8 +220,16 @@ def main() -> None:
         raise ValueError("--inline-payload-max-bytes must be nonnegative")
     if args.inline_payload_max_bytes > (1 << 53) - 1:
         raise ValueError("--inline-payload-max-bytes exceeds the safe JSON integer range")
+    parse_device_counts(args.device_counts)
+    if args.intra_rank_communication_cost < 1:
+        raise ValueError("--intra-rank-communication-cost must be positive")
+    if args.inter_rank_communication_cost < 1:
+        raise ValueError("--inter-rank-communication-cost must be positive")
 
     args.operator_spec = args.operator_spec.resolve()
+    args.placement_operator_spec = (
+        args.placement_operator_spec or args.operator_spec
+    ).resolve()
     args.hecate_build = args.hecate_build.resolve()
     args.hecate_opt = args.hecate_opt.resolve()
     args.python = Path(os.path.abspath(args.python))

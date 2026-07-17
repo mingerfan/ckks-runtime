@@ -50,6 +50,11 @@ target("dacapo_mlp_vec_experiment")
     add_files("experiments/dacapo_mlp_vec.cpp")
     add_deps("runtime_plan_json")
 
+target("dacapo_plan_vec_diff")
+    set_kind("binary")
+    add_files("experiments/dacapo_plan_vec_diff.cpp")
+    add_deps("runtime_plan_json")
+
 target("mpi_runtime_test")
     set_kind("binary")
     add_files("tests/mpi_runtime_test.cpp", "api/mpi_api.cpp")

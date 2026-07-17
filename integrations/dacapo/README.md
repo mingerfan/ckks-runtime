@@ -20,7 +20,9 @@ nix develop --command cmake --build --preset nix
 nix develop --command ctest --test-dir build/nix --output-on-failure
 ```
 
-当前 `emit-runtime-plan` Pass 输出单 Host RuntimePlan V1，文件名是 `<prefix>.<func>.runtime-plan.json`。Dacapo 的 CKKS MLIR 使用纯 SSA result-style，不再生成 `dst` 和 `tensor.empty`。target、OperatorSpec 引用和 context 必须通过 Pass option 明确提供。Encode payload 默认以 4096 字节为界：不超过阈值的常量内联到 JSON，超过阈值的 float64 常量写入 `<prefix>.<func>.bundle/`；相同内容按 SHA-256 复用同一个 blob。直接读取 OperatorSpec、placement 和通信仍留给后续 Pass。
+`emit-runtime-plan` 输出 RuntimePlan V1，文件名是 `<prefix>.<func>.runtime-plan.json`。Dacapo 的 CKKS MLIR 使用纯 SSA result-style，不再生成 `dst` 和 `tensor.empty`。target、OperatorSpec 引用和 context 必须通过 Pass option 明确提供。Encode payload 默认以 4096 字节为界：不超过阈值的常量内联到 JSON，超过阈值的 float64 常量写入 `<prefix>.<func>.bundle/`；相同内容按 SHA-256 复用同一个 blob。
+
+不传 `--device-counts` 时生成原来的单 Host 计划。传入后，编译器用 OperatorSpec V2 的逐 level 延迟做确定性 HEFT placement，再为跨 Place 操作数插入 1 对 1 的 `point_to_point` Transfer。`8` 表示 1 rank × 8 devices，`8x8` 表示 2 ranks × 8 devices。通信代价目前是与算子延迟同一调度单位的两个固定整数，只是占位值，不按字节数计算，也不是实测传输耗时。
 
 ## 生成模型审阅产物
 
@@ -51,3 +53,44 @@ python3 integrations/dacapo/generate_model_artifacts.py mlp \
 ```
 
 使用 `--dry-run` 可以只检查 OperatorSpec、旧 profile 摘要并打印完整的 `hecate-opt` 命令，不执行编译。
+
+## 生成并检查多 rank MLP
+
+先保留一份 Host 参考计划，再把两个拓扑输出到不同目录：
+
+```bash
+python3 integrations/dacapo/generate_model_artifacts.py mlp \
+  --operator-spec docs/operator-spec/v2/profiles/dacapo-heaan-cpu.v1.json \
+  --traced-mlir third_party/dacapo/review_artifacts/mlp/mlp.traced.earth.mlir \
+  --output-dir third_party/dacapo/review_artifacts/mlp/host
+
+python3 integrations/dacapo/generate_model_artifacts.py mlp \
+  --operator-spec docs/operator-spec/v2/profiles/dacapo-heaan-cpu.v1.json \
+  --traced-mlir third_party/dacapo/review_artifacts/mlp/mlp.traced.earth.mlir \
+  --device-counts 8 \
+  --output-dir third_party/dacapo/review_artifacts/mlp/1x8
+
+python3 integrations/dacapo/generate_model_artifacts.py mlp \
+  --operator-spec docs/operator-spec/v2/profiles/dacapo-heaan-cpu.v1.json \
+  --traced-mlir third_party/dacapo/review_artifacts/mlp/mlp.traced.earth.mlir \
+  --device-counts 8x8 \
+  --output-dir third_party/dacapo/review_artifacts/mlp/2x8
+```
+
+构建通用 VecApi 差分程序：
+
+```bash
+xmake build dacapo_plan_vec_diff
+```
+
+程序依次接收 Host 计划、分布式计划、OperatorSpec、两份 bundle 目录和报告路径。它先检查原 CKKS ValueId/算子/操作数与 Transfer 谱系，再用 `DiffMode::AllValuesAfterRun` 执行两份计划，比较每条 Encode、Compute、Transfer，最后单独再比较 final output。没有 bundle 时对应参数写 `-`。
+
+```bash
+build/dacapo_plan_vec_diff \
+  third_party/dacapo/review_artifacts/mlp/host/mlp.optimized._hecate_MLP.runtime-plan.json \
+  third_party/dacapo/review_artifacts/mlp/2x8/mlp.optimized._hecate_MLP.runtime-plan.json \
+  docs/operator-spec/v2/profiles/dacapo-heaan-cpu.v1.json \
+  third_party/dacapo/review_artifacts/mlp/host/mlp.optimized._hecate_MLP.bundle \
+  third_party/dacapo/review_artifacts/mlp/2x8/mlp.optimized._hecate_MLP.bundle \
+  third_party/dacapo/review_artifacts/mlp/2x8/vec.diff.txt
+```
