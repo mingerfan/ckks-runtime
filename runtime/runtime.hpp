@@ -3,6 +3,8 @@
 #include "runtime/plaintext_bundle.hpp"
 #include "runtime/verifier.hpp"
 
+#include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <map>
@@ -25,8 +27,23 @@ struct RuntimeResources {
 template <class Value>
 struct ArtifactValue { Place place; Value value; };
 
+// Wall time inside Api::compute. Asynchronous APIs report submission time.
+struct RuntimeTiming {
+    std::size_t compute_calls = 0;
+    std::size_t boot_calls = 0;
+    std::uint64_t compute_including_boot_nanoseconds = 0;
+    std::uint64_t boot_nanoseconds = 0;
+
+    std::uint64_t compute_excluding_boot_nanoseconds() const {
+        return compute_including_boot_nanoseconds - boot_nanoseconds;
+    }
+};
+
 template <class Value>
-struct RunArtifact { std::map<ValueId, ArtifactValue<Value>> values; };
+struct RunArtifact {
+    std::map<ValueId, ArtifactValue<Value>> values;
+    RuntimeTiming timing;
+};
 
 template <class Api>
 class ValueStore {
@@ -82,6 +99,7 @@ public:
         bundle_slots_.clear();
         retain_all_values_ = diff_mode == DiffMode::AllValuesAfterRun;
         remaining_uses_.clear();
+        timing_ = RuntimeTiming{};
         try {
             if (resources.skip_artifact_digest_checks) {
                 std::cerr << "WARNING: rank " << rank_
@@ -202,7 +220,18 @@ private:
         if (op.place.rank != rank_) return;
         std::vector<Value> inputs;
         for (ValueId id : op.inputs) inputs.push_back(ensure_ready(id, op.place));
+        const auto start = std::chrono::steady_clock::now();
         Value output = api_.compute(op, inputs);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start);
+        const auto elapsed_nanoseconds =
+            static_cast<std::uint64_t>(elapsed.count());
+        ++timing_.compute_calls;
+        timing_.compute_including_boot_nanoseconds += elapsed_nanoseconds;
+        if (op.kind == ComputeKind::Boot) {
+            ++timing_.boot_calls;
+            timing_.boot_nanoseconds += elapsed_nanoseconds;
+        }
         const auto &output_desc = desc(op.output);
         api_.validate_value(output, output_desc);
         store_.define_ready(op.output, op.place, std::move(output));
@@ -291,6 +320,7 @@ private:
 
     RunArtifact<Value> make_artifact(DiffMode mode) {
         RunArtifact<Value> result;
+        result.timing = timing_;
         if (mode == DiffMode::AllValuesAfterRun) {
             for (const auto &item : store_.entries())
                 if (const auto *ready = std::get_if<typename ValueStore<Api>::Ready>(&item.second))
@@ -339,6 +369,7 @@ private:
     std::vector<PendingGroup> groups_;
     std::map<std::string, std::vector<double>> bundle_slots_;
     std::unordered_map<ValueId, std::size_t> remaining_uses_;
+    RuntimeTiming timing_;
     bool retain_all_values_ = false;
 };
 

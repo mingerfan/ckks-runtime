@@ -160,6 +160,13 @@ void test_inline_encode_and_host_compute() {
                         [](double value) { return value == 0.0; }),
             "Host AddCP padding is not zero");
     require(result.stats[0].compute_calls == 1, "Host compute was not executed");
+    const auto &timing = result.artifacts[0].timing;
+    require(timing.compute_calls == 1 && timing.boot_calls == 0,
+            "Host compute timing counts are wrong");
+    require(timing.boot_nanoseconds == 0 &&
+                timing.compute_excluding_boot_nanoseconds() ==
+                    timing.compute_including_boot_nanoseconds,
+            "Host compute timing split is wrong");
 }
 
 void test_device_compute_and_value_validation() {
@@ -223,6 +230,12 @@ void test_boot_paths() {
         const auto result = run_mock_cluster(loaded.plan, spec, {{1, input}}, {}, {}, DiffMode::FinalOnly);
         const auto output = result.artifacts[0].values.at(loaded.plan.final_outputs[0]).value.materialize();
         require(output.metadata.level == 12 && output.metadata.scale_log2 == 40, name + " did not execute");
+        const auto &timing = result.artifacts[0].timing;
+        require(timing.compute_calls == 1 && timing.boot_calls == 1,
+                name + " timing counts are wrong");
+        require(timing.compute_including_boot_nanoseconds == timing.boot_nanoseconds &&
+                    timing.compute_excluding_boot_nanoseconds() == 0,
+                name + " Boot timing split is wrong");
     }
 }
 
