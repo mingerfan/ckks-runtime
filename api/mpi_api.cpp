@@ -22,11 +22,12 @@ MpiVecApi::MpiVecApi(MPI_Comm communicator) : communicator_(communicator), execu
     int *tag_limit = nullptr;
     int present = 0;
     check_mpi(MPI_Comm_get_attr(communicator_, MPI_TAG_UB, &tag_limit, &present), "MPI_Comm_get_attr(MPI_TAG_UB)");
-    if (!present || !tag_limit) throw std::runtime_error("MPI_TAG_UB is unavailable");
-    tag_upper_bound_ = *tag_limit;
+    if (present && tag_limit) tag_upper_bound_ = *tag_limit;
 }
 
 int MpiVecApi::tag(TransferId id, std::size_t slot, int part) const {
+    if (tag_upper_bound_ < 0)
+        throw std::runtime_error("MPI_TAG_UB is unavailable for communication");
     if (slot >= 32 || part < 0 || part > 1) throw std::runtime_error("MPI communication output slot exceeds tag layout");
     const std::uint64_t suffix = slot * 2ULL + static_cast<std::uint64_t>(part);
     const std::uint64_t upper_bound = static_cast<std::uint64_t>(tag_upper_bound_);
@@ -67,7 +68,12 @@ MpiVecApi::Value MpiVecApi::compute(const ComputeOp &op, const std::vector<Value
 
 MpiVecApi::Value MpiVecApi::encode_plaintext(const ValueDesc &output_desc,
                                              const std::vector<double> &slots) {
-    return make_plain(slots, output_desc.context, poly_degree_, output_desc.level,
+    const std::size_t slot_capacity = static_cast<std::size_t>(poly_degree_ / 2);
+    if (slots.size() > slot_capacity)
+        throw std::runtime_error("plaintext payload exceeds CKKS slot capacity");
+    std::vector<double> padded = slots;
+    padded.resize(slot_capacity, 0.0);
+    return make_plain(std::move(padded), output_desc.context, poly_degree_, output_desc.level,
                       output_desc.scale_log2, output_desc.ntt);
 }
 

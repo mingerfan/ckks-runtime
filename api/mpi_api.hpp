@@ -73,7 +73,7 @@ private:
     MPI_Comm communicator_;
     int rank_ = 0;
     int world_size_ = 0;
-    int tag_upper_bound_ = 0;
+    int tag_upper_bound_ = -1;
     VecExecutor executor_;
     std::uint64_t poly_degree_ = 0;
 };

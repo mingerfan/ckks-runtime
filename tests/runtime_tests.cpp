@@ -23,6 +23,11 @@ void require(bool condition, const std::string &message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+std::vector<double> padded(std::vector<double> values, std::size_t size) {
+    values.resize(size, 0.0);
+    return values;
+}
+
 template <class Function>
 void expect_throw(Function function, const std::string &needle = {}) {
     try { function(); }
@@ -134,12 +139,26 @@ void test_all_compute_metadata_rules() {
 void test_inline_encode_and_host_compute() {
     const auto loaded = RuntimePlanJsonReader::read_file(plan_path("valid", "v001_inline_encode_host_compute.json").string());
     const auto spec = load_spec(loaded.plan);
-    const auto input = make_cipher({10, 20, 30, 40}, "ctx-main", 32768, 5, 40);
+    const auto input = make_cipher(padded({10, 20, 30, 40}, spec.spec.poly_degree / 2),
+                                   "ctx-main", 32768, 5, 40);
     const auto result = run_mock_cluster(loaded.plan, spec, {{1, input}}, {}, {}, DiffMode::AllValuesAfterRun);
     const auto encoded = result.artifacts[0].values.at(2).value.materialize();
-    require(encoded.slots == std::vector<double>({1, 0, 3.5, -2}), "inline Encode slots are wrong");
+    const std::vector<double> encoded_prefix{1, 0, 3.5, -2};
+    require(encoded.slots.size() == spec.spec.poly_degree / 2,
+            "inline Encode did not fill the CKKS slot capacity");
+    require(std::equal(encoded_prefix.begin(), encoded_prefix.end(), encoded.slots.begin()),
+            "inline Encode prefix is wrong");
+    require(std::all_of(encoded.slots.begin() + 4, encoded.slots.end(),
+                        [](double value) { return value == 0.0; }),
+            "inline Encode padding is not zero");
     require(!std::signbit(encoded.slots[1]), "Encode did not normalize negative zero");
-    require(result.artifacts[0].values.at(3).value.materialize().slots == std::vector<double>({11, 20, 33.5, 38}), "Host AddCP result is wrong");
+    const auto computed = result.artifacts[0].values.at(3).value.materialize();
+    const std::vector<double> computed_prefix{11, 20, 33.5, 38};
+    require(std::equal(computed_prefix.begin(), computed_prefix.end(), computed.slots.begin()),
+            "Host AddCP result prefix is wrong");
+    require(std::all_of(computed.slots.begin() + 4, computed.slots.end(),
+                        [](double value) { return value == 0.0; }),
+            "Host AddCP padding is not zero");
     require(result.stats[0].compute_calls == 1, "Host compute was not executed");
 }
 
@@ -168,7 +187,11 @@ void test_bundle_reuse_and_rank_local_files() {
     const auto reuse_result = run_mock_cluster(reuse.plan, reuse_spec, {}, {}, {}, DiffMode::FinalOnly, false, {local});
     const auto first = reuse_result.artifacts[0].values.at(1).value.materialize();
     const auto second = reuse_result.artifacts[0].values.at(2).value.materialize();
-    require(first.slots == std::vector<double>({1, 0, 3.5, -2}) && first.slots == second.slots &&
+    const std::vector<double> bundle_prefix{1, 0, 3.5, -2};
+    require(first.slots.size() == reuse_spec.spec.poly_degree / 2 && first.slots == second.slots &&
+            std::equal(bundle_prefix.begin(), bundle_prefix.end(), first.slots.begin()) &&
+            std::all_of(first.slots.begin() + 4, first.slots.end(),
+                        [](double value) { return value == 0.0; }) &&
             first.metadata.level == 5 && second.metadata.level == 4 &&
             first.metadata.scale_log2 == 40 && second.metadata.scale_log2 == 20,
             "one bundle content was not encoded with two ValueDesc settings");
@@ -177,10 +200,16 @@ void test_bundle_reuse_and_rank_local_files() {
     const auto multi_spec = load_spec(multi.plan);
     const auto rank0 = make_rank_bundle("ckks-runtime-rank0", {});
     const auto rank1 = make_rank_bundle("ckks-runtime-rank1", {content});
-    const auto input = make_cipher({2, 3, 4, 5}, "ctx-main", 32768, 5, 40);
+    const auto input = make_cipher(padded({2, 3, 4, 5}, multi_spec.spec.poly_degree / 2),
+                                   "ctx-main", 32768, 5, 40);
     const auto result = run_mock_cluster(multi.plan, multi_spec, {{1, input}}, {}, {}, DiffMode::FinalOnly,
                                          false, {rank0, rank1});
-    require(result.artifacts[1].values.at(7).value.materialize().slots == std::vector<double>({2, 0, 14, -10}), "multi-rank bundle execution failed");
+    const auto multi_output = result.artifacts[1].values.at(7).value.materialize();
+    const std::vector<double> multi_prefix{2, 0, 14, -10};
+    require(std::equal(multi_prefix.begin(), multi_prefix.end(), multi_output.slots.begin()) &&
+            std::all_of(multi_output.slots.begin() + 4, multi_output.slots.end(),
+                        [](double value) { return value == 0.0; }),
+            "multi-rank bundle execution failed");
     std::filesystem::remove_all(local);
     std::filesystem::remove_all(rank0);
     std::filesystem::remove_all(rank1);
@@ -210,11 +239,21 @@ void test_preflight_and_digest_debug_mode() {
 
     const auto bad_spec_plan = RuntimePlanJsonReader::read_file(plan_path("invalid", "i011_operator_spec_digest_mismatch.json").string());
     const auto bad_plan_spec = load_spec(bad_spec_plan.plan);
-    expect_throw([&] { run_mock_cluster(bad_spec_plan.plan, bad_plan_spec, {{1, make_cipher({1, 2}, "ctx-main", 32768, 5, 40)}}, {}, {}, DiffMode::FinalOnly); }, "source SHA-256 mismatch");
-    run_mock_cluster(bad_spec_plan.plan, bad_plan_spec, {{1, make_cipher({1, 2, 3, 4}, "ctx-main", 32768, 5, 40)}}, {}, {}, DiffMode::FinalOnly, true);
+    expect_throw([&] {
+        run_mock_cluster(bad_spec_plan.plan, bad_plan_spec,
+            {{1, make_cipher(padded({1, 2}, bad_plan_spec.spec.poly_degree / 2),
+                             "ctx-main", 32768, 5, 40)}}, {}, {}, DiffMode::FinalOnly);
+    }, "source SHA-256 mismatch");
+    run_mock_cluster(bad_spec_plan.plan, bad_plan_spec,
+        {{1, make_cipher(padded({1, 2, 3, 4}, bad_plan_spec.spec.poly_degree / 2),
+                         "ctx-main", 32768, 5, 40)}}, {}, {}, DiffMode::FinalOnly, true);
     auto wrong_id_spec = bad_plan_spec;
     wrong_id_spec.spec.id = "wrong-spec";
-    expect_throw([&] { run_mock_cluster(bad_spec_plan.plan, wrong_id_spec, {{1, make_cipher({1, 2}, "ctx-main", 32768, 5, 40)}}, {}, {}, DiffMode::FinalOnly, true); }, "id/version mismatch");
+    expect_throw([&] {
+        run_mock_cluster(bad_spec_plan.plan, wrong_id_spec,
+            {{1, make_cipher(padded({1, 2}, wrong_id_spec.spec.poly_degree / 2),
+                             "ctx-main", 32768, 5, 40)}}, {}, {}, DiffMode::FinalOnly, true);
+    }, "id/version mismatch");
 
     auto check_cluster_preflight = [](bool skip0, bool skip1, std::string digest1, const std::string &needle) {
         MockClusterConfig config;

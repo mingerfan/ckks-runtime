@@ -96,7 +96,12 @@ MockVecApi::~MockVecApi() = default;
 
 MockVecApi::Value MockVecApi::encode_plaintext(const ValueDesc &output_desc,
                                                const std::vector<double> &slots) {
-    return make_plain(slots, output_desc.context, poly_degree_, output_desc.level,
+    const std::size_t slot_capacity = static_cast<std::size_t>(poly_degree_ / 2);
+    if (slots.size() > slot_capacity)
+        throw std::runtime_error("plaintext payload exceeds CKKS slot capacity");
+    std::vector<double> padded = slots;
+    padded.resize(slot_capacity, 0.0);
+    return make_plain(std::move(padded), output_desc.context, poly_degree_, output_desc.level,
                       output_desc.scale_log2, output_desc.ntt);
 }
 
