@@ -384,7 +384,7 @@ Host 上的实现步骤是:用 Poseidon CPU 路径解密和解码,再按目标 c
 
 ### 7.3 当前 placement 算法
 
-`assign-ckks-placement` 把每条非 Encode CKKS 指令看成 DAG 节点，把 SSA 数据依赖看成边。拓扑参数写成每个 rank 的 device 数，例如 `8` 表示 1 rank × 8 devices，`8x8` 表示 2 ranks × 8 devices。外部输入和 Encode 输出目前固定在 rank 0 的 Host，计算节点只能分到 Device；这是完整值放置，不切分密文或明文。
+`assign-ckks-placement` 把每条非 Encode CKKS 指令看成 DAG 节点，把 SSA 数据依赖看成边。拓扑参数写成每个 rank 的 device 数，例如 `8` 表示 1 rank × 8 devices，`8x8` 表示 2 ranks × 8 devices，`0x0` 表示 2 个只有 Host 的 CPU rank。外部输入和 Encode 输出目前固定在 rank 0 的 Host；全零拓扑把计算放到各 rank 的 Host，正数拓扑把计算放到 Device，零和正数不能混用。这是完整值放置，不切分密文或明文。
 
 当前使用确定性的 HEFT 列表调度：
 
@@ -394,9 +394,9 @@ Host 上的实现步骤是:用 Poseidon CPU 路径解密和解码,再按目标 c
 4. 选择完成时间最早的 device；完成时间相同时依次按开始时间、rank、device 和原始指令顺序决定，保证重复编译结果相同；
 5. 最后按计划开始时间重排指令，同时保留原 CKKS 逻辑 ValueId。
 
-每个 device 是一条不能重叠的计算时间线。跨 Place 边的到达时间等于生产者完成时间加通信代价；同一值已经传到某个目标后，后续消费者复用这个到达时间。rank 内和 rank 间暂时分别使用固定整数代价，通信之间不争用链路，因此这个模型适合先验证分配与协议正确性，不代表真实性能预测。当前还没有值大小、带宽、通信并发限制、显存容量、异构 device 或分片模型；Bootstrap placement 也会明确报错。
+每个候选 Place 是一条不能重叠的计算时间线。跨 Place 边的到达时间等于生产者完成时间加通信代价；同一值已经传到某个目标后，后续消费者复用这个到达时间。rank 内和 rank 间暂时分别使用固定整数代价，通信之间不争用链路，因此这个模型适合先验证分配与协议正确性，不代表真实性能预测。当前还没有值大小、带宽、通信并发限制、显存容量、异构 device 或分片模型。Boot 延迟从指定的 OperatorSpec V2 Boot profile 按输入 level 读取，缺少实测数据时直接失败。
 
-`device-counts` 接受任意非空的正整数列表，所以 `1x8`、`2x8` 之外的中小拓扑不需要改 IR 或算法。实际规模仍受 DAG 大小和候选 device 数影响；调度会为每个节点检查全部 device 及其时间线，不应把这个首版实现当成超大集群调度器。
+`device-counts` 接受任意非空的正整数列表或全零列表，所以 `1x8`、`2x8`、`2×CPU` 之外的中小拓扑不需要改 IR 或算法。实际规模仍受 DAG 大小和候选 Place 数影响；调度会为每个节点检查全部候选位置及其时间线，不应把这个首版实现当成超大集群调度器。
 
 ### 7.4 当前通信显式化
 

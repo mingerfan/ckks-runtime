@@ -41,11 +41,16 @@ def parse_device_counts(value: Optional[str]) -> list[int]:
     parts = value.split("x")
     if not parts or any(not part.isdecimal() for part in parts):
         raise ValueError(
-            "--device-counts must contain positive integers separated by x"
+            "--device-counts must contain nonnegative integers separated by x"
         )
     counts = [int(part) for part in parts]
-    if any(count < 1 or count > (1 << 31) - 1 for count in counts):
-        raise ValueError("--device-counts entries must be positive int32 values")
+    if any(count < 0 or count > (1 << 31) - 1 for count in counts):
+        raise ValueError("--device-counts entries must be nonnegative int32 values")
+    if not (all(count == 0 for count in counts) or
+            all(count > 0 for count in counts)):
+        raise ValueError(
+            "--device-counts must be all zero for CPU ranks or all positive"
+        )
     return counts
 
 
@@ -275,8 +280,10 @@ def main() -> None:
     if not compiler_profile.is_file():
         raise FileNotFoundError(f"Dacapo compiler profile not found: {compiler_profile}")
     boot = select_boot_profile(spec, args.boot_profile)
-    if args.device_counts and spec["spec_format_version"] != 2:
-        raise ValueError("placement requires OperatorSpec V2")
+    if args.device_counts:
+        placement_spec, _ = read_operator_spec(args.placement_operator_spec)
+        if placement_spec["spec_format_version"] != 2:
+            raise ValueError("placement requires OperatorSpec V2")
 
     if args.traced_mlir:
         traced = args.traced_mlir.resolve()

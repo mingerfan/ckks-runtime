@@ -19,13 +19,13 @@
 - Dacapo 的 CKKS `PolyType` 已保存 components、`scale_log2` 和 Runtime 方向的 level；全部 CKKS 算子使用纯 SSA result-style，不再携带 `dst` 或生成 `tensor.empty`；Earth 密文乘法下降为独立的 `ckks.mulcc` 和 `ckks.relinearize`。
 - `emit-runtime-plan` 支持单 Host 和已 placement 的函数：小 Encode payload 保持 inline，大 float64 payload 按阈值写入内容寻址 bundle，相同内容只保存一次；输出严格的 RuntimePlan V1 JSON，并覆盖 Mul/Relinearize、Upscale、常量、bundle 复用、Boot 层号换算、真实多 rank/device target 和点对点 Transfer。
 - 已增加 `dist.transfer`、`assign-ckks-placement` 和 `materialize-ckks-communication`。placement 使用确定性 HEFT、OperatorSpec V2 逐 level 延迟和固定 rank 内/间通信代价；当前是完整值放置，外部输入与 Encode 位于 Host rank 0，同一值到同一目标只复制一次。
-- 编译器 fixture 的 `1x8`/`2x8` 测试覆盖全部 device、点对点 hint、本地操作数、设备区间不重叠、依赖到达时间和重复编译确定性。MLP 的 Host/`1x8`/`2x8` 计划已用 MockVecApi `AllValuesAfterRun` 完成每条 Encode、Compute、Transfer 及 final output 的精确差分，均为 0 diff。
+- 编译器 fixture 的 `1x8`/`2x8`/`2×CPU` 测试覆盖全部候选 Place、点对点 hint、本地操作数、时间区间不重叠、依赖到达时间和重复编译确定性。MLP 的 Host/`1x8`/`2x8`/`2×CPU` 计划已用 MockVecApi `AllValuesAfterRun` 完成每条 Encode、Compute、Transfer 及 final output 的精确差分，均为 0 diff。
 - 已删除依赖 destination-style 的旧 `ReuseBuffer` Pass；`RemoveLevel` 仍保留注册但不进入新管线，`emit-hevm` 调用会直接报错。Python frontend 不再生成 `.cst` 索引。
 - 待完成：目标合法化、Bootstrap placement、Replicate 合并、分片、显存容量和基于值大小/带宽/链路争用的通信代价。当前 placement 已直接读取 OperatorSpec V2；RuntimePlan V1 无需增加字段。
 
 ## 阶段三进行中
 
-- Poseidon 仓库已经通过可选构建路径接入本 Runtime。`PoseidonCpuApi` 同时支持不依赖 MPI 的单进程模式和可选的 MPI 多进程模式；MPI 模式支持 Host rank 间的明文/密文 Transfer、Replicate、计划与 context 一致性检查及全组终止，手工 RuntimePlan 已在 2/4 rank 下通过端到端测试。
+- Poseidon 仓库已经通过可选构建路径接入本 Runtime。`PoseidonCpuApi` 同时支持不依赖 MPI 的单进程模式和可选的 MPI 多进程模式；MPI 模式支持 Host rank 间的明文/密文 Transfer、Replicate、计划与 context 一致性检查及全组终止。手工 RuntimePlan 已在 2/4 rank 下通过，Dacapo 生成的 2-rank MLP 也已完成 Poseidon、MockVecApi 和 Python 三方验证。
 - 单进程 `PoseidonGpuApi` 已从单卡兼容扩展到本机多卡：`Device(rank=0,index=i)` 映射到构造时给出的第 `i` 个物理 CUDA device，每张卡独立持有参数、Evaluator 和密钥缓存；旧单卡构造函数保持兼容。
 - 本机 GPU 通信已支持 Host↔Device、Device↔Device、Transfer 和 Replicate。跨卡复制先物化完整目标对象，再按拓扑使用 CUDA P2P 或 pinned Host 中转；V1 仍只接受单 field、单完整 shard 的值。
 - GPU compute 结果现在记录 CUDA completion event，不再在每个算子末尾无条件执行 `cudaDeviceSynchronize`。Runtime 继续按 Dacapo 的静态顺序提交，因此不同设备上的独立算子可以重叠；跨卡通信、下载和最终输出会等待源 Value。多级 Rescale 为保护本次调用中的临时对象仍保留一次同步。

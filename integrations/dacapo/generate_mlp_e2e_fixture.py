@@ -15,6 +15,12 @@ DEFAULT_OPERATOR_SPEC = (
     ROOT / "docs" / "operator-spec" / "v1" / "profiles" /
     "poseidon-ckks-cpu.v1.json"
 )
+DEFAULT_PLACEMENT_OPERATOR_SPEC = (
+    ROOT / "docs" / "operator-spec" / "v2" / "profiles" /
+    "dacapo-seal-cpu.v1.json"
+)
+BOOT_PROFILE_ID = "poseidon-cpu-boot-emulation-v1"
+BOOT_LATENCY_US = 500_000
 
 
 def sha256(path: Path) -> str:
@@ -60,6 +66,28 @@ def make_e2e_operator_spec(path: Path) -> dict:
     return spec
 
 
+def make_e2e_placement_operator_spec(path: Path) -> dict:
+    spec = json.loads(path.read_text(encoding="utf-8"))
+    if spec.get("spec_format_version") != 2:
+        raise ValueError("placement base OperatorSpec must use format V2")
+    spec["spec_id"] = "poseidon-ckks-cpu-seal-e2e-placement-v1"
+    spec["target_id"] = "poseidon-ckks-cpu"
+    spec["context"]["context_id"] = "poseidon-ckks-cpu-seal-e2e"
+    spec["levels"]["lower_bound"] = 1
+    if len(spec["boot_profiles"]) != 1:
+        raise ValueError("placement base OperatorSpec must contain one Boot profile")
+    profile = spec["boot_profiles"][0]
+    profile["profile_id"] = BOOT_PROFILE_ID
+    profile["output_level"] = 13
+    profile["output_scale_log2"] = 60
+    level_count = len(spec["context"]["rns_moduli_log2"])
+    profile["latency_us_by_input_level"] = [
+        0 if level < profile["input_level_min"] else BOOT_LATENCY_US
+        for level in range(level_count)
+    ]
+    return spec
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate one reproducible random MLP input and Python result"
@@ -72,6 +100,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--base-operator-spec", type=Path, default=DEFAULT_OPERATOR_SPEC,
+    )
+    parser.add_argument("--placement-operator-spec-output", type=Path)
+    parser.add_argument(
+        "--base-placement-operator-spec", type=Path,
+        default=DEFAULT_PLACEMENT_OPERATOR_SPEC,
     )
     parser.add_argument("--seed", type=int, default=20260717)
     args = parser.parse_args()
@@ -109,6 +142,20 @@ def main() -> None:
     )
     print(f"fixture: {output_path}")
     print(f"OperatorSpec: {operator_spec_path}")
+    if args.placement_operator_spec_output:
+        placement_path = args.placement_operator_spec_output.resolve()
+        placement_path.parent.mkdir(parents=True, exist_ok=True)
+        placement_path.write_text(
+            json.dumps(
+                make_e2e_placement_operator_spec(
+                    args.base_placement_operator_spec.resolve()
+                ),
+                indent=2,
+                allow_nan=False,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        print(f"placement OperatorSpec: {placement_path}")
 
 
 if __name__ == "__main__":
