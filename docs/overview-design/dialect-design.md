@@ -199,9 +199,9 @@ payload 有两种形态。小数据可以直接内联:
 
 两个 Encode 可以引用同一个 `content`,但输出不同的 ValueId。`content` 标识编码前的原始浮点数据;ValueId 标识按某组 context、level、`scale_log2` 和 NTT 参数编码后的 CKKS 明文。这两个身份不能混在一起。
 
-逻辑 CKKS 中的 `ckks.encode` 是确定性的纯算子,没有通信副作用;进入 RuntimePlan 后则是一条显式的初始化指令。它的输出 ValueDesc 必须是 Host plaintext,具体 rank 和编码参数都从该 ValueDesc 读取。当前 Dacapo fork 已让 destination-style `ckks.encode` 直接携带 MLIR `DenseElementsAttr`，旧 `.cst` 整数索引会被导出器拒绝。bundle 内容引用和大常量外化 Pass 仍是后续工作。
+逻辑 CKKS 中的 `ckks.encode` 是确定性的纯算子,没有通信副作用;进入 RuntimePlan 后则是一条显式的初始化指令。它的输出 ValueDesc 必须是 Host plaintext,具体 rank 和编码参数都从该 ValueDesc 读取。当前 Dacapo fork 的全部 CKKS 算子都使用纯 SSA result-style，不再携带 destination operand 或生成 `tensor.empty`；`ckks.encode` 直接携带 MLIR `DenseElementsAttr`，旧 `.cst` 整数索引会被导出器拒绝。
 
-内联形态适合小 mask 和手写测试；引用形态适合模型权重。明文数据外化 pass 可以按字节阈值把大的内联 payload 写入数据包并改写为引用形态，但 RuntimePlan 不要求全部外化，两种 payload 都是合法协议形式。
+内联形态适合小 mask 和手写测试；引用形态适合模型权重。当前 Dacapo RuntimePlan exporter 会按字节阈值把大的浮点 payload 写入内容寻址 bundle，小 payload 继续内联；RuntimePlan 不要求全部外化，两种 payload 都是合法协议形式。
 
 判断两个 `ckks.encode` 能否合并时，要先把 inline/bundle 都还原成同一套 float64 字节再比较，并同时比较完整输出描述。placement 完成后，输出 Place 也必须相同；否则即使原始数据相同，也不能共用一个 ValueId。
 

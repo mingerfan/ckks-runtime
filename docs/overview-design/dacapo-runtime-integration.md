@@ -618,7 +618,7 @@ Dacapo 测试模型
 
 1. Dacapo 作为可选 submodule 进入 Runtime;
 2. 把 Dacapo 现有 profile JSON 中的 CKKS 参数、算子延迟/噪声和 bootstrap 范围迁到版本化 OperatorSpec。注意 profile 里的 bootstrap level 上下界是 Earth 方向的数字,迁移时要做和 5.2 节一样的层号换算,不能照抄。已完成：三份旧 profile 已迁到 OperatorSpec V2，保留来源摘要和逐 level 代价;
-3. 在 Dacapo 里搭 MLIR 层的 RuntimePlan 产出管线,先支持单 Host 配置,把 `ckks.encode` 一对一导出成 Encode 指令,实现生成端自检和 JSON 写出。已完成：当前 Pass 支持线性单 block CKKS、inline/bundle Encode、按内容哈希复用大常量，并覆盖 Dacapo 当前会产生的 CKKS 计算算子;
+3. 在 Dacapo 里搭 MLIR 层的 RuntimePlan 产出管线,先支持单 Host 配置,把 `ckks.encode` 一对一导出成 Encode 指令,实现生成端自检和 JSON 写出。已完成：CKKS dialect 已改为无 `dst`/`tensor.empty` 的纯 SSA result-style，当前 Pass 支持线性单 block CKKS、inline/bundle Encode、按内容哈希复用大常量，并覆盖 Dacapo 当前会产生的 CKKS 计算算子;
 4. 接 CPU eager 和 GPU lazy 两种 rescale 管线,用 spec 决定是否启用 lazy-rescale;
 5. 加入可选的 GPU Boot→Host `decrypt_reencrypt` 合法化 Pass;
 6. 用 MockVecApi 建立真实编译产物的单卡端到端测试。基础链路已完成：Mul→Relinearize、Upscale、内联常量和 Boot level 换算均通过 Runtime verifier 与 MockVecApi;
