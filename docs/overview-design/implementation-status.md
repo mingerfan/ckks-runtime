@@ -23,8 +23,9 @@
 
 ## 阶段三进行中
 
-- Poseidon 仓库已经通过可选构建路径接入本 Runtime，并实现单进程、Host-only 的 `PoseidonCpuApi` 及最小端到端测试。
-- 下一步是单进程单卡的 `PoseidonGpuApi`：使用 Poseidon 的 `GpuUploader`、`GpuParameterData` 和 `GpuEvaluator`，支持 Host↔Device Transfer 与当前 GPU 库已有的普通 CKKS 算子。
+- Poseidon 仓库已经通过可选构建路径接入本 Runtime。`PoseidonCpuApi` 同时支持不依赖 MPI 的单进程模式和可选的 MPI 多进程模式；MPI 模式支持 Host rank 间的明文/密文 Transfer、Replicate、计划与 context 一致性检查及全组终止，手工 RuntimePlan 已在 2/4 rank 下通过端到端测试。
+- 单进程单卡 `PoseidonGpuApi` 已实现：使用 Poseidon 的 `GpuUploader`、`GpuParameterData` 和 `GpuEvaluator`，支持 Host↔Device Transfer 与当前 GPU 库已有的普通 CKKS 算子。
+- Dacapo 尚未生成多 rank placement 和 Transfer/Replicate；当前 Poseidon CPU MPI 测试使用手工构造的 RuntimePlan。
 - 生产 GPU OperatorSpec 尚未完成。当前 placeholder profile 使用 28-bit 模数且只允许两层 Rescale，不符合实际 30-bit 模数和 lazy Rescale 连续下降 4 层的设计；ModSwitch 和 Boot 也尚未实现，不能被真实 GPUApi 接受。
 
 这些内容不属于 RuntimePlan V1 冻结条件。

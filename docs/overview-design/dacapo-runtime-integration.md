@@ -1,6 +1,6 @@
 # Dacapo、Runtime 与 Poseidon 集成方案
 
-> 本文描述目标集成结构和迁移顺序。当前仓库已经加入可选的 Dacapo submodule。Poseidon 仓库已经有单进程、Host-only 的 `PoseidonCpuApi`，下一步是单进程单卡的 `PoseidonGpuApi`。Runtime 自身的完成情况见[实现状态](implementation-status.md)。
+> 本文描述目标集成结构和迁移顺序。当前仓库已经加入可选的 Dacapo submodule。Poseidon 仓库已经实现向下兼容的单进程/MPI `PoseidonCpuApi` 和单进程单卡 `PoseidonGpuApi`；Dacapo 的多 rank placement 与通信插入仍未完成。Runtime 自身的完成情况见[实现状态](implementation-status.md)。
 
 ## 1. 这份方案要解决什么问题
 
@@ -627,12 +627,12 @@ Dacapo 测试模型
 ### 阶段三:接入 Poseidon CPU/GPU
 
 1. 已完成：Poseidon 通过可选构建路径引入 Runtime;
-2. 已完成：单进程、Host-only 的 PoseidonCpuApi;
+2. 已完成：向下兼容的 PoseidonCpuApi；默认构造保持单进程 Host-only，MPI 构造支持 Host rank 间的 Transfer/Replicate，并已通过手工 2/4 rank RuntimePlan 测试;
 3. 先用真实 GPU context 和测量结果替换 placeholder GPU OperatorSpec，未实现的 ModSwitch/Boot 必须标成 unsupported;
-4. 按 8.1～8.7 节实现单进程单卡的 PoseidonGpuApi，先打通 Host↔Device Transfer 和普通 GPU compute;
+4. 已完成：按 8.1～8.7 节实现单进程单卡的 PoseidonGpuApi，打通 Host↔Device Transfer 和普通 GPU compute;
 5. 让 PoseidonGpuApi 支持计划明确要求的 Host Boot 模拟:Device→Host、CPU 解密再加密、Host→Device;
 6. 迁移同进程跨卡的对象拷贝并开放 Replicate;
-7. 接入跨进程通信;
+7. CPU 已接入跨进程 MPI 通信；GPU 跨进程通信仍待实现;
 8. GPU 计划在 MockVecApi/PoseidonGpuApi 下结果一致，等价 Host 计划在 PoseidonCpuApi 下给出同样的数学结果。
 
 ### 阶段四:弃用并删除旧执行系统
