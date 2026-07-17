@@ -183,7 +183,7 @@ def main() -> None:
     args.operator_spec = args.operator_spec.resolve()
     args.hecate_build = args.hecate_build.resolve()
     args.hecate_opt = args.hecate_opt.resolve()
-    args.python = args.python.resolve()
+    args.python = Path(os.path.abspath(args.python))
     output_dir = (args.output_dir or
                   (DACAPO / "review_artifacts" / args.model)).resolve()
     spec, spec_digest, compiler_profile = read_operator_spec(args.operator_spec)
