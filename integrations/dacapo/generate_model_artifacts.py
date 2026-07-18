@@ -64,6 +64,8 @@ def read_operator_spec(path: Path) -> tuple[dict, str]:
     require_string(spec.get("spec_id"), "$.spec_id")
     require_positive_integer(spec.get("version"), "$.version")
     require_string(spec.get("target_id"), "$.target_id")
+    if spec.get("rescale_mode") not in {"eager", "lazy"}:
+        raise ValueError("$.rescale_mode must be eager or lazy")
 
     context = spec.get("context")
     if not isinstance(context, dict):
@@ -188,6 +190,13 @@ def build_optimizer_command(args, traced: Path, spec: dict,
         f"--runtime-plan-boot-implementation={boot['implementation']}",
         f"--runtime-plan-inline-payload-max-bytes={args.inline_payload_max_bytes}",
     ]
+    if spec["rescale_mode"] == "lazy":
+        command.extend([
+            "--runtime-plan-physical-level-operator-spec-path="
+            f"{args.operator_spec}",
+            "--runtime-plan-levels-per-logical-level="
+            f"{args.lazy_rescale_level_factor}",
+        ])
     if args.device_counts:
         command.extend([
             f"--runtime-plan-device-counts={args.device_counts}",
@@ -230,6 +239,10 @@ def main() -> None:
     parser.add_argument("--plan-id", type=int, default=1)
     parser.add_argument("--inline-payload-max-bytes", type=int, default=4096)
     parser.add_argument(
+        "--lazy-rescale-level-factor", type=int, default=4,
+        help="Physical RNS levels represented by one logical lazy Rescale",
+    )
+    parser.add_argument(
         "--device-counts",
         help="Enable placement with x-separated per-rank counts, e.g. 8 or 8x8",
     )
@@ -256,6 +269,8 @@ def main() -> None:
         raise ValueError("--inline-payload-max-bytes must be nonnegative")
     if args.inline_payload_max_bytes > (1 << 53) - 1:
         raise ValueError("--inline-payload-max-bytes exceeds the safe JSON integer range")
+    if args.lazy_rescale_level_factor < 1:
+        raise ValueError("--lazy-rescale-level-factor must be positive")
     parse_device_counts(args.device_counts)
     if args.intra_rank_communication_cost < 1:
         raise ValueError("--intra-rank-communication-cost must be positive")

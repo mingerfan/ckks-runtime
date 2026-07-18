@@ -22,6 +22,8 @@ nix develop --command ctest --test-dir build/nix --output-on-failure
 
 `emit-runtime-plan` 输出 RuntimePlan V1，文件名是 `<prefix>.<func>.runtime-plan.json`。Dacapo 的 CKKS MLIR 使用纯 SSA result-style，不再生成 `dst` 和 `tensor.empty`。target、OperatorSpec 引用和 context 必须通过 Pass option 明确提供。Encode payload 默认以 4096 字节为界：不超过阈值的常量内联到 JSON，超过阈值的 float64 常量写入 `<prefix>.<func>.bundle/`；相同内容按 SHA-256 复用同一个 blob。
 
+当 OperatorSpec 声明 `rescale_mode=lazy` 时，生成脚本会在 Earth→CKKS 之后、placement 之前自动加入 `materialize-ckks-physical-levels`。默认一个逻辑 level 展开为 4 个物理 RNS level，可用 `--lazy-rescale-level-factor` 显式调整。Pass 使用目标 spec 的 `levels.upper_bound` 作为物理起始 level，并检查每条 Rescale 的 scale 降幅是否等于被丢弃模数的 bit 数之和；因此 Poseidon GPU 的 Dacapo compiler profile 必须把 `rescalingFactor` 设为 120，目标 OperatorSpec 必须记录真实的 30-bit 模数链并允许一次 Rescale 至少下降 4 层。只改 JSON writer 或只把 profile 标成 lazy 都不够。
+
 不传 `--device-counts` 时生成原来的单 Host 计划。传入后，编译器用 OperatorSpec V2 的逐 level 延迟做确定性 HEFT placement，再为跨 Place 操作数插入 1 对 1 的 `point_to_point` Transfer。`8` 表示 1 rank × 8 devices，`8x8` 表示 2 ranks × 8 devices，`0x0` 表示 2 个只有 Host 的 CPU rank。零和正数不能混用。通信代价目前是与算子延迟同一调度单位的两个固定整数，只是占位值，不按字节数计算，也不是实测传输耗时。
 
 ## 生成模型审阅产物

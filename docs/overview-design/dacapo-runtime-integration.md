@@ -339,6 +339,10 @@ lazy-rescale 不是所有目标都必须打开的全局规则:
 
 关于 lazy-rescale 放哪一层,判断标准是:**它改不改计划的可观察内容**。如果它会移动 Rescale 的位置、改变 level/`scale_log2`、增减算子或改变值的生存期,就必须在 placement 之前、在 Dacapo 里做——因为这些变化影响计算量、显存占用和通信量,placement 需要看到真实代价。如果它只是一个不改变这些内容的 GPU kernel 实现细节,才留在 PoseidonGpuApi 内部。
 
+为了最大限度复用现有 Earth 分析，Poseidon GPU 管线采用“先按逻辑 level 分析，再物理化”的做法：Earth 阶段仍把一次 lazy Rescale 看成下降约 120 bit、消耗 1 个逻辑 level，因此现有 scale 管理、bootstrap 搜索和路径比较继续使用同一套算法。Earth→CKKS 之后、placement 之前，`materialize-ckks-physical-levels` 再把逻辑 level 换算成真实的 30-bit RNS level：它把函数 `init_level` 对应到 OperatorSpec 的 `levels.upper_bound`，每消耗 1 个逻辑 level，最终 CKKS level 消耗 4；对应 ModSwitch 的 down factor 也按同一比例换算。Pass 还会把每条 Rescale 的 `scale_log2` 降幅与实际丢掉的 `rns_moduli_log2` 相加结果对账。换算后的所有 `ckks.poly` 类型已经是 RuntimePlan 方向的物理 level，placement、代价查询和显存估算只能看这份结果。
+
+这个换算不能塞进 JSON writer。writer 只序列化已经合法化的 CKKS 类型；否则 placement 会在错误的逻辑 level 上调度。最终 RuntimePlan 也不新增 `lazy_rescale` 算子或布尔标记：OperatorSpec 的 `rescale_mode=lazy` 说明所选目标模式，每条普通 `rescale` 指令用具体的 `target_level=input_level-4` 和 `target_scale_log2=input_scale_log2-120` 表达本次行为。`generate_model_artifacts.py` 读取到 lazy profile 时默认传入 4 倍物理化参数；直接使用 `hecate-opt` 时对应参数是 `--runtime-plan-physical-level-operator-spec-path` 和 `--runtime-plan-levels-per-logical-level=4`。
+
 普通 Rescale 也可以由同一个 GPU 后端执行：计划把 `target_level` 写成输入 level 减 1，Api 就调用一次 evaluator。是否能在整个程序中正确使用普通 Rescale、应该把 Rescale 放在哪里以及每次的目标 `scale_log2` 是多少，属于 Dacapo 的 scale 管理职责。PoseidonGpuApi 不选择 eager/lazy 策略，只按计划给出的目标执行。
 
 Mul、Rescale 等算子的外部元信息变化由计划明确写出。Boot 内部的 lazy-rescale 不会展开成一长串 RuntimePlan 指令,但它造成的合法输入范围、实际 level 消耗和输出元信息必须由所选 boot profile 明确给出。Dacapo 按该 profile 规划,Runtime 和 PoseidonApi 按同一个 profile 校验和执行。
@@ -519,7 +523,7 @@ Api 构造时由部署方一次性提供：
 | Negate | `GpuEvaluator::negate` | 支持 |
 | Rotate | `GpuEvaluator::rotate` | 支持，需要对应的直接旋转 key |
 | Rescale | 重复调用 `GpuEvaluator::rescale` | 支持普通和 lazy Rescale；每次物理调用丢一个 30-bit 模数，level 下降 1 |
-| ModSwitch | `GpuEvaluator::drop_modulus` | GPU 库当前未实现，拒绝 |
+| ModSwitch | `GpuEvaluator::drop_modulus` | 支持；物化目标 q-count，保留对应 RNS limbs，scale 不变 |
 | Relinearize | `GpuEvaluator::relinearize` | 支持，需要 relin key |
 | Boot | 无可用实现 | 拒绝，留到后续阶段 |
 
@@ -527,7 +531,7 @@ Api 构造时由部署方一次性提供：
 
 最后一次物理 rescale 完成后，Api 按协议把输出的名义 scale 设为精确的 `2^target_scale_log2`，做法和现有 `PoseidonCpuApi` 一致；输出仍必须通过 `validate_value` 和计划里的 ValueDesc 对账。Api 不自行计算应该丢几层，也不根据当前浮点 scale 猜目标，一切以编译器写入的 `target_level` 和 `target_scale_log2` 为准。
 
-当前仓库的 `poseidon-ckks-gpu.v1.json` 是协议测试用 placeholder，里面的 28-bit 模数、两层 Rescale、ModSwitch 和 Boot 声明都不能代表真实 GPUApi。接 GPUApi 前必须先生成一份和实测 GPU context 一致的非 placeholder OperatorSpec：数据模数按当前实现记录为 30 bit，`rescale.max_levels_per_op` 至少覆盖当前 lazy Rescale 所需的 4 层，并把尚未实现的 ModSwitch、Boot 标成 unsupported。Api preflight 也要拒绝 `status="placeholder"`，并拒绝任何把未实现算子标成 supported 的 spec。
+当前仓库的 `poseidon-ckks-gpu.v1.json` 是协议测试用 placeholder，里面的 28-bit 模数、两层 Rescale 以及 ModSwitch/Boot 声明都不能代表真实 GPUApi。接 GPUApi 前必须先生成一份和实测 GPU context 一致的非 placeholder OperatorSpec：数据模数按当前实现记录为 30 bit，`rescale.max_levels_per_op` 至少覆盖当前 lazy Rescale 所需的 4 层，ModSwitch 按真实实现和实测代价标成 supported，尚未实现的 Boot 标成 unsupported。Api preflight 也要拒绝 `status="placeholder"`，并拒绝任何把未实现算子标成 supported 的 spec。
 
 ### 8.4 本机 Transfer 与 Replicate
 
@@ -581,7 +585,7 @@ src/poseidon/runtime_api/
 
 1. preflight 明确拒绝错误 target、`device_counts`、placeholder spec、缺失密钥和超出 GPU 库能力的 OperatorSpec；
 2. `Encode(Host) -> Transfer(H2D) -> AddCP(Device) -> Transfer(D2H)` 跑通，下载后的密文可正确解密；
-3. `MulCC -> Relinearize -> Rescale -> Rotate` 跑通，并和明文参考结果比较；Rescale 测试同时覆盖 `drop_count=1` 的普通路径和 `drop_count=4`、约 120-bit 的 lazy 路径；
+3. `MulCC -> Relinearize -> Rescale -> Rotate` 跑通，并和明文参考结果比较；Rescale 测试同时覆盖 `drop_count=1` 的普通路径和 `drop_count=4`、约 120-bit 的 lazy 路径；ModSwitch 覆盖一次下降多个 level、scale 不变和解密结果不变；
 4. Host/Device Value 的 kind、level、scale、NTT、components 或实际 device id 任一不符时，`validate_value` 都拒绝；
 5. 同一份 GPU RuntimePlan 分别交给 `MockVecApi` 和 `PoseidonGpuApi`，数学结果和每个 ValueDesc 一致。`PoseidonCpuApi` 使用等价的 Host 计划做对照，因为 CPU/GPU target 和 placement 本来就不同，不强行声称三种 Api 执行同一份 target 文件。
 
@@ -644,7 +648,7 @@ Dacapo 测试模型
 1. Dacapo 作为可选 submodule 进入 Runtime;
 2. 把 Dacapo 现有 profile JSON 中的 CKKS 参数、算子延迟/噪声和 bootstrap 范围迁到版本化 OperatorSpec。注意 profile 里的 bootstrap level 上下界是 Earth 方向的数字,迁移时要做和 5.2 节一样的层号换算,不能照抄。已完成：三份旧 profile 已迁到 OperatorSpec V2，保留来源摘要和逐 level 代价;
 3. 在 Dacapo 里搭 MLIR 层的 RuntimePlan 产出管线,先支持单 Host 配置,把 `ckks.encode` 一对一导出成 Encode 指令,实现生成端自检和 JSON 写出。已完成：CKKS dialect 已改为无 `dst`/`tensor.empty` 的纯 SSA result-style，当前 Pass 支持线性单 block CKKS、inline/bundle Encode、按内容哈希复用大常量，并覆盖 Dacapo 当前会产生的 CKKS 计算算子;
-4. 接 CPU eager 和 GPU lazy 两种 rescale 管线,用 spec 决定是否启用 lazy-rescale;
+4. 已完成编译器侧 CPU eager / GPU lazy 分流：生成脚本按 spec 的 `rescale_mode` 决定是否在 placement 前启用物理 level Pass；生产 GPU profile 和硬件实测仍需补齐;
 5. 加入可选的 GPU Boot→Host `decrypt_reencrypt` 合法化 Pass;
 6. 用 MockVecApi 建立真实编译产物的单卡端到端测试。基础链路已完成：Mul→Relinearize、Upscale、内联常量和 Boot level 换算均通过 Runtime verifier 与 MockVecApi;
 7. 已完成首版多卡 placement 和点对点 Transfer 插入：确定性 HEFT 使用 OperatorSpec V2 的逐 level 延迟和固定 rank 内/间通信代价；`1x8`、`2x8` fixture 与 MLP 已通过 MockVecApi 的逐指令和最终结果差分。Replicate、分片、显存容量和真实通信模型仍待实现。
@@ -653,7 +657,7 @@ Dacapo 测试模型
 
 1. 已完成：Poseidon 通过可选构建路径引入 Runtime;
 2. 已完成：向下兼容的 PoseidonCpuApi；默认构造保持单进程 Host-only，MPI 构造支持 Host rank 间的 Transfer/Replicate，并已通过手工 2/4 rank RuntimePlan 测试;
-3. 先用真实 GPU context 和测量结果替换 placeholder GPU OperatorSpec，未实现的 ModSwitch/Boot 必须标成 unsupported;
+3. 先用真实 GPU context 和测量结果替换 placeholder GPU OperatorSpec，启用已经实现的 ModSwitch，未实现的 Boot 必须标成 unsupported;
 4. 已完成：按 8.1～8.7 节实现向下兼容的单进程单卡/多卡 PoseidonGpuApi，打通普通 GPU compute 和本机显式通信;
 5. 让 PoseidonGpuApi 支持计划明确要求的 Host Boot 模拟:Device→Host、CPU 解密再加密、Host→Device;
 6. 已完成：迁移同进程跨卡的完整对象拷贝并开放 Replicate；compute completion event 已允许不同设备的静态顺序提交发生重叠，通信异步化仍待完成;
@@ -692,7 +696,7 @@ Dacapo 测试模型
 - `level` 是整数模数链层号,`scale_log2` 是整数 scale 指数;V1 不传浮点 scale;
 - CPU 和 GPU 使用不同的 OperatorSpec。CPU 默认 eager rescale,当前 30-bit GPU profile 使用 lazy-rescale;GPU boot 的内部 level 消耗也由独立 boot profile 给出;
 - GPU 原生 boot 不可用时,只能由 Dacapo 的可选 Pass 明确生成 Device→Host、CPU 解密再加密、Host→Device 的计划,Runtime 不做隐式回退;
-- 单进程 PoseidonGpuApi 向下兼容单卡并支持本机多卡：普通 GPU 算子、普通/多层 lazy Rescale、Host↔Device、Device↔Device、Transfer 和 Replicate 已接通；每次物理 Rescale 丢一个 30-bit 模数，当前 lazy 路径执行四次、共下降 4 个 level 和约 120 bit；ModSwitch、Boot 和 GPU 多进程仍拒绝;
+- 单进程 PoseidonGpuApi 向下兼容单卡并支持本机多卡：普通 GPU 算子、普通/多层 lazy Rescale、ModSwitch、Host↔Device、Device↔Device、Transfer 和 Replicate 已接通；每次物理 Rescale 丢一个 30-bit 模数，当前 lazy 路径执行四次、共下降 4 个 level 和约 120 bit；Boot 和 GPU 多进程仍拒绝;
 - 协议测试用 placeholder GPU OperatorSpec 不能被真实 PoseidonGpuApi 接受，生产 profile 必须和 GPU context 及已实现能力一致;
 - Dacapo 是 Runtime 的可选 submodule(指向 `dacapo-modified` fork),只用于锁版本和集成测试;
 - 计划产出走 MLIR 原生管线直接输出 RuntimePlan,HEVM 字节码及其解释器/解析器整条链退役;

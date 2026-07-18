@@ -238,6 +238,8 @@ rescale 的规则是:
 - 当前低 bit Poseidon GPU profile 固定为 lazy 模式,选中该 profile 时 Dacapo 必须启用相应变换;
 - pass 产生的 Rescale 位置、每个值的 level 和 `scale_log2` 都会进入后续计划,Runtime 不再改变。
 
+Poseidon GPU 可以继续复用 Earth 的 120-bit 逻辑 scale 分析：Earth 中一次 lazy Rescale 只增加 1 个逻辑 level；Earth→CKKS 后的 `materialize-ckks-physical-levels` 再按 `physical_level = physical_base_level - 4 * consumed_logical_levels` 换算全部 CKKS 类型，并把逻辑 ModSwitch down factor 同步乘 4。`physical_base_level` 取目标 OperatorSpec 的 `levels.upper_bound`；Pass 同时校验 120-bit 逻辑降幅等于四个目标 RNS 模数的 bit 数之和。这个 Pass 必须早于 placement。JSON 导出器不改 level，也不新增 `lazy_rescale` 指令，只从已经物理化的输入/输出类型写出普通 Rescale 的具体目标。
+
 GPU boot 暂不可用时,可选 Pass 把 Boot 标成 `implementation=decrypt_reencrypt`,并限制 `compute_place` 必须是 Host。通信显式化完成后,它自然形成下面的计划:
 
 ~~~mlir

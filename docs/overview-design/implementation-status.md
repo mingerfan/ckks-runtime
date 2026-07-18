@@ -29,8 +29,10 @@
 - 单进程 `PoseidonGpuApi` 已从单卡兼容扩展到本机多卡：`Device(rank=0,index=i)` 映射到构造时给出的第 `i` 个物理 CUDA device，每张卡独立持有参数、Evaluator 和密钥缓存；旧单卡构造函数保持兼容。
 - 本机 GPU 通信已支持 Host↔Device、Device↔Device、Transfer 和 Replicate。跨卡复制先物化完整目标对象，再按拓扑使用 CUDA P2P 或 pinned Host 中转；V1 仍只接受单 field、单完整 shard 的值。
 - GPU compute 结果现在记录 CUDA completion event，不再在每个算子末尾无条件执行 `cudaDeviceSynchronize`。Runtime 继续按 Dacapo 的静态顺序提交，因此不同设备上的独立算子可以重叠；跨卡通信、下载和最终输出会等待源 Value。多级 Rescale 为保护本次调用中的临时对象仍保留一次同步。
+- GPU ModSwitch 已接入 `GpuEvaluator` 和 `PoseidonGpuApi`：直接物化目标 q-count 并复制保留的 RNS limbs，保持 scale、NTT 和 components 不变，支持一次下降多个 level。单卡 GPU API 测试已在 RTX 4060 Laptop 上通过，覆盖下降两个 level 后的元信息和解密结果；四次 30-bit lazy Rescale 也已和 CPU 四次 Rescale 做结果差分。双卡用例仍需双卡机器验收。
 - 手工双卡 RuntimePlan 已覆盖反向逻辑/物理设备映射、Replicate、明文/密文跨卡传输和两卡计算；当前单卡开发机只编译并跳过该用例，仍需在真实双卡机器上完成运行验收。
 - Dacapo 已生成多 rank/device placement 和点对点 Transfer；Poseidon CPU MPI 的既有测试仍使用手工 RuntimePlan。Dacapo 产出的 Device 计划目前由 MockVecApi 验证，交给真实 PoseidonGpuApi 还需要生产 GPU OperatorSpec、受支持算子合法化和多卡硬件验收。
-- 生产 GPU OperatorSpec 尚未完成。当前 placeholder profile 使用 28-bit 模数且只允许两层 Rescale，不符合实际 30-bit 模数和 lazy Rescale 连续下降 4 层的设计；ModSwitch 和 Boot 也尚未实现，不能被真实 GPUApi 接受。
+- Dacapo 已加入 `materialize-ckks-physical-levels`：Earth 继续按 120-bit/1 个逻辑 level 分析，Earth→CKKS 后、placement 前再按目标 OperatorSpec 把一个逻辑 level 展开为 4 个物理 level，并同步改写 ModSwitch down factor。测试覆盖 `L13 -> L9` lazy Rescale、`downFactor 1 -> 4`、placement 使用物理 level 代价、scale bit 不匹配和物理链不足。
+- 生产 GPU OperatorSpec 尚未完成。当前 placeholder profile 使用 28-bit 模数且只允许两层 Rescale，不符合实际 30-bit 模数和 lazy Rescale 连续下降 4 层的设计；它对 ModSwitch/Boot 的声明也不符合当前真实能力，生产 spec 应启用 ModSwitch 并关闭尚未实现的 Boot。
 
 这些内容不属于 RuntimePlan V1 冻结条件。
