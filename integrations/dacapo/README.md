@@ -82,7 +82,8 @@ python3 integrations/dacapo/generate_model_artifacts.py mlp \
 构建通用 VecApi 差分程序：
 
 ```bash
-xmake build dacapo_plan_vec_diff
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target dacapo_plan_vec_diff --parallel 2
 ```
 
 程序依次接收 Host 计划、分布式计划、OperatorSpec、两份 bundle 目录和报告路径。它先检查原 CKKS ValueId/算子/操作数与 Transfer 谱系，再用 `DiffMode::AllValuesAfterRun` 执行两份计划，比较每条 Encode、Compute、Transfer，最后单独再比较 final output。没有 bundle 时对应参数写 `-`。

@@ -15,7 +15,7 @@
       pkgs = nixpkgs.legacyPackages.${system};
     in {
       devShells.${system}.default = pkgs.mkShell {
-        nativeBuildInputs = [ pkgs.openmpi ];
+        nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.openmpi ];
 
         # 单机测试时允许 -np 超过物理核数
         OMPI_MCA_rmaps_base_oversubscribe = "1";

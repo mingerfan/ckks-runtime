@@ -14,7 +14,7 @@
 
 ## 阶段二进行中
 
-- 已把 `mingerfan/dacapo-modified` 作为可选 submodule 固定在 `third_party/dacapo/`。它不参与默认 xmake 构建，需要时用 `git submodule update --init third_party/dacapo` 显式初始化。
+- 已把 `mingerfan/dacapo-modified` 作为可选 submodule 固定在 `third_party/dacapo/`。它不参与默认 CMake 构建，需要时用 `git submodule update --init third_party/dacapo` 显式初始化。
 - 已把 Dacapo 的 HEAAN CPU/GPU、SEAL CPU profile 迁到 OperatorSpec V2，保留 CKKS 参数、逐 level 延迟/噪声、来源 SHA-256，并显式完成 Earth→CKKS bootstrap level 换算。V1 保持冻结。
 - Dacapo 的 CKKS `PolyType` 已保存 components、`scale_log2` 和 Runtime 方向的 level；全部 CKKS 算子使用纯 SSA result-style，不再携带 `dst` 或生成 `tensor.empty`；Earth 密文乘法下降为独立的 `ckks.mulcc` 和 `ckks.relinearize`。
 - `emit-runtime-plan` 支持单 Host 和已 placement 的函数：小 Encode payload 保持 inline，大 float64 payload 按阈值写入内容寻址 bundle，相同内容只保存一次；输出严格的 RuntimePlan V1 JSON，并覆盖 Mul/Relinearize、Upscale、常量、bundle 复用、Boot 层号换算、真实多 rank/device target 和点对点 Transfer。
