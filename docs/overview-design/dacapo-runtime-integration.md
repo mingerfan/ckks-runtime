@@ -4,13 +4,13 @@
 
 ## 1. 这份方案要解决什么问题
 
-现在有三份代码,各自都在做"执行计划"这件事,职责重叠:
+迁移前有三份代码,各自都在做"执行计划"这件事,职责重叠:
 
-- **Dacapo**(`utils/dacapo`,即 hecate 编译器的 fork):把上层程序编译成 CKKS 程序,自带一套 HEVM 字节码和两个解释器(`lib/Runtime` 里的 SEAL/HEAAN 版本);
-- **Poseidon**(FHE GPU 库):除了 CPU/GPU 算子和通信能力，还保留着一套独立的旧执行系统，以及 `frontends/dacapo` 里的 HEVM 导入和第三套执行器;
-- **本仓库**(CKKS Runtime):一套干净的"照计划执行"框架,有验证器、值状态管理和明文参考实现,但还没接真实 GPU。
+- **Dacapo**(`utils/dacapo`,即 hecate 编译器的 fork):除了 CKKS 编译，曾经还自带 HEVM 字节码和 SEAL/HEAAN 解释器;
+- **Poseidon**(FHE GPU 库):除了 CPU/GPU 算子和通信能力，曾经还有独立的 mgpu 执行系统和 HEVM frontend;
+- **本仓库**(CKKS Runtime):提供"照计划执行"的验证器、值管理和统一执行器，由 Poseidon CPU/GPU Api 提供真实后端。
 
-三套执行逻辑长期并存,每改一处要同步三处,谁也不敢删谁。本方案的目标是收敛成一条链,每个仓库只干一件事:
+三套执行逻辑已收敛成一条链,每个仓库只干一件事:
 
 - **Dacapo 只做编译**:从上层程序生成一份"每条指令在哪算、数据怎么搬都定死了"的静态计划文件;
 - **Runtime 只做执行**:读入计划文件,验证,然后照着执行。单卡、多卡、多机用同一套执行代码;计算和通信的具体实现通过一个抽象接口(下文称 Api)注入,明文、CPU、GPU 各实现一份;
@@ -659,31 +659,21 @@ Dacapo 测试模型
 2. 已完成：向下兼容的 PoseidonCpuApi；默认构造保持单进程 Host-only，MPI 构造支持 Host rank 间的 Transfer/Replicate，并已通过手工 2/4 rank RuntimePlan 测试;
 3. 先用真实 GPU context 和测量结果替换 placeholder GPU OperatorSpec，启用已经实现的 ModSwitch，未实现的 Boot 必须标成 unsupported;
 4. 已完成：按 8.1～8.7 节实现向下兼容的单进程单卡/多卡 PoseidonGpuApi，打通普通 GPU compute 和本机显式通信;
-5. 让 PoseidonGpuApi 支持计划明确要求的 Host Boot 模拟:Device→Host、CPU 解密再加密、Host→Device;
+5. 已完成：PoseidonGpuApi 支持计划明确要求的 Host Boot 模拟:Device→Host、CPU 解密再加密、Host→Device;
 6. 已完成：迁移同进程跨卡的完整对象拷贝并开放 Replicate；compute completion event 已允许不同设备的静态顺序提交发生重叠，通信异步化仍待完成;
 7. CPU 已接入跨进程 MPI 通信；GPU 跨进程通信仍待实现;
 8. GPU 计划在 MockVecApi/PoseidonGpuApi 下结果一致，等价 Host 计划在 PoseidonCpuApi 下给出同样的数学结果。
 
 ### 阶段四:弃用并删除旧执行系统
 
-#### 11.1 mgpu 弃用声明
+#### 11.1 删除结果
 
-**`src/poseidon/mgpu/` 已确定弃用。它不是 Runtime 或 `PoseidonGpuApi` 的演进基础，新代码不得依赖其头文件、库目标、IR、object store、后端或执行入口。**
+- Poseidon 已删除 `src/poseidon/mgpu/` 的 IR、placement、调度、object store、解释器、通信兼容层，以及对应 CMake 选项、工具、benchmark 和测试。
+- Poseidon 已删除 `frontends/dacapo/` 和 HEVM/CST 工具/测试，不保留 HEVM→旧 IR 转译或兼容 wrapper。
+- Dacapo 已删除 `EmitHEVM`/`RemoveLevel` Pass、`lib/Runtime/{HEAAN,SEAL}_HEVM.cpp`、Python runner 和相关示例/脚本。
+- 已迁移的能力只保留在 RuntimePlan/PlanVerifier、`PoseidonCpuApi`/`PoseidonGpuApi` 和 `src/poseidon/runtime_api/communication/`。Poseidon 执行入口只接受明确版本的 RuntimePlan。
 
-这个目录只允许做迁移和删除所需的改动：
-
-1. 把仍有用的对象拆分、分段拷贝、CUDA peer 和拓扑探测能力迁到 `src/poseidon/runtime_api/communication/`，改成直接服务 `communicate_async`；
-2. 把仍有价值的不变量和测试场景改写到 RuntimePlan、PlanVerifier、PoseidonGpuApi 及新通信模块的测试中，不保留旧 IR 兼容层；
-3. 单卡、多卡和通信替代路径通过测试后，删除整个旧目录及其 CMake 选项、测试目标、工具和陈旧构建目录；
-4. 不保留自动转译、兼容 wrapper 或旧入口回退。删除后 Poseidon 的执行入口只接受明确版本的 RuntimePlan。
-
-`src/poseidon/gpu/` 下的 GPU data、参数、上传下载、算子、handlers 和 kernels 是底层 GPU 库，不在弃用范围内，`PoseidonGpuApi` 直接使用它们。
-
-#### 11.2 其他旧路径
-
-- `frontends/dacapo/` 整个目录:HEVM/CST 解析、常量装载、输入输出绑定和第三套执行器(`poseidon_gpu_hevm_executor.*`)。HEVM 格式退役后整条链没有存在理由,不迁移(见 7.5);其中的 CKKS 元信息对账逻辑以规范文字和测试样例形式沉淀进协议,而非搬运代码;
-- Dacapo 仓库的 `lib/Runtime/{HEAAN,SEAL}_HEVM.cpp`:Dacapo 自带的 HEVM 解释器。注意它同时是差分测试的 CPU 参照实现,且被 `python/hecate/runner.py` 加载——要等新路径有了替代参照(PoseidonCpuApi 跑通并对过账)之后再删;
-- 相关测试随被删模块一起退役，其中验证的不变量要确认在 Runtime 和 PoseidonApi 测试集中有对应覆盖。
+`src/poseidon/gpu/` 下的 GPU data、参数、上传下载、算子、handlers 和 kernels 是底层 GPU 库，`PoseidonGpuApi` 直接使用它们。
 
 ## 12. 结论
 
@@ -696,10 +686,10 @@ Dacapo 测试模型
 - `level` 是整数模数链层号,`scale_log2` 是整数 scale 指数;V1 不传浮点 scale;
 - CPU 和 GPU 使用不同的 OperatorSpec。CPU 默认 eager rescale,当前 30-bit GPU profile 使用 lazy-rescale;GPU boot 的内部 level 消耗也由独立 boot profile 给出;
 - GPU 原生 boot 不可用时,只能由 Dacapo 的可选 Pass 明确生成 Device→Host、CPU 解密再加密、Host→Device 的计划,Runtime 不做隐式回退;
-- 单进程 PoseidonGpuApi 向下兼容单卡并支持本机多卡：普通 GPU 算子、普通/多层 lazy Rescale、ModSwitch、Host↔Device、Device↔Device、Transfer 和 Replicate 已接通；每次物理 Rescale 丢一个 30-bit 模数，当前 lazy 路径执行四次、共下降 4 个 level 和约 120 bit；Boot 和 GPU 多进程仍拒绝;
+- 单进程 PoseidonGpuApi 向下兼容单卡并支持本机多卡：普通 GPU 算子、普通/多层 lazy Rescale、ModSwitch、Host↔Device、Device↔Device、Transfer、Replicate 和 `decrypt_reencrypt` Host Boot 已接通；每次物理 Rescale 丢一个 30-bit 模数，当前 lazy 路径执行四次、共下降 4 个 level 和约 120 bit；原生 GPU Boot 和 GPU 多进程仍拒绝;
 - 协议测试用 placeholder GPU OperatorSpec 不能被真实 PoseidonGpuApi 接受，生产 profile 必须和 GPU context 及已实现能力一致;
 - Dacapo 是 Runtime 的可选 submodule(指向 `dacapo-modified` fork),只用于锁版本和集成测试;
 - 计划产出走 MLIR 原生管线直接输出 RuntimePlan,HEVM 字节码及其解释器/解析器整条链退役;
-- Poseidon 只引入 Runtime,通过 PoseidonCpuApi/PoseidonGpuApi 提供计算和通信；通信实现放在独立的 Runtime Api 通信模块，旧执行系统在迁移验证后整体删除;
+- Poseidon 只引入 Runtime,通过 PoseidonCpuApi/PoseidonGpuApi 提供计算和通信；通信实现放在独立的 Runtime Api 通信模块，旧执行系统已整体删除;
 - 单卡、多卡、多机由同一套 Runtime 代码执行,只是目标配置不同;
 - 版本、目标或能力对不上时直接报错,永远不猜。

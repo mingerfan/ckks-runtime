@@ -35,7 +35,7 @@
 
 ## Poseidon 后端
 
-Poseidon 通过 `PoseidonCpuApi` 和 `PoseidonGpuApi` 接入 Runtime。GPU 计算直接调用 Poseidon GPU 库；对象拆分、Host/Device 搬运、跨卡和跨进程通信放在独立的 Runtime Api 通信模块中。RuntimePlan、ValueStore、验证器和执行器只保留本仓库这一套。旧执行系统的弃用与删除要求见[集成方案的迁移章节](overview-design/dacapo-runtime-integration.md#阶段四弃用并删除旧执行系统)。
+Poseidon 通过 `PoseidonCpuApi` 和 `PoseidonGpuApi` 接入 Runtime。GPU 计算直接调用 Poseidon GPU 库；Host/Device 搬运和跨卡通信放在独立的 Runtime Api 通信模块中。RuntimePlan、ValueStore、验证器和执行器只保留本仓库这一套；Poseidon 旧 mgpu/HEVM 执行链已按[集成方案的迁移章节](overview-design/dacapo-runtime-integration.md#阶段四弃用并删除旧执行系统)删除。
 
 ## 常用术语
 
