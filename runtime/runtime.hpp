@@ -33,6 +33,9 @@ struct RuntimeTiming {
     std::size_t boot_calls = 0;
     std::uint64_t compute_including_boot_nanoseconds = 0;
     std::uint64_t boot_nanoseconds = 0;
+    std::uint64_t setup_nanoseconds = 0;
+    std::uint64_t initialization_nanoseconds = 0;
+    std::uint64_t online_execution_nanoseconds = 0;
 
     std::uint64_t compute_excluding_boot_nanoseconds() const {
         return compute_including_boot_nanoseconds - boot_nanoseconds;
@@ -101,6 +104,7 @@ public:
         remaining_uses_.clear();
         timing_ = RuntimeTiming{};
         try {
+            const auto setup_start = std::chrono::steady_clock::now();
             if (resources.skip_artifact_digest_checks) {
                 std::cerr << "WARNING: rank " << rank_
                           << " is running with skip_artifact_digest_checks=true; artifact digest comparisons are disabled\n";
@@ -115,12 +119,22 @@ public:
                            resources.skip_artifact_digest_checks,
                            plan_->target, resources.operator_spec.spec, requirements);
             bind_inputs(local_inputs);
+
+            const auto initialization_start = std::chrono::steady_clock::now();
+            timing_.setup_nanoseconds = elapsed_nanoseconds(
+                setup_start, initialization_start);
             execute_phase(plan_->initialization);
             finish_all_groups();
+
+            const auto online_execution_start = std::chrono::steady_clock::now();
+            timing_.initialization_nanoseconds = elapsed_nanoseconds(
+                initialization_start, online_execution_start);
             execute_phase(plan_->execution);
             execute_phase(plan_->finalization);
             finish_all_groups();
             synchronize_final_outputs();
+            timing_.online_execution_nanoseconds = elapsed_nanoseconds(
+                online_execution_start, std::chrono::steady_clock::now());
             return make_artifact(diff_mode);
         } catch (const std::exception &error) {
             const std::string diagnostic = format_error(error.what());
@@ -131,6 +145,14 @@ public:
     }
 
 private:
+    static std::uint64_t elapsed_nanoseconds(
+        std::chrono::steady_clock::time_point start,
+        std::chrono::steady_clock::time_point finish) {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(finish - start)
+                .count());
+    }
+
     struct PendingGroup {
         CommAction action;
         std::vector<ValueId> local_input_ids;
