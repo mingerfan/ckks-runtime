@@ -72,9 +72,28 @@ inline std::vector<double> pack_mlp_input(const std::vector<double> &logical) {
     return packed;
 }
 
+inline std::vector<double> pack_resnet20_input(
+    const std::vector<double> &logical) {
+    constexpr std::size_t image_values = 3 * 32 * 32;
+    constexpr std::size_t packed_block = 4096;
+    constexpr std::size_t repetitions = 4;
+    constexpr double activation_scale = 32.0;
+    if (logical.size() != image_values)
+        throw std::runtime_error(
+            "ResNet-20 logical input must contain 3072 values");
+    std::vector<double> block(packed_block, 0.0);
+    for (std::size_t index = 0; index < logical.size(); ++index)
+        block[index] = logical[index] / activation_scale;
+    std::vector<double> packed;
+    packed.reserve(packed_block * repetitions);
+    for (std::size_t repeat = 0; repeat < repetitions; ++repeat)
+        packed.insert(packed.end(), block.begin(), block.end());
+    return packed;
+}
+
 inline void set_input(Context &context, std::vector<double> input) {
     if (input.size() > context.slot_capacity)
-        throw std::runtime_error("MLP input exceeds CKKS slot capacity");
+        throw std::runtime_error("model input exceeds CKKS slot capacity");
     input.resize(context.slot_capacity, 0.0);
     const auto &input_desc =
         find_value(context.loaded_plan.plan, context.input_id);
