@@ -4,13 +4,17 @@
 #include "runtime/verifier.hpp"
 
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <variant>
 
@@ -36,6 +40,10 @@ struct RuntimeTiming {
     std::uint64_t setup_nanoseconds = 0;
     std::uint64_t initialization_nanoseconds = 0;
     std::uint64_t online_execution_nanoseconds = 0;
+    std::size_t communication_post_calls = 0;
+    std::size_t communication_wait_calls = 0;
+    std::uint64_t communication_post_nanoseconds = 0;
+    std::uint64_t communication_wait_nanoseconds = 0;
 
     std::uint64_t compute_excluding_boot_nanoseconds() const {
         return compute_including_boot_nanoseconds - boot_nanoseconds;
@@ -103,6 +111,7 @@ public:
         retain_all_values_ = diff_mode == DiffMode::AllValuesAfterRun;
         remaining_uses_.clear();
         timing_ = RuntimeTiming{};
+        open_trace();
         try {
             const auto setup_start = std::chrono::steady_clock::now();
             if (resources.skip_artifact_digest_checks) {
@@ -153,11 +162,52 @@ private:
                 .count());
     }
 
+    void open_trace() {
+        runtime_trace_.reset();
+        const char *trace_path = std::getenv("POSEIDON_RUNTIME_TRACE");
+        if (trace_path == nullptr || trace_path[0] == '\0' ||
+            std::string_view(trace_path) == "0")
+            return;
+        std::string path = std::string_view(trace_path) == "1"
+                               ? "/tmp/poseidon-runtime"
+                               : std::string(trace_path);
+        const std::string rank_text = std::to_string(rank_);
+        std::size_t offset = 0;
+        bool replaced = false;
+        while ((offset = path.find("%r", offset)) != std::string::npos) {
+            path.replace(offset, 2, rank_text);
+            offset += rank_text.size();
+            replaced = true;
+        }
+        if (!replaced) path += ".rank" + rank_text + ".csv";
+        runtime_trace_ = std::make_unique<std::ofstream>(
+            path, std::ios::out | std::ios::trunc);
+        if (!*runtime_trace_)
+            throw std::runtime_error("cannot open Poseidon Runtime trace file");
+        *runtime_trace_
+            << "rank,event,id,ordinal,consumer_ordinal,op,duration_ns\n";
+        runtime_trace_->flush();
+    }
+
+    void trace_event(const char *event, std::uint64_t id,
+                     std::uint64_t ordinal,
+                     std::optional<std::uint64_t> consumer_ordinal,
+                     std::string_view op,
+                     std::uint64_t duration_nanoseconds) {
+        if (!runtime_trace_) return;
+        *runtime_trace_ << rank_ << ',' << event << ',' << id << ','
+                        << ordinal << ',';
+        if (consumer_ordinal) *runtime_trace_ << *consumer_ordinal;
+        *runtime_trace_ << ',' << op << ',' << duration_nanoseconds << '\n';
+        runtime_trace_->flush();
+    }
+
     struct PendingGroup {
         CommAction action;
         std::vector<ValueId> local_input_ids;
         std::vector<ValueId> local_output_ids;
         CommHandle handle;
+        std::uint64_t instruction_ordinal = 0;
         bool completed = false;
     };
 
@@ -248,6 +298,8 @@ private:
             std::chrono::steady_clock::now() - start);
         const auto elapsed_nanoseconds =
             static_cast<std::uint64_t>(elapsed.count());
+        trace_event("compute", op.output, current_->ordinal, std::nullopt,
+                    to_string(op.kind), elapsed_nanoseconds);
         ++timing_.compute_calls;
         timing_.compute_including_boot_nanoseconds += elapsed_nanoseconds;
         if (op.kind == ComputeKind::Boot) {
@@ -266,10 +318,18 @@ private:
             if (action.sources[i].rank == rank_) local_inputs.push_back(ensure_ready(action.inputs[i], action.sources[i]));
         PendingGroup group;
         group.action = action;
+        group.instruction_ordinal = current_->ordinal;
         for (std::size_t i = 0; i < action.inputs.size(); ++i)
             if (action.sources[i].rank == rank_)
                 group.local_input_ids.push_back(action.inputs[i]);
+        const auto post_start = std::chrono::steady_clock::now();
         group.handle = api_.communicate_async(action, local_inputs);
+        const auto post_elapsed = elapsed_nanoseconds(
+            post_start, std::chrono::steady_clock::now());
+        ++timing_.communication_post_calls;
+        timing_.communication_post_nanoseconds += post_elapsed;
+        trace_event("comm_post", action.id, group.instruction_ordinal,
+                    std::nullopt, to_string(action.kind), post_elapsed);
         const std::size_t group_id = groups_.size();
         for (std::size_t i = 0; i < action.outputs.size(); ++i) {
             if (action.destinations[i].rank != rank_) continue;
@@ -283,7 +343,16 @@ private:
     void finish_group(std::size_t group_id) {
         auto &group = groups_.at(group_id);
         if (group.completed) return;
+        const auto wait_start = std::chrono::steady_clock::now();
         auto outputs = api_.wait(group.handle);
+        const auto wait_elapsed = elapsed_nanoseconds(
+            wait_start, std::chrono::steady_clock::now());
+        ++timing_.communication_wait_calls;
+        timing_.communication_wait_nanoseconds += wait_elapsed;
+        trace_event("comm_wait", group.action.id, group.instruction_ordinal,
+                    current_ ? std::optional<std::uint64_t>(current_->ordinal)
+                             : std::nullopt,
+                    to_string(group.action.kind), wait_elapsed);
         if (outputs.size() != group.local_output_ids.size()) throw std::runtime_error("Api wait returned wrong output count");
         for (std::size_t i = 0; i < outputs.size(); ++i) {
             const ValueId id = group.local_output_ids[i];
@@ -392,6 +461,7 @@ private:
     std::map<std::string, std::vector<double>> bundle_slots_;
     std::unordered_map<ValueId, std::size_t> remaining_uses_;
     RuntimeTiming timing_;
+    std::unique_ptr<std::ofstream> runtime_trace_;
     bool retain_all_values_ = false;
 };
 
