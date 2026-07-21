@@ -18,10 +18,10 @@
 - 已把 Dacapo 的 HEAAN CPU/GPU、SEAL CPU profile 迁到 OperatorSpec V2，保留 CKKS 参数、逐 level 延迟/噪声、来源 SHA-256，并显式完成 Earth→CKKS bootstrap level 换算。V1 保持冻结。
 - Dacapo 的 CKKS `PolyType` 已保存 components、`scale_log2` 和 Runtime 方向的 level；全部 CKKS 算子使用纯 SSA result-style，不再携带 `dst` 或生成 `tensor.empty`；Earth 密文乘法下降为独立的 `ckks.mulcc` 和 `ckks.relinearize`。
 - `emit-runtime-plan` 支持单 Host 和已 placement 的函数：小 Encode payload 保持 inline，大 float64 payload 按阈值写入内容寻址 bundle，相同内容只保存一次；输出严格的 RuntimePlan V1 JSON，并覆盖 Mul/Relinearize、Upscale、常量、bundle 复用、Boot 层号换算、真实多 rank/device target 和点对点 Transfer。
-- 已增加 `dist.transfer`、`assign-ckks-placement` 和 `materialize-ckks-communication`。placement 使用确定性 HEFT、OperatorSpec V2 逐 level 延迟和固定 rank 内/间通信代价；当前是完整值放置，外部输入与 Encode 位于 Host rank 0，同一值到同一目标只复制一次。
+- 已增加 `dist.transfer`、`assign-ckks-placement` 和 `materialize-ckks-communication`。placement 使用确定性 HEFT 和 OperatorSpec V2 逐 level 延迟；通信支持固定 rank 内/间代价，也支持按 CKKS value 大小、链路速率上限和可选 payload/rate 点位表估算。当前是完整值放置，外部输入与 Encode 位于 Host rank 0，同一值到同一目标只复制一次。
 - 编译器 fixture 的 `1x8`/`2x8`/`2×CPU` 测试覆盖全部候选 Place、点对点 hint、本地操作数、时间区间不重叠、依赖到达时间和重复编译确定性。MLP 的 Host/`1x8`/`2x8`/`2×CPU` 计划已用 MockVecApi `AllValuesAfterRun` 完成每条 Encode、Compute、Transfer 及 final output 的精确差分，均为 0 diff。
 - 已删除依赖 destination-style 的旧 `ReuseBuffer` Pass，以及仅服务 HEVM 的 `RemoveLevel`/`EmitHEVM` Pass、C++ interpreter、Python runner 和示例执行脚本。Python frontend 不再生成 `.cst` 索引。
-- 待完成：目标合法化、Bootstrap placement、Replicate 合并、分片、显存容量和基于值大小/带宽/链路争用的通信代价。当前 placement 已直接读取 OperatorSpec V2；RuntimePlan V1 无需增加字段。
+- 待完成：目标合法化、Bootstrap placement、Replicate 合并、分片、显存容量、具体 device pair 和链路争用。当前粗粒度通信模型已经考虑值大小和带宽上限，但 profile 仍需用真实硬件数据标定；RuntimePlan V1 无需增加字段。
 
 ## 阶段三进行中
 

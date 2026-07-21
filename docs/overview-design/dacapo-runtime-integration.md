@@ -354,7 +354,7 @@ Dacapo 通过两份声明式配置了解目标:
 
 Dacapo 不 include 任何 Poseidon 头文件,也不调用 Poseidon 的运行时接口。
 
-当前实现还没有独立的 TargetSpec 文件。拓扑由 `device-counts` 参数给出，算子代价从 OperatorSpec V2 读取，通信代价由两个显式参数给出。等后续确实需要链路带宽、显存容量和异构设备时，再把这些参数收进稳定的 TargetSpec，不在现阶段先造一套空格式。
+当前实现还没有独立的 TargetSpec 文件。拓扑由 `device-counts` 参数给出，算子代价从 OperatorSpec V2 读取。通信代价可由独立的 placement communication profile 按 payload 大小、速率上限、启动延迟和可选点位表估算；旧的两个固定代价参数继续作为兼容路径。通信 profile 仍是编译期输入，不进入 RuntimePlan V1。等后续需要表达具体 GPU 对、链路争用、显存容量和异构设备时，再把这些参数收进稳定的 TargetSpec。
 
 ### 7.2 可选的 GPU boot CPU 模拟 Pass
 
@@ -398,7 +398,7 @@ Host 上的实现步骤是:用 Poseidon CPU 路径解密和解码,再按目标 c
 4. 选择完成时间最早的 device；完成时间相同时依次按开始时间、rank、device 和原始指令顺序决定，保证重复编译结果相同；
 5. 最后按计划开始时间重排指令，同时保留原 CKKS 逻辑 ValueId。
 
-每个候选 Place 是一条不能重叠的计算时间线。跨 Place 边的到达时间等于生产者完成时间加通信代价；同一值已经传到某个目标后，后续消费者复用这个到达时间。rank 内和 rank 间暂时分别使用固定整数代价，通信之间不争用链路，因此这个模型适合先验证分配与协议正确性，不代表真实性能预测。当前还没有值大小、带宽、通信并发限制、显存容量、异构 device 或分片模型。Boot 延迟从指定的 OperatorSpec V2 Boot profile 按输入 level 读取，缺少实测数据时直接失败。
+每个候选 Place 是一条不能重叠的计算时间线。跨 Place 边的到达时间等于生产者完成时间加通信代价；同一值已经传到某个目标后，后续消费者复用这个到达时间。传入 communication profile 时，首版模型按 `tensor_elements × components × (level + 1) × poly_degree × coefficient_bytes` 估算 value 大小，再通过链路启动延迟、速率上限和可选 payload/rate 点位表得到耗时；没有点位表时使用随 payload 增长而逼近速率上限的饱和曲线。不传 profile 时仍使用固定 rank 内/间代价。通信之间暂不争用链路，因此这个模型仍不代表完整性能预测。当前还没有通信并发限制、显存容量、具体 device pair、异构 device 或分片模型。Boot 延迟从指定的 OperatorSpec V2 Boot profile 按输入 level 读取，缺少实测数据时直接失败。
 
 `device-counts` 接受任意非空的正整数列表或全零列表，所以 `1x8`、`2x8`、`2×CPU` 之外的中小拓扑不需要改 IR 或算法。实际规模仍受 DAG 大小和候选 Place 数影响；调度会为每个节点检查全部候选位置及其时间线，不应把这个首版实现当成超大集群调度器。
 
@@ -651,7 +651,7 @@ Dacapo 测试模型
 4. 已完成编译器侧 CPU eager / GPU lazy 分流：生成脚本按 spec 的 `rescale_mode` 决定是否在 placement 前启用物理 level Pass；生产 GPU profile 和硬件实测仍需补齐;
 5. 加入可选的 GPU Boot→Host `decrypt_reencrypt` 合法化 Pass;
 6. 用 MockVecApi 建立真实编译产物的单卡端到端测试。基础链路已完成：Mul→Relinearize、Upscale、内联常量和 Boot level 换算均通过 Runtime verifier 与 MockVecApi;
-7. 已完成首版多卡 placement 和点对点 Transfer 插入：确定性 HEFT 使用 OperatorSpec V2 的逐 level 延迟和固定 rank 内/间通信代价；`1x8`、`2x8` fixture 与 MLP 已通过 MockVecApi 的逐指令和最终结果差分。Replicate、分片、显存容量和真实通信模型仍待实现。
+7. 已完成首版多卡 placement 和点对点 Transfer 插入：确定性 HEFT 使用 OperatorSpec V2 的逐 level 延迟；通信既支持固定 rank 内/间代价，也支持按 value 大小、速率上限和可选点位表估算。`1x8`、`2x8` fixture 与 MLP 已通过 MockVecApi 的逐指令和最终结果差分。Replicate、分片、显存容量、链路争用和实测通信 profile 仍待实现。
 
 ### 阶段三:接入 Poseidon CPU/GPU
 

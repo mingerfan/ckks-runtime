@@ -207,6 +207,11 @@ def build_optimizer_command(args, traced: Path, spec: dict,
             "--runtime-plan-inter-rank-communication-cost="
             f"{args.inter_rank_communication_cost}",
         ])
+        if args.communication_profile:
+            command.append(
+                "--runtime-plan-communication-profile-path="
+                f"{args.communication_profile}"
+            )
     else:
         command.append("--runtime-plan-device-count=0")
     command.extend([str(traced), "-o", str(optimized)])
@@ -251,6 +256,10 @@ def main() -> None:
         help="OperatorSpec V2 used for placement latency; defaults to --operator-spec",
     )
     parser.add_argument(
+        "--communication-profile", type=Path,
+        help="Payload-aware communication profile JSON used for placement",
+    )
+    parser.add_argument(
         "--intra-rank-communication-cost", type=int, default=1000,
         help="Fixed point-to-point cost between devices in one rank",
     )
@@ -283,6 +292,8 @@ def main() -> None:
     args.placement_operator_spec = (
         args.placement_operator_spec or args.operator_spec
     ).resolve()
+    if args.communication_profile:
+        args.communication_profile = args.communication_profile.resolve()
     args.hecate_build = args.hecate_build.resolve()
     args.hecate_opt = args.hecate_opt.resolve()
     args.python = Path(os.path.abspath(args.python))
@@ -299,6 +310,12 @@ def main() -> None:
         placement_spec, _ = read_operator_spec(args.placement_operator_spec)
         if placement_spec["spec_format_version"] != 2:
             raise ValueError("placement requires OperatorSpec V2")
+        if args.communication_profile and not args.communication_profile.is_file():
+            raise FileNotFoundError(
+                f"communication profile not found: {args.communication_profile}"
+            )
+    elif args.communication_profile:
+        raise ValueError("--communication-profile requires --device-counts")
 
     if args.traced_mlir:
         traced = args.traced_mlir.resolve()

@@ -269,7 +269,7 @@ Boot 内部如果也需要 lazy-rescale,其合法输入范围、实际 level 消
 
 输入逻辑 CKKS，输出已分配 CKKS。职责：为每条需要进入执行计划的计算指令选唯一的 `compute_place`；算出各结果需要出现的位置集合；使用编译期已知的固定拓扑；校验位置和目标 Api 能力；权衡 Host/Device、延迟、带宽、显存和密钥位置；**不插入实际通信**。`ckks.encode` 的输出 Place 固定为某个 Host,placement 只需要决定具体 rank并写入输出 ValueDesc;后续设备使用仍要插入显式 Transfer/Replicate。
 
-当前 `assign-ckks-placement` 已实现整值放置。它读取 `device-counts` 和 OperatorSpec V2，使用确定性的 HEFT ready-list 调度：节点代价取输入 level 对应的算子延迟，边代价暂时取固定的 rank 内/间点对点代价；每个 device 维护不重叠的计算区间，候选位置按最早完成时间选择。Pass 写入 `dist.logical_id`、`dist.rank`、`dist.device`、`dist.schedule_start` 和 `dist.schedule_finish`，并按开始时间重排 launch 顺序。外部输入和 Encode 目前固定在 Host rank 0；尚未建模分片、显存容量、链路争用和 Bootstrap。
+当前 `assign-ckks-placement` 已实现整值放置。它读取 `device-counts` 和 OperatorSpec V2，使用确定性的 HEFT ready-list 调度：节点代价取输入 level 对应的算子延迟；边代价可以从 CKKS degree、level、components 和通信 profile 估算 payload 字节数，再用速率上限、启动延迟及可选的 payload/rate 点位表计算，也保留固定 rank 内/间代价的兼容路径。每个 device 维护不重叠的计算区间，候选位置按最早完成时间选择。Pass 写入 `dist.logical_id`、`dist.rank`、`dist.device`、`dist.schedule_start` 和 `dist.schedule_finish`，并按开始时间重排 launch 顺序。外部输入和 Encode 目前固定在 Host rank 0；尚未建模分片、显存容量、链路争用和 Bootstrap。
 
 ### 7.4 通信显式化
 
