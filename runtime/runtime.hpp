@@ -30,7 +30,11 @@
 namespace fhegpu {
 
 enum class DiffMode { FinalOnly, AllValuesAfterRun };
-enum class DeviceExecutionMode { Sequential, PerDeviceWorkers };
+enum class DeviceExecutionMode {
+    Sequential,
+    PerDeviceWorkers,
+    PerDeviceReadyWorkers
+};
 
 struct RuntimeResources {
     const LoadedOperatorSpec &operator_spec;
@@ -54,6 +58,9 @@ struct RuntimeTiming {
     std::size_t communication_wait_calls = 0;
     std::uint64_t communication_post_nanoseconds = 0;
     std::uint64_t communication_wait_nanoseconds = 0;
+    std::size_t device_backfill_tasks = 0;
+    std::size_t device_ready_wait_calls = 0;
+    std::uint64_t device_ready_wait_nanoseconds = 0;
 
     std::uint64_t compute_excluding_boot_nanoseconds() const {
         return compute_including_boot_nanoseconds - boot_nanoseconds;
@@ -153,7 +160,7 @@ public:
             const auto online_execution_start = std::chrono::steady_clock::now();
             timing_.initialization_nanoseconds = elapsed_nanoseconds(
                 initialization_start, online_execution_start);
-            if (device_execution_mode_ == DeviceExecutionMode::PerDeviceWorkers) {
+            if (device_execution_mode_ != DeviceExecutionMode::Sequential) {
                 execute_device_parallel_phases();
             } else {
                 execute_phase(plan_->execution);
@@ -253,7 +260,18 @@ private:
         bool completed = false;
     };
 
-    using ParallelTask = std::function<void()>;
+    enum class ParallelTaskReadiness {
+        Blocked,
+        PendingCommunication,
+        Ready
+    };
+
+    struct ParallelTask {
+        std::uint64_t ordinal = 0;
+        std::vector<ValueId> input_ids;
+        std::function<void()> execute;
+        bool completed = false;
+    };
 
     const ValueDesc &desc(ValueId id) const {
         for (const auto &value : plan_->values) if (value.id == id) return value;
@@ -441,6 +459,10 @@ private:
         parallel_remaining_uses_ = remaining_uses_;
         parallel_failed_.store(false);
         parallel_failure_ = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(parallel_progress_mutex_);
+            parallel_progress_epoch_ = 0;
+        }
 
         for (const auto &item : store_.entries()) {
             const auto *ready =
@@ -464,6 +486,31 @@ private:
         }
         for (const auto &item : parallel_values_)
             item.second->condition.notify_all();
+        notify_parallel_progress();
+    }
+
+    void notify_parallel_progress() {
+        if (device_execution_mode_ !=
+            DeviceExecutionMode::PerDeviceReadyWorkers)
+            return;
+        {
+            std::lock_guard<std::mutex> lock(parallel_progress_mutex_);
+            ++parallel_progress_epoch_;
+        }
+        parallel_progress_condition_.notify_all();
+    }
+
+    ParallelTaskReadiness parallel_task_readiness(
+        const ParallelTask &task) const {
+        ParallelTaskReadiness readiness = ParallelTaskReadiness::Ready;
+        for (ValueId id : task.input_ids) {
+            auto value = parallel_value(id);
+            std::lock_guard<std::mutex> lock(value->mutex);
+            if (!value->defined) return ParallelTaskReadiness::Blocked;
+            if (!value->value)
+                readiness = ParallelTaskReadiness::PendingCommunication;
+        }
+        return readiness;
     }
 
     void release_parallel_value_after_use(ValueId id) {
@@ -528,6 +575,7 @@ private:
             }
             value->condition.notify_all();
         }
+        notify_parallel_progress();
         group->completed = true;
         const auto input_ids = group->local_input_ids;
         lock.unlock();
@@ -594,6 +642,7 @@ private:
             output_value->defined = true;
         }
         output_value->condition.notify_all();
+        notify_parallel_progress();
         for (ValueId id : op.inputs) release_parallel_value_after_use(id);
     }
 
@@ -629,6 +678,7 @@ private:
             }
             value->condition.notify_all();
         }
+        notify_parallel_progress();
     }
 
     int parallel_communication_worker(const CommAction &action) const {
@@ -666,10 +716,12 @@ private:
                     op->output, desc(op->output).place);
                 const std::size_t worker =
                     static_cast<std::size_t>(op->place.index) % tasks.size();
-                tasks[worker].push_back(
+                tasks[worker].push_back(ParallelTask{
+                    instruction.ordinal,
+                    op->inputs,
                     [this, op = *op, ordinal = instruction.ordinal, output] {
                         execute_parallel_compute(op, ordinal, output);
-                    });
+                    }});
                 continue;
             }
             if (std::holds_alternative<EncodeOp>(instruction.body))
@@ -692,10 +744,71 @@ private:
             const int device = parallel_communication_worker(action);
             const std::size_t worker =
                 static_cast<std::size_t>(device) % tasks.size();
-            tasks[worker].push_back(
+            tasks[worker].push_back(ParallelTask{
+                instruction.ordinal,
+                group->local_input_ids,
                 [this, action, ordinal = instruction.ordinal, group] {
                     execute_parallel_communication(action, ordinal, group);
+                }});
+        }
+    }
+
+    void execute_ready_parallel_tasks(std::vector<ParallelTask> &tasks) {
+        std::size_t remaining = tasks.size();
+        while (remaining != 0) {
+            if (parallel_failed_.load()) return;
+
+            std::uint64_t observed_epoch = 0;
+            {
+                std::lock_guard<std::mutex> lock(parallel_progress_mutex_);
+                observed_epoch = parallel_progress_epoch_;
+            }
+
+            std::optional<std::size_t> first_unfinished;
+            std::optional<std::size_t> pending_communication;
+            std::optional<std::size_t> selected;
+            for (std::size_t index = 0; index < tasks.size(); ++index) {
+                auto &task = tasks[index];
+                if (task.completed) continue;
+                if (!first_unfinished) first_unfinished = index;
+                const auto readiness = parallel_task_readiness(task);
+                if (readiness == ParallelTaskReadiness::Ready) {
+                    selected = index;
+                    break;
+                }
+                if (readiness == ParallelTaskReadiness::PendingCommunication &&
+                    !pending_communication)
+                    pending_communication = index;
+            }
+            if (!selected) selected = pending_communication;
+
+            if (selected) {
+                auto &task = tasks[*selected];
+                if (first_unfinished && *selected != *first_unfinished) {
+                    std::lock_guard<std::mutex> lock(parallel_timing_mutex_);
+                    ++timing_.device_backfill_tasks;
+                }
+                task.completed = true;
+                task.execute();
+                --remaining;
+                continue;
+            }
+
+            const auto wait_start = std::chrono::steady_clock::now();
+            {
+                std::unique_lock<std::mutex> lock(parallel_progress_mutex_);
+                parallel_progress_condition_.wait(lock, [&] {
+                    return parallel_failed_.load() ||
+                           parallel_progress_epoch_ != observed_epoch;
                 });
+            }
+            const auto wait_elapsed = elapsed_nanoseconds(
+                wait_start, std::chrono::steady_clock::now());
+            {
+                std::lock_guard<std::mutex> lock(parallel_timing_mutex_);
+                ++timing_.device_ready_wait_calls;
+                timing_.device_ready_wait_nanoseconds += wait_elapsed;
+            }
         }
     }
 
@@ -719,9 +832,14 @@ private:
         for (std::size_t device = 0; device < tasks.size(); ++device) {
             workers.emplace_back([this, &tasks, device] {
                 try {
-                    for (auto &task : tasks[device]) {
-                        if (parallel_failed_.load()) return;
-                        task();
+                    if (device_execution_mode_ ==
+                        DeviceExecutionMode::PerDeviceReadyWorkers) {
+                        execute_ready_parallel_tasks(tasks[device]);
+                    } else {
+                        for (auto &task : tasks[device]) {
+                            if (parallel_failed_.load()) return;
+                            task.execute();
+                        }
                     }
                 } catch (...) {
                     record_parallel_failure(std::current_exception());
@@ -856,6 +974,9 @@ private:
     std::atomic<bool> parallel_failed_{false};
     std::mutex parallel_failure_mutex_;
     std::exception_ptr parallel_failure_;
+    std::mutex parallel_progress_mutex_;
+    std::condition_variable parallel_progress_condition_;
+    std::uint64_t parallel_progress_epoch_ = 0;
     bool retain_all_values_ = false;
 };
 
