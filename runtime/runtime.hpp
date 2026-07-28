@@ -106,9 +106,11 @@ public:
 
     SequentialRuntime(int rank, int world_size, int local_devices, Api &api,
                       DeviceExecutionMode device_execution_mode =
-                          DeviceExecutionMode::Sequential)
+                          DeviceExecutionMode::Sequential,
+                      std::size_t device_worker_count = 0)
         : rank_(rank), world_size_(world_size), local_devices_(local_devices), api_(api),
-          device_execution_mode_(device_execution_mode) {}
+          device_execution_mode_(device_execution_mode),
+          device_worker_count_(device_worker_count) {}
 
     RunArtifact<Value> run(const LoadedRuntimePlan &loaded_plan,
                            const RuntimeResources &resources,
@@ -662,7 +664,9 @@ private:
                         "per-device worker execution requires Device compute operations");
                 auto output = define_parallel_value(
                     op->output, desc(op->output).place);
-                tasks[static_cast<std::size_t>(op->place.index)].push_back(
+                const std::size_t worker =
+                    static_cast<std::size_t>(op->place.index) % tasks.size();
+                tasks[worker].push_back(
                     [this, op = *op, ordinal = instruction.ordinal, output] {
                         execute_parallel_compute(op, ordinal, output);
                     });
@@ -685,8 +689,10 @@ private:
                     action.outputs[i], action.destinations[i]));
             }
             parallel_groups_.push_back(group);
-            const int worker = parallel_communication_worker(action);
-            tasks[static_cast<std::size_t>(worker)].push_back(
+            const int device = parallel_communication_worker(action);
+            const std::size_t worker =
+                static_cast<std::size_t>(device) % tasks.size();
+            tasks[worker].push_back(
                 [this, action, ordinal = instruction.ordinal, group] {
                     execute_parallel_communication(action, ordinal, group);
                 });
@@ -695,8 +701,16 @@ private:
 
     void execute_device_parallel_phases() {
         prepare_parallel_values();
+        const std::size_t worker_count =
+            device_worker_count_ == 0
+                ? static_cast<std::size_t>(local_devices_)
+                : device_worker_count_;
+        if (worker_count == 0 ||
+            worker_count > static_cast<std::size_t>(local_devices_))
+            throw std::runtime_error(
+                "device worker count must be between one and local device count");
         std::vector<std::vector<ParallelTask>> tasks(
-            static_cast<std::size_t>(local_devices_));
+            worker_count);
         compile_parallel_phase(plan_->execution, tasks);
         compile_parallel_phase(plan_->finalization, tasks);
 
@@ -822,6 +836,7 @@ private:
     int local_devices_;
     Api &api_;
     DeviceExecutionMode device_execution_mode_;
+    std::size_t device_worker_count_ = 0;
     const RuntimePlan *plan_ = nullptr;
     std::string plan_source_sha256_;
     const Instruction *current_ = nullptr;
