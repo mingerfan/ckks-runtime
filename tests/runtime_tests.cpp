@@ -75,8 +75,8 @@ void test_requirements_and_vec_operations() {
     const auto spec = load_spec(loaded.plan);
     const auto requirements = PlanVerifier::verify(loaded.plan, spec);
     require(std::find(requirements.capabilities.begin(), requirements.capabilities.end(), RequiredCapability::Transfer) != requirements.capabilities.end(), "Transfer capability was not derived");
-    require(std::find(requirements.keys.begin(), requirements.keys.end(), KeyRequirement{KeyKind::Relin, {PlaceKind::Device, 0, 0}, std::nullopt}) != requirements.keys.end(), "relin key was not derived");
-    require(std::find(requirements.keys.begin(), requirements.keys.end(), KeyRequirement{KeyKind::Galois, {PlaceKind::Device, 0, 0}, 16383}) != requirements.keys.end(), "normalized Galois step was not derived");
+    require(std::find(requirements.keys.begin(), requirements.keys.end(), KeyRequirement{KeyKind::Relin, {PlaceKind::Device, 0, 0}, std::nullopt, 5}) != requirements.keys.end(), "level-specific relin key was not derived");
+    require(std::find(requirements.keys.begin(), requirements.keys.end(), KeyRequirement{KeyKind::Galois, {PlaceKind::Device, 0, 0}, 16383, 4}) != requirements.keys.end(), "level-specific normalized Galois key was not derived");
 
     VecExecutor executor;
     const Place place{PlaceKind::Host, 0, 0};
@@ -244,7 +244,7 @@ void test_preflight_and_digest_debug_mode() {
     const auto spec = load_spec(plan.plan);
     const auto input = make_cipher({1, 2, 3, 4}, "ctx-main", 32768, 5, 40);
     MockClusterConfig missing;
-    missing.missing_keys.insert(KeyRequirement{KeyKind::Galois, {PlaceKind::Device, 0, 0}, 16383});
+    missing.missing_keys.insert(KeyRequirement{KeyKind::Galois, {PlaceKind::Device, 0, 0}, 16383, 4});
     expect_throw([&] { run_mock_cluster(plan.plan, spec, {{1, input}}, missing, {}, DiffMode::FinalOnly); }, "rotation step 16383");
     missing = {};
     missing.missing_capabilities.insert(RequiredCapability::Transfer);

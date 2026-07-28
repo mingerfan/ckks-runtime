@@ -188,6 +188,7 @@ void MockVecApi::preflight(std::string_view plan_source_sha256,
         if (!cluster_->key_available(key)) {
             std::string message = "Api lacks required " + to_string(key.kind) + " key at " + to_string(key.place);
             if (key.rotation_step) message += " for rotation step " + std::to_string(*key.rotation_step);
+            if (key.level) message += " at level " + std::to_string(*key.level);
             throw std::runtime_error(message);
         }
     cluster_->preflight(rank_, std::string(plan_source_sha256), skip_artifact_digest_checks);

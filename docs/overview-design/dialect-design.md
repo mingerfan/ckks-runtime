@@ -452,6 +452,7 @@ struct KeyRequirement {
     KeyKind kind;
     Place place;
     std::optional<int> rotation_step;
+    std::optional<int> level;
 };
 
 struct TargetConfig {

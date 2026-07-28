@@ -15,11 +15,12 @@ bool operator<(const Place &a, const Place &b) {
 }
 
 bool operator==(const KeyRequirement &a, const KeyRequirement &b) {
-    return a.kind == b.kind && a.place == b.place && a.rotation_step == b.rotation_step;
+    return a.kind == b.kind && a.place == b.place &&
+           a.rotation_step == b.rotation_step && a.level == b.level;
 }
 bool operator<(const KeyRequirement &a, const KeyRequirement &b) {
-    return std::tie(a.kind, a.place, a.rotation_step) <
-           std::tie(b.kind, b.place, b.rotation_step);
+    return std::tie(a.kind, a.place, a.rotation_step, a.level) <
+           std::tie(b.kind, b.place, b.rotation_step, b.level);
 }
 
 std::string to_string(const Place &p) {

@@ -250,9 +250,11 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                 if (op->place.kind == PlaceKind::Host) capabilities.insert(RequiredCapability::HostCompute);
                 if (op->kind == ComputeKind::Rotate) {
                     const int step = normalized_rotation_step(std::get<RotateAttrs>(op->attrs).steps, spec.poly_degree / 2);
-                    keys.insert(KeyRequirement{KeyKind::Galois, op->place, step});
+                    const auto &input = lookup(descs, op->inputs[0], "Rotate input");
+                    keys.insert(KeyRequirement{KeyKind::Galois, op->place, step, input.level});
                 } else if (op->kind == ComputeKind::Relinearize) {
-                    keys.insert(KeyRequirement{KeyKind::Relin, op->place, std::nullopt});
+                    const auto &input = lookup(descs, op->inputs[0], "Relinearize input");
+                    keys.insert(KeyRequirement{KeyKind::Relin, op->place, std::nullopt, input.level});
                 } else if (op->kind == ComputeKind::Rescale) {
                     const auto attrs = std::get<RescaleAttrs>(op->attrs);
                     const auto &input = lookup(descs, op->inputs[0], "Rescale input");
@@ -271,7 +273,7 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                         capabilities.insert(RequiredCapability::BootNative);
                     else {
                         capabilities.insert(RequiredCapability::BootDecryptReencrypt);
-                        keys.insert(KeyRequirement{KeyKind::Secret, op->place, std::nullopt});
+                        keys.insert(KeyRequirement{KeyKind::Secret, op->place, std::nullopt, std::nullopt});
                     }
                 }
             } else if (const auto *action = std::get_if<CommAction>(&instruction.body)) {

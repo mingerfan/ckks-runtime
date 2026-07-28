@@ -115,6 +115,7 @@ struct KeyRequirement {
     KeyKind kind = KeyKind::Secret;
     Place place;
     std::optional<int> rotation_step;
+    std::optional<int> level;
 };
 
 bool operator==(const KeyRequirement &a, const KeyRequirement &b);
