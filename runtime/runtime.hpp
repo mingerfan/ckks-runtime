@@ -3,24 +3,34 @@
 #include "runtime/plaintext_bundle.hpp"
 #include "runtime/verifier.hpp"
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
+#include <utility>
 #include <variant>
+#include <vector>
 
 namespace fhegpu {
 
 enum class DiffMode { FinalOnly, AllValuesAfterRun };
+enum class DeviceExecutionMode { Sequential, PerDeviceWorkers };
 
 struct RuntimeResources {
     const LoadedOperatorSpec &operator_spec;
@@ -94,8 +104,11 @@ public:
     using Value = typename Api::Value;
     using CommHandle = typename Api::CommHandle;
 
-    SequentialRuntime(int rank, int world_size, int local_devices, Api &api)
-        : rank_(rank), world_size_(world_size), local_devices_(local_devices), api_(api) {}
+    SequentialRuntime(int rank, int world_size, int local_devices, Api &api,
+                      DeviceExecutionMode device_execution_mode =
+                          DeviceExecutionMode::Sequential)
+        : rank_(rank), world_size_(world_size), local_devices_(local_devices), api_(api),
+          device_execution_mode_(device_execution_mode) {}
 
     RunArtifact<Value> run(const LoadedRuntimePlan &loaded_plan,
                            const RuntimeResources &resources,
@@ -138,9 +151,13 @@ public:
             const auto online_execution_start = std::chrono::steady_clock::now();
             timing_.initialization_nanoseconds = elapsed_nanoseconds(
                 initialization_start, online_execution_start);
-            execute_phase(plan_->execution);
-            execute_phase(plan_->finalization);
-            finish_all_groups();
+            if (device_execution_mode_ == DeviceExecutionMode::PerDeviceWorkers) {
+                execute_device_parallel_phases();
+            } else {
+                execute_phase(plan_->execution);
+                execute_phase(plan_->finalization);
+                finish_all_groups();
+            }
             synchronize_final_outputs();
             timing_.online_execution_nanoseconds = elapsed_nanoseconds(
                 online_execution_start, std::chrono::steady_clock::now());
@@ -195,6 +212,7 @@ private:
                      std::string_view op,
                      std::uint64_t duration_nanoseconds) {
         if (!runtime_trace_) return;
+        std::lock_guard<std::mutex> lock(trace_mutex_);
         *runtime_trace_ << rank_ << ',' << event << ',' << id << ','
                         << ordinal << ',';
         if (consumer_ordinal) *runtime_trace_ << *consumer_ordinal;
@@ -210,6 +228,30 @@ private:
         std::uint64_t instruction_ordinal = 0;
         bool completed = false;
     };
+
+    struct ParallelGroup;
+
+    struct ParallelValue {
+        Place place;
+        std::mutex mutex;
+        std::condition_variable condition;
+        bool defined = false;
+        std::optional<Value> value;
+        std::shared_ptr<ParallelGroup> group;
+        std::size_t local_slot = 0;
+    };
+
+    struct ParallelGroup {
+        CommAction action;
+        std::uint64_t instruction_ordinal = 0;
+        std::vector<ValueId> local_input_ids;
+        std::vector<std::shared_ptr<ParallelValue>> local_outputs;
+        CommHandle handle;
+        std::mutex mutex;
+        bool completed = false;
+    };
+
+    using ParallelTask = std::function<void()>;
 
     const ValueDesc &desc(ValueId id) const {
         for (const auto &value : plan_->values) if (value.id == id) return value;
@@ -364,6 +406,333 @@ private:
         group.completed = true;
     }
 
+    std::shared_ptr<ParallelValue> parallel_value(ValueId id) const {
+        const auto found = parallel_values_.find(id);
+        if (found == parallel_values_.end())
+            throw std::runtime_error(
+                "ValueId is absent from parallel ValueStore: " +
+                std::to_string(id));
+        return found->second;
+    }
+
+    std::shared_ptr<ParallelValue> define_parallel_value(
+        ValueId id, const Place &place) {
+        auto value = std::make_shared<ParallelValue>();
+        value->place = place;
+        if (!parallel_values_.emplace(id, value).second)
+            throw std::runtime_error(
+                "ValueId defined twice in parallel ValueStore: " +
+                std::to_string(id));
+        return value;
+    }
+
+    void prepare_parallel_values() {
+        if (retain_all_values_)
+            throw std::runtime_error(
+                "per-device worker execution does not support AllValuesAfterRun");
+        if (world_size_ != 1 || local_devices_ <= 0)
+            throw std::runtime_error(
+                "per-device worker execution requires one rank and at least one device");
+
+        parallel_values_.clear();
+        parallel_groups_.clear();
+        parallel_remaining_uses_ = remaining_uses_;
+        parallel_failed_.store(false);
+        parallel_failure_ = nullptr;
+
+        for (const auto &item : store_.entries()) {
+            const auto *ready =
+                std::get_if<typename ValueStore<Api>::Ready>(&item.second);
+            if (ready == nullptr)
+                throw std::runtime_error(
+                    "initialization left a pending value before parallel execution");
+            auto value = define_parallel_value(item.first, ready->place);
+            value->value.emplace(ready->value);
+            value->defined = true;
+        }
+        store_ = ValueStore<Api>{};
+    }
+
+    void record_parallel_failure(std::exception_ptr failure) {
+        bool expected = false;
+        if (!parallel_failed_.compare_exchange_strong(expected, true)) return;
+        {
+            std::lock_guard<std::mutex> lock(parallel_failure_mutex_);
+            parallel_failure_ = std::move(failure);
+        }
+        for (const auto &item : parallel_values_)
+            item.second->condition.notify_all();
+    }
+
+    void release_parallel_value_after_use(ValueId id) {
+        bool release = false;
+        {
+            std::lock_guard<std::mutex> lock(parallel_use_mutex_);
+            const auto found = parallel_remaining_uses_.find(id);
+            if (found == parallel_remaining_uses_.end() || found->second == 0)
+                throw std::runtime_error(
+                    "ValueId has no remaining parallel use: " +
+                    std::to_string(id));
+            release = --found->second == 0;
+        }
+        if (!release) return;
+
+        std::optional<Value> released;
+        auto value = parallel_value(id);
+        {
+            std::lock_guard<std::mutex> lock(value->mutex);
+            if (!value->defined || !value->value)
+                throw std::runtime_error(
+                    "parallel ValueId cannot be released before it is ready: " +
+                    std::to_string(id));
+            released.emplace(std::move(*value->value));
+            value->value.reset();
+        }
+    }
+
+    void finish_parallel_group(
+        const std::shared_ptr<ParallelGroup> &group,
+        std::optional<std::uint64_t> consumer_ordinal) {
+        std::unique_lock<std::mutex> lock(group->mutex);
+        if (group->completed) return;
+
+        const auto wait_start = std::chrono::steady_clock::now();
+        auto outputs = api_.wait(group->handle);
+        const auto wait_elapsed = elapsed_nanoseconds(
+            wait_start, std::chrono::steady_clock::now());
+        {
+            std::lock_guard<std::mutex> timing_lock(parallel_timing_mutex_);
+            ++timing_.communication_wait_calls;
+            timing_.communication_wait_nanoseconds += wait_elapsed;
+        }
+        trace_event("comm_wait", group->action.id,
+                    group->instruction_ordinal, consumer_ordinal,
+                    to_string(group->action.kind), wait_elapsed);
+        if (outputs.size() != group->local_outputs.size())
+            throw std::runtime_error("Api wait returned wrong parallel output count");
+
+        for (std::size_t i = 0; i < outputs.size(); ++i) {
+            const ValueId id = group->action.outputs[i];
+            const auto &expected_desc = desc(id);
+            api_.validate_value(outputs[i], expected_desc);
+            auto &value = group->local_outputs[i];
+            {
+                std::lock_guard<std::mutex> value_lock(value->mutex);
+                if (!value->defined || value->group.get() != group.get())
+                    throw std::runtime_error(
+                        "parallel communication output state is invalid");
+                value->value.emplace(std::move(outputs[i]));
+                value->group.reset();
+            }
+            value->condition.notify_all();
+        }
+        group->completed = true;
+        const auto input_ids = group->local_input_ids;
+        lock.unlock();
+        for (ValueId id : input_ids) release_parallel_value_after_use(id);
+    }
+
+    Value resolve_parallel_value(
+        ValueId id, const Place &expected_place,
+        std::optional<std::uint64_t> consumer_ordinal) {
+        auto value = parallel_value(id);
+        for (;;) {
+            std::shared_ptr<ParallelGroup> group;
+            {
+                std::unique_lock<std::mutex> lock(value->mutex);
+                value->condition.wait(lock, [&] {
+                    return value->defined || parallel_failed_.load();
+                });
+                if (parallel_failed_.load())
+                    throw std::runtime_error("parallel execution was cancelled");
+                if (value->place != expected_place)
+                    throw std::runtime_error(
+                        "parallel value Place mismatch for " +
+                        std::to_string(id));
+                if (value->value) return *value->value;
+                group = value->group;
+            }
+            if (!group)
+                throw std::runtime_error(
+                    "parallel value is defined without data or communication");
+            finish_parallel_group(group, consumer_ordinal);
+        }
+    }
+
+    void execute_parallel_compute(
+        ComputeOp op, std::uint64_t instruction_ordinal,
+        const std::shared_ptr<ParallelValue> &output_value) {
+        std::vector<Value> inputs;
+        inputs.reserve(op.inputs.size());
+        for (ValueId id : op.inputs)
+            inputs.push_back(resolve_parallel_value(
+                id, op.place, instruction_ordinal));
+
+        const auto start = std::chrono::steady_clock::now();
+        Value output = api_.compute(op, inputs);
+        const auto elapsed = elapsed_nanoseconds(
+            start, std::chrono::steady_clock::now());
+        trace_event("compute", op.output, instruction_ordinal,
+                    std::nullopt, to_string(op.kind), elapsed);
+        {
+            std::lock_guard<std::mutex> lock(parallel_timing_mutex_);
+            ++timing_.compute_calls;
+            timing_.compute_including_boot_nanoseconds += elapsed;
+            if (op.kind == ComputeKind::Boot) {
+                ++timing_.boot_calls;
+                timing_.boot_nanoseconds += elapsed;
+            }
+        }
+
+        const auto &output_desc = desc(op.output);
+        api_.validate_value(output, output_desc);
+        {
+            std::lock_guard<std::mutex> lock(output_value->mutex);
+            output_value->value.emplace(std::move(output));
+            output_value->defined = true;
+        }
+        output_value->condition.notify_all();
+        for (ValueId id : op.inputs) release_parallel_value_after_use(id);
+    }
+
+    void execute_parallel_communication(
+        CommAction action, std::uint64_t instruction_ordinal,
+        const std::shared_ptr<ParallelGroup> &group) {
+        std::vector<Value> local_inputs;
+        for (std::size_t i = 0; i < action.inputs.size(); ++i) {
+            if (action.sources[i].rank != rank_) continue;
+            local_inputs.push_back(resolve_parallel_value(
+                action.inputs[i], action.sources[i], instruction_ordinal));
+        }
+
+        const auto post_start = std::chrono::steady_clock::now();
+        group->handle = api_.communicate_async(action, local_inputs);
+        const auto post_elapsed = elapsed_nanoseconds(
+            post_start, std::chrono::steady_clock::now());
+        {
+            std::lock_guard<std::mutex> lock(parallel_timing_mutex_);
+            ++timing_.communication_post_calls;
+            timing_.communication_post_nanoseconds += post_elapsed;
+        }
+        trace_event("comm_post", action.id, instruction_ordinal,
+                    std::nullopt, to_string(action.kind), post_elapsed);
+
+        for (std::size_t i = 0; i < group->local_outputs.size(); ++i) {
+            auto &value = group->local_outputs[i];
+            {
+                std::lock_guard<std::mutex> lock(value->mutex);
+                value->group = group;
+                value->local_slot = i;
+                value->defined = true;
+            }
+            value->condition.notify_all();
+        }
+    }
+
+    int parallel_communication_worker(const CommAction &action) const {
+        std::optional<int> worker;
+        const auto select = [&](const Place &place) {
+            if (place.rank != rank_ || place.kind != PlaceKind::Device) return;
+            if (place.index < 0 || place.index >= local_devices_)
+                throw std::runtime_error(
+                    "parallel communication uses an unavailable device");
+            if (worker && *worker != place.index)
+                throw std::runtime_error(
+                    "parallel communication cannot own outputs on multiple devices");
+            worker = place.index;
+        };
+        for (const Place &destination : action.destinations) select(destination);
+        if (!worker)
+            for (const Place &source : action.sources) select(source);
+        if (!worker)
+            throw std::runtime_error(
+                "parallel communication has no local device worker");
+        return *worker;
+    }
+
+    void compile_parallel_phase(
+        const std::vector<Instruction> &instructions,
+        std::vector<std::vector<ParallelTask>> &tasks) {
+        for (const auto &instruction : instructions) {
+            if (const auto *op = std::get_if<ComputeOp>(&instruction.body)) {
+                if (op->place.rank != rank_) continue;
+                if (op->place.kind != PlaceKind::Device ||
+                    op->place.index < 0 || op->place.index >= local_devices_)
+                    throw std::runtime_error(
+                        "per-device worker execution requires Device compute operations");
+                auto output = define_parallel_value(
+                    op->output, desc(op->output).place);
+                tasks[static_cast<std::size_t>(op->place.index)].push_back(
+                    [this, op = *op, ordinal = instruction.ordinal, output] {
+                        execute_parallel_compute(op, ordinal, output);
+                    });
+                continue;
+            }
+            if (std::holds_alternative<EncodeOp>(instruction.body))
+                throw std::runtime_error(
+                    "per-device worker execution does not support online Encode");
+
+            const auto action = std::get<CommAction>(instruction.body);
+            auto group = std::make_shared<ParallelGroup>();
+            group->action = action;
+            group->instruction_ordinal = instruction.ordinal;
+            for (std::size_t i = 0; i < action.inputs.size(); ++i)
+                if (action.sources[i].rank == rank_)
+                    group->local_input_ids.push_back(action.inputs[i]);
+            for (std::size_t i = 0; i < action.outputs.size(); ++i) {
+                if (action.destinations[i].rank != rank_) continue;
+                group->local_outputs.push_back(define_parallel_value(
+                    action.outputs[i], action.destinations[i]));
+            }
+            parallel_groups_.push_back(group);
+            const int worker = parallel_communication_worker(action);
+            tasks[static_cast<std::size_t>(worker)].push_back(
+                [this, action, ordinal = instruction.ordinal, group] {
+                    execute_parallel_communication(action, ordinal, group);
+                });
+        }
+    }
+
+    void execute_device_parallel_phases() {
+        prepare_parallel_values();
+        std::vector<std::vector<ParallelTask>> tasks(
+            static_cast<std::size_t>(local_devices_));
+        compile_parallel_phase(plan_->execution, tasks);
+        compile_parallel_phase(plan_->finalization, tasks);
+
+        std::vector<std::thread> workers;
+        workers.reserve(tasks.size());
+        for (std::size_t device = 0; device < tasks.size(); ++device) {
+            workers.emplace_back([this, &tasks, device] {
+                try {
+                    for (auto &task : tasks[device]) {
+                        if (parallel_failed_.load()) return;
+                        task();
+                    }
+                } catch (...) {
+                    record_parallel_failure(std::current_exception());
+                }
+            });
+        }
+        for (auto &worker : workers) worker.join();
+        if (parallel_failed_.load()) {
+            std::lock_guard<std::mutex> lock(parallel_failure_mutex_);
+            std::rethrow_exception(parallel_failure_);
+        }
+
+        for (ValueId id : plan_->final_outputs) {
+            const auto &output_desc = desc(id);
+            if (output_desc.place.rank != rank_) continue;
+            Value output = resolve_parallel_value(
+                id, output_desc.place, std::nullopt);
+            store_.define_ready(id, output_desc.place, std::move(output));
+        }
+        for (const auto &group : parallel_groups_)
+            if (!group->completed)
+                throw std::runtime_error(
+                    "parallel communication output was never consumed");
+    }
+
     void initialize_use_counts() {
         if (retain_all_values_) return;
         const auto count_phase = [&](const std::vector<Instruction> &instructions) {
@@ -452,6 +821,7 @@ private:
     int world_size_;
     int local_devices_;
     Api &api_;
+    DeviceExecutionMode device_execution_mode_;
     const RuntimePlan *plan_ = nullptr;
     std::string plan_source_sha256_;
     const Instruction *current_ = nullptr;
@@ -460,8 +830,17 @@ private:
     std::vector<PendingGroup> groups_;
     std::map<std::string, std::vector<double>> bundle_slots_;
     std::unordered_map<ValueId, std::size_t> remaining_uses_;
+    std::unordered_map<ValueId, std::shared_ptr<ParallelValue>> parallel_values_;
+    std::vector<std::shared_ptr<ParallelGroup>> parallel_groups_;
+    std::unordered_map<ValueId, std::size_t> parallel_remaining_uses_;
     RuntimeTiming timing_;
     std::unique_ptr<std::ofstream> runtime_trace_;
+    std::mutex trace_mutex_;
+    std::mutex parallel_timing_mutex_;
+    std::mutex parallel_use_mutex_;
+    std::atomic<bool> parallel_failed_{false};
+    std::mutex parallel_failure_mutex_;
+    std::exception_ptr parallel_failure_;
     bool retain_all_values_ = false;
 };
 
