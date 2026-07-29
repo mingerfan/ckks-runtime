@@ -440,6 +440,23 @@ void test_device_ready_worker_backfills_blocked_head() {
             "ready worker did not report a backfilled task");
     require(output.slots == std::vector<double>({1, 2, 3, 4}),
             "ready worker changed the final result");
+
+    auto dependency_cluster =
+        std::make_shared<MockCluster>(MockClusterConfig{});
+    BackfillProbeApi dependency_api(dependency_cluster);
+    SequentialRuntime<BackfillProbeApi> dependency_runtime(
+        0, 1, 2, dependency_api,
+        DeviceExecutionMode::PerDeviceDependencyWorkers, 2);
+    const auto dependency_artifact = dependency_runtime.run(
+        loaded, resources, {{0, input}});
+    const auto dependency_output =
+        dependency_artifact.values.at(7).value.materialize();
+    require(dependency_api.producer_started(),
+            "dependency worker producer was not executed");
+    require(dependency_artifact.timing.device_backfill_tasks >= 1,
+            "dependency worker did not activate an independent operation");
+    require(dependency_output.slots == std::vector<double>({1, 2, 3, 4}),
+            "dependency worker changed the final result");
 }
 
 } // namespace
@@ -454,7 +471,7 @@ int main() {
         run_test("Host and Device Boot paths", test_boot_paths);
         run_test("preflight and digest debug mode", test_preflight_and_digest_debug_mode);
         run_test("Mock sync/async multi-rank matrix", test_mock_sync_async_matrix);
-        run_test("Device ready worker backfills a blocked head",
+        run_test("Device ready and dependency workers bypass a blocked head",
                  test_device_ready_worker_backfills_blocked_head);
         std::cout << "ALL " << tests_run << " TEST GROUPS PASSED\n";
         return 0;
