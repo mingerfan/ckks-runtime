@@ -955,7 +955,9 @@ private:
                     ++queue->next_unfinished;
             }
 
-            if (wait_elapsed != 0 && queue->compute_queue) {
+            if (wait_elapsed != 0) {
+                // Count both compute and communication queue waits so the
+                // metric matches the total time workers spent blocked.
                 std::lock_guard<std::mutex> lock(parallel_timing_mutex_);
                 ++timing_.device_ready_wait_calls;
                 timing_.device_ready_wait_nanoseconds += wait_elapsed;
