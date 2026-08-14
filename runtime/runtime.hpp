@@ -98,12 +98,6 @@ public:
         return it->second;
     }
     const std::unordered_map<ValueId, Entry> &entries() const { return entries_; }
-    void erase(ValueId id) {
-        if (entries_.erase(id) != 1)
-            throw std::runtime_error("ValueId cannot be released from ValueStore: " +
-                                     std::to_string(id));
-    }
-
 private:
     std::unordered_map<ValueId, Entry> entries_;
 };
@@ -133,8 +127,7 @@ public:
         store_ = ValueStore<Api>{};
         groups_.clear();
         bundle_slots_.clear();
-        retain_all_values_ = diff_mode == DiffMode::AllValuesAfterRun;
-        remaining_uses_.clear();
+        return_all_values_ = diff_mode == DiffMode::AllValuesAfterRun;
         timing_ = RuntimeTiming{};
         open_trace();
         open_wait_trace();
@@ -148,7 +141,6 @@ public:
             const PlanRequirements requirements = PlanVerifier::verify(
                 *plan_, resources.operator_spec, resources.skip_artifact_digest_checks);
             PlanVerifier::verify_runtime_target(*plan_, rank_, world_size_, local_devices_);
-            initialize_use_counts();
             load_bundle(resources);
             api_.preflight(loaded_plan.source_sha256,
                            resources.skip_artifact_digest_checks,
@@ -238,7 +230,6 @@ private:
 
     struct PendingGroup {
         CommAction action;
-        std::vector<ValueId> local_input_ids;
         std::vector<ValueId> local_output_ids;
         CommHandle handle;
         std::uint64_t instruction_ordinal = 0;
@@ -657,7 +648,6 @@ private:
         const auto &output_desc = desc(op.output);
         api_.validate_value(output, output_desc);
         store_.define_ready(op.output, op.place, std::move(output));
-        for (ValueId id : op.inputs) release_after_use(id);
     }
 
     void execute_communication(const CommAction &action) {
@@ -667,9 +657,6 @@ private:
         PendingGroup group;
         group.action = action;
         group.instruction_ordinal = current_->ordinal;
-        for (std::size_t i = 0; i < action.inputs.size(); ++i)
-            if (action.sources[i].rank == rank_)
-                group.local_input_ids.push_back(action.inputs[i]);
         const auto post_start = std::chrono::steady_clock::now();
         group.handle = api_.communicate_async(action, local_inputs);
         const auto post_elapsed = elapsed_nanoseconds(
@@ -708,7 +695,6 @@ private:
             api_.validate_value(outputs[i], expected_desc);
             store_.lookup(id) = typename ValueStore<Api>::Ready{expected_desc.place, std::move(outputs[i])};
         }
-        for (ValueId id : group.local_input_ids) release_after_use(id);
         group.completed = true;
     }
 
@@ -733,7 +719,7 @@ private:
     }
 
     void prepare_parallel_values() {
-        if (retain_all_values_)
+        if (return_all_values_)
             throw std::runtime_error(
                 "per-device worker execution does not support AllValuesAfterRun");
         if (world_size_ != 1 || local_devices_ <= 0)
@@ -744,7 +730,6 @@ private:
         parallel_groups_.clear();
         parallel_dependency_dependents_.clear();
         parallel_dependency_queues_.clear();
-        parallel_remaining_uses_ = remaining_uses_;
         parallel_failed_.store(false);
         parallel_failure_ = nullptr;
         {
@@ -832,32 +817,6 @@ private:
         return readiness;
     }
 
-    void release_parallel_value_after_use(ValueId id) {
-        bool release = false;
-        {
-            std::lock_guard<std::mutex> lock(parallel_use_mutex_);
-            const auto found = parallel_remaining_uses_.find(id);
-            if (found == parallel_remaining_uses_.end() || found->second == 0)
-                throw std::runtime_error(
-                    "ValueId has no remaining parallel use: " +
-                    std::to_string(id));
-            release = --found->second == 0;
-        }
-        if (!release) return;
-
-        std::optional<Value> released;
-        auto value = parallel_value(id);
-        {
-            std::lock_guard<std::mutex> lock(value->mutex);
-            if (!value->defined || !value->value)
-                throw std::runtime_error(
-                    "parallel ValueId cannot be released before it is ready: " +
-                    std::to_string(id));
-            released.emplace(std::move(*value->value));
-            value->value.reset();
-        }
-    }
-
     void finish_parallel_group(
         const std::shared_ptr<ParallelGroup> &group,
         std::optional<std::uint64_t> consumer_ordinal) {
@@ -897,9 +856,6 @@ private:
         }
         notify_parallel_progress();
         group->completed = true;
-        const auto input_ids = group->local_input_ids;
-        lock.unlock();
-        for (ValueId id : input_ids) release_parallel_value_after_use(id);
     }
 
     Value resolve_parallel_value(
@@ -964,7 +920,6 @@ private:
         output_value->condition.notify_all();
         activate_parallel_dependents(op.output);
         notify_parallel_progress();
-        for (ValueId id : op.inputs) release_parallel_value_after_use(id);
     }
 
     void execute_parallel_communication(
@@ -1422,37 +1377,6 @@ private:
                     "parallel communication output was never consumed");
     }
 
-    void initialize_use_counts() {
-        if (retain_all_values_) return;
-        const auto count_phase = [&](const std::vector<Instruction> &instructions) {
-            for (const auto &instruction : instructions) {
-                if (const auto *op = std::get_if<ComputeOp>(&instruction.body)) {
-                    if (op->place.rank != rank_) continue;
-                    for (ValueId id : op->inputs) ++remaining_uses_[id];
-                } else if (const auto *action =
-                               std::get_if<CommAction>(&instruction.body)) {
-                    for (std::size_t i = 0; i < action->inputs.size(); ++i)
-                        if (action->sources[i].rank == rank_)
-                            ++remaining_uses_[action->inputs[i]];
-                }
-            }
-        };
-        count_phase(plan_->initialization);
-        count_phase(plan_->execution);
-        count_phase(plan_->finalization);
-        for (ValueId id : plan_->final_outputs)
-            if (desc(id).place.rank == rank_) ++remaining_uses_[id];
-    }
-
-    void release_after_use(ValueId id) {
-        if (retain_all_values_) return;
-        auto found = remaining_uses_.find(id);
-        if (found == remaining_uses_.end() || found->second == 0)
-            throw std::runtime_error("ValueId has no remaining local use: " +
-                                     std::to_string(id));
-        if (--found->second == 0) store_.erase(id);
-    }
-
     void finish_all_groups() {
         for (std::size_t i = 0; i < groups_.size(); ++i) finish_group(i);
     }
@@ -1519,10 +1443,8 @@ private:
     ValueStore<Api> store_;
     std::vector<PendingGroup> groups_;
     std::map<std::string, std::vector<double>> bundle_slots_;
-    std::unordered_map<ValueId, std::size_t> remaining_uses_;
     std::unordered_map<ValueId, std::shared_ptr<ParallelValue>> parallel_values_;
     std::vector<std::shared_ptr<ParallelGroup>> parallel_groups_;
-    std::unordered_map<ValueId, std::size_t> parallel_remaining_uses_;
     std::unordered_map<
         ValueId, std::vector<std::shared_ptr<DependencyTask>>>
         parallel_dependency_dependents_;
@@ -1538,14 +1460,13 @@ private:
     std::mutex wait_trace_mutex_;
     std::unordered_map<ValueId, ValueProducer> value_producers_;
     std::mutex parallel_timing_mutex_;
-    std::mutex parallel_use_mutex_;
     std::atomic<bool> parallel_failed_{false};
     std::mutex parallel_failure_mutex_;
     std::exception_ptr parallel_failure_;
     std::mutex parallel_progress_mutex_;
     std::condition_variable parallel_progress_condition_;
     std::uint64_t parallel_progress_epoch_ = 0;
-    bool retain_all_values_ = false;
+    bool return_all_values_ = false;
 };
 
 } // namespace fhegpu
