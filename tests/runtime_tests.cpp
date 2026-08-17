@@ -5,13 +5,10 @@
 #include <filesystem>
 #include <fstream>
 #include <algorithm>
-#include <chrono>
 #include <cmath>
-#include <condition_variable>
 #include <functional>
 #include <iostream>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <thread>
 
@@ -57,82 +54,6 @@ LoadedOperatorSpec load_spec(const RuntimePlan &plan) {
         ? "poseidon-ckks-cpu.v1.json" : "poseidon-ckks-gpu.v1.json";
     return OperatorSpecReader::read_file((source_dir / "docs/operator-spec/v1/profiles" / filename).string());
 }
-
-class BackfillProbeApi {
-public:
-    using Value = MockVecApi::Value;
-    using CommHandle = MockVecApi::CommHandle;
-
-    explicit BackfillProbeApi(std::shared_ptr<MockCluster> cluster)
-        : delegate_(0, std::move(cluster)) {}
-
-    std::string name() const { return "BackfillProbeApi"; }
-
-    Value encode_plaintext(const ValueDesc &output_desc,
-                           const std::vector<double> &slots) {
-        return delegate_.encode_plaintext(output_desc, slots);
-    }
-
-    Value compute(const ComputeOp &op, const std::vector<Value> &inputs) {
-        if (op.output == producer_output_) {
-            std::unique_lock<std::mutex> lock(mutex_);
-            producer_started_ = true;
-            condition_.notify_all();
-            if (!condition_.wait_for(lock, std::chrono::seconds(2), [&] {
-                    return independent_started_;
-                }))
-                throw std::runtime_error(
-                    "ready worker did not backfill an independent operation");
-        } else if (op.output == independent_output_) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            independent_started_ = true;
-            condition_.notify_all();
-        }
-        return delegate_.compute(op, inputs);
-    }
-
-    CommHandle communicate_async(const CommAction &action,
-                                 const std::vector<Value> &local_inputs) {
-        return delegate_.communicate_async(action, local_inputs);
-    }
-
-    std::vector<Value> wait(CommHandle &handle) {
-        return delegate_.wait(handle);
-    }
-
-    void synchronize(Value &value) { delegate_.synchronize(value); }
-
-    void preflight(std::string_view plan_source_sha256,
-                   bool skip_artifact_digest_checks,
-                   const TargetConfig &target,
-                   const OperatorSpec &operator_spec,
-                   const PlanRequirements &requirements) {
-        delegate_.preflight(plan_source_sha256, skip_artifact_digest_checks,
-                            target, operator_spec, requirements);
-    }
-
-    [[noreturn]] void abort_all(int exit_code, const std::string &reason) {
-        delegate_.abort_all(exit_code, reason);
-    }
-
-    void validate_value(const Value &value, const ValueDesc &expected) const {
-        delegate_.validate_value(value, expected);
-    }
-
-    bool producer_started() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return producer_started_;
-    }
-
-private:
-    static constexpr ValueId producer_output_ = 3;
-    static constexpr ValueId independent_output_ = 6;
-    MockVecApi delegate_;
-    mutable std::mutex mutex_;
-    std::condition_variable condition_;
-    bool producer_started_ = false;
-    bool independent_started_ = false;
-};
 
 void copy_fixture(const std::filesystem::path &source, const std::filesystem::path &destination) {
     std::filesystem::create_directories(destination.parent_path());
@@ -386,79 +307,6 @@ void test_mock_sync_async_matrix() {
     }
 }
 
-void test_device_ready_worker_backfills_blocked_head() {
-    const auto fixture = make_fanout_plan({2});
-    RuntimePlan plan;
-    plan.plan_id = 0x4241434b46494c4cULL;
-    plan.target = fixture.plan.target;
-
-    const Place host{PlaceKind::Host, 0, 0};
-    const Place device0{PlaceKind::Device, 0, 0};
-    const Place device1{PlaceKind::Device, 0, 1};
-    const auto value = [](ValueId id, Place place) {
-        return ValueDesc{id, ValueKind::Ciphertext, place, "ctx", 3, 1,
-                         true, 2};
-    };
-    plan.values = {
-        value(0, host), value(1, device0), value(2, device1),
-        value(3, device0), value(4, device1), value(5, device1),
-        value(6, device1), value(7, host)};
-    plan.external_inputs = {0};
-    plan.initialization = {
-        {0, CommAction{100, CommKind::Transfer, CommHint::PointToPoint,
-                       {0}, {1}, {host}, {device0},
-                       {ValueKind::Ciphertext}}},
-        {1, CommAction{101, CommKind::Transfer, CommHint::PointToPoint,
-                       {0}, {2}, {host}, {device1},
-                       {ValueKind::Ciphertext}}}};
-    plan.execution = {
-        {2, ComputeOp{ComputeKind::Negate, {1}, 3, device0, {}}},
-        {3, CommAction{102, CommKind::Transfer, CommHint::PointToPoint,
-                       {3}, {4}, {device0}, {device1},
-                       {ValueKind::Ciphertext}}},
-        {4, ComputeOp{ComputeKind::Negate, {4}, 5, device1, {}}},
-        {5, ComputeOp{ComputeKind::Negate, {2}, 6, device1, {}}}};
-    plan.finalization = {
-        {6, CommAction{103, CommKind::Transfer, CommHint::PointToPoint,
-                       {5}, {7}, {device1}, {host},
-                       {ValueKind::Ciphertext}}}};
-    plan.final_outputs = {7};
-
-    auto cluster = std::make_shared<MockCluster>(MockClusterConfig{});
-    BackfillProbeApi api(cluster);
-    SequentialRuntime<BackfillProbeApi> runtime(
-        0, 1, 2, api, DeviceExecutionMode::PerDeviceReadyWorkers, 2);
-    const LoadedRuntimePlan loaded{
-        plan,
-        "sha256:1111111111111111111111111111111111111111111111111111111111111111"};
-    const RuntimeResources resources{fixture.operator_spec, std::nullopt, false};
-    const auto input = make_cipher({1, 2, 3, 4}, "ctx", 8192, 3, 1);
-    const auto artifact = runtime.run(loaded, resources, {{0, input}});
-    const auto output = artifact.values.at(7).value.materialize();
-    require(api.producer_started(), "backfill probe producer was not executed");
-    require(artifact.timing.device_backfill_tasks >= 1,
-            "ready worker did not report a backfilled task");
-    require(output.slots == std::vector<double>({1, 2, 3, 4}),
-            "ready worker changed the final result");
-
-    auto dependency_cluster =
-        std::make_shared<MockCluster>(MockClusterConfig{});
-    BackfillProbeApi dependency_api(dependency_cluster);
-    SequentialRuntime<BackfillProbeApi> dependency_runtime(
-        0, 1, 2, dependency_api,
-        DeviceExecutionMode::PerDeviceDependencyWorkers, 2);
-    const auto dependency_artifact = dependency_runtime.run(
-        loaded, resources, {{0, input}});
-    const auto dependency_output =
-        dependency_artifact.values.at(7).value.materialize();
-    require(dependency_api.producer_started(),
-            "dependency worker producer was not executed");
-    require(dependency_artifact.timing.device_backfill_tasks >= 1,
-            "dependency worker did not activate an independent operation");
-    require(dependency_output.slots == std::vector<double>({1, 2, 3, 4}),
-            "dependency worker changed the final result");
-}
-
 } // namespace
 
 int main() {
@@ -471,8 +319,6 @@ int main() {
         run_test("Host and Device Boot paths", test_boot_paths);
         run_test("preflight and digest debug mode", test_preflight_and_digest_debug_mode);
         run_test("Mock sync/async multi-rank matrix", test_mock_sync_async_matrix);
-        run_test("Device ready and dependency workers bypass a blocked head",
-                 test_device_ready_worker_backfills_blocked_head);
         std::cout << "ALL " << tests_run << " TEST GROUPS PASSED\n";
         return 0;
     } catch (const std::exception &error) {

@@ -3,7 +3,6 @@
 #include "runtime/plaintext_bundle.hpp"
 #include "runtime/verifier.hpp"
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -18,7 +17,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -32,12 +30,7 @@
 namespace fhegpu {
 
 enum class DiffMode { FinalOnly, AllValuesAfterRun };
-enum class DeviceExecutionMode {
-    Sequential,
-    PerDeviceWorkers,
-    PerDeviceReadyWorkers,
-    PerDeviceDependencyWorkers
-};
+enum class DeviceExecutionMode { Sequential, PerDeviceWorkers };
 
 struct RuntimeResources {
     const LoadedOperatorSpec &operator_spec;
@@ -61,10 +54,6 @@ struct RuntimeTiming {
     std::size_t communication_wait_calls = 0;
     std::uint64_t communication_post_nanoseconds = 0;
     std::uint64_t communication_wait_nanoseconds = 0;
-    std::size_t device_backfill_tasks = 0;
-    std::size_t device_ready_wait_calls = 0;
-    std::uint64_t device_ready_wait_nanoseconds = 0;
-
     std::uint64_t compute_excluding_boot_nanoseconds() const {
         return compute_including_boot_nanoseconds - boot_nanoseconds;
     }
@@ -130,7 +119,6 @@ public:
         return_all_values_ = diff_mode == DiffMode::AllValuesAfterRun;
         timing_ = RuntimeTiming{};
         open_trace();
-        open_wait_trace();
         try {
             const auto setup_start = std::chrono::steady_clock::now();
             if (resources.skip_artifact_digest_checks) {
@@ -156,10 +144,7 @@ public:
             const auto online_execution_start = std::chrono::steady_clock::now();
             timing_.initialization_nanoseconds = elapsed_nanoseconds(
                 initialization_start, online_execution_start);
-            if (device_execution_mode_ ==
-                DeviceExecutionMode::PerDeviceDependencyWorkers) {
-                execute_dependency_parallel_phases();
-            } else if (device_execution_mode_ != DeviceExecutionMode::Sequential) {
+            if (device_execution_mode_ == DeviceExecutionMode::PerDeviceWorkers) {
                 execute_device_parallel_phases();
             } else {
                 execute_phase(plan_->execution);
@@ -258,297 +243,7 @@ private:
         bool completed = false;
     };
 
-    enum class ParallelTaskReadiness {
-        Blocked,
-        PendingCommunication,
-        Ready
-    };
-
-    struct ParallelTask {
-        std::uint64_t ordinal = 0;
-        std::vector<ValueId> input_ids;
-        std::function<void()> execute;
-        bool completed = false;
-    };
-
-    struct DependencyTaskQueue;
-
-    struct DependencyTask {
-        std::uint64_t ordinal = 0;
-        std::vector<ValueId> input_ids;
-        std::function<void()> execute;
-        std::weak_ptr<DependencyTaskQueue> queue;
-        std::size_t queue_position = 0;
-        std::atomic<std::size_t> pending_inputs{0};
-        std::string op_label;
-        bool completed = false;
-    };
-
-    struct DependencyTaskCompare {
-        bool operator()(const std::shared_ptr<DependencyTask> &left,
-                        const std::shared_ptr<DependencyTask> &right) const {
-            return left->ordinal > right->ordinal;
-        }
-    };
-
-    struct DependencyTaskQueue {
-        std::mutex mutex;
-        std::condition_variable condition;
-        std::priority_queue<
-            std::shared_ptr<DependencyTask>,
-            std::vector<std::shared_ptr<DependencyTask>>,
-            DependencyTaskCompare> ready;
-        std::vector<std::shared_ptr<DependencyTask>> tasks;
-        std::size_t next_unfinished = 0;
-        std::size_t completed = 0;
-        bool compute_queue = false;
-        std::size_t index = 0;
-    };
-
-    // Optional dependency-wait tracing. When POSEIDON_RUNTIME_WAIT_TRACE is
-    // set, every worker queue wait is recorded with the instruction it is
-    // blocked on and the producers of its missing inputs, and written as
-    // JSON once parallel execution finishes.
-    struct ValueProducer {
-        std::string queue_kind;
-        std::size_t queue_index = 0;
-        std::uint64_t ordinal = 0;
-        std::string op;
-    };
-
-    struct WaitTraceProducer {
-        ValueId value = 0;
-        std::string queue_kind;
-        std::size_t queue_index = 0;
-        std::uint64_t ordinal = 0;
-        std::string op;
-    };
-
-    struct WaitTraceRecord {
-        std::uint64_t start_ns = 0;
-        std::uint64_t duration_ns = 0;
-        std::string queue_kind;
-        std::size_t queue_index = 0;
-        std::optional<std::uint64_t> waited_ordinal;
-        std::string waited_op;
-        std::vector<ValueId> missing_inputs;
-        std::vector<WaitTraceProducer> producers;
-        std::string wake_reason;
-    };
-
-    void open_wait_trace() {
-        wait_trace_enabled_ = false;
-        wait_trace_records_.clear();
-        const char *trace_path = std::getenv("POSEIDON_RUNTIME_WAIT_TRACE");
-        if (trace_path == nullptr || trace_path[0] == '\0' ||
-            std::string_view(trace_path) == "0")
-            return;
-        std::string path = std::string_view(trace_path) == "1"
-                               ? "/tmp/poseidon-runtime-waits"
-                               : std::string(trace_path);
-        const std::string rank_text = std::to_string(rank_);
-        std::size_t offset = 0;
-        bool replaced = false;
-        while ((offset = path.find("%r", offset)) != std::string::npos) {
-            path.replace(offset, 2, rank_text);
-            offset += rank_text.size();
-            replaced = true;
-        }
-        if (!replaced) path += ".rank" + rank_text + ".json";
-        wait_trace_path_ = std::move(path);
-        wait_trace_enabled_ = true;
-    }
-
-    const char *device_execution_mode_name() const {
-        switch (device_execution_mode_) {
-            case DeviceExecutionMode::Sequential:
-                return "Sequential";
-            case DeviceExecutionMode::PerDeviceWorkers:
-                return "PerDeviceWorkers";
-            case DeviceExecutionMode::PerDeviceReadyWorkers:
-                return "PerDeviceReadyWorkers";
-            case DeviceExecutionMode::PerDeviceDependencyWorkers:
-                return "PerDeviceDependencyWorkers";
-        }
-        return "Unknown";
-    }
-
-    static std::string json_escape(std::string_view text) {
-        std::string escaped;
-        escaped.reserve(text.size());
-        for (const char character : text) {
-            switch (character) {
-                case '"': escaped += "\\\""; break;
-                case '\\': escaped += "\\\\"; break;
-                case '\n': escaped += "\\n"; break;
-                case '\r': escaped += "\\r"; break;
-                case '\t': escaped += "\\t"; break;
-                default: escaped += character; break;
-            }
-        }
-        return escaped;
-    }
-
-    // Snapshot what this queue is blocked on before sleeping: the earliest
-    // unfinished task in program order and which of its inputs are still
-    // un-materialized. Sampled while holding the queue mutex.
-    std::optional<WaitTraceRecord> sample_wait_trace(
-        const std::shared_ptr<DependencyTaskQueue> &queue) {
-        WaitTraceRecord record;
-        record.start_ns = static_cast<std::uint64_t>(
-            std::chrono::steady_clock::now().time_since_epoch().count());
-        record.queue_kind = queue->compute_queue ? "compute" : "communication";
-        record.queue_index = queue->index;
-        if (queue->next_unfinished >= queue->tasks.size()) return record;
-        const auto &head = queue->tasks[queue->next_unfinished];
-        record.waited_ordinal = head->ordinal;
-        record.waited_op = head->op_label;
-        for (ValueId id : head->input_ids) {
-            const auto found = parallel_values_.find(id);
-            if (found == parallel_values_.end()) continue;
-            bool materialized = false;
-            {
-                std::lock_guard<std::mutex> lock(found->second->mutex);
-                materialized = found->second->value.has_value();
-            }
-            if (materialized) continue;
-            record.missing_inputs.push_back(id);
-            const auto producer = value_producers_.find(id);
-            if (producer == value_producers_.end()) continue;
-            record.producers.push_back(WaitTraceProducer{
-                id, producer->second.queue_kind, producer->second.queue_index,
-                producer->second.ordinal, producer->second.op});
-        }
-        return record;
-    }
-
-    void record_wait_trace(WaitTraceRecord record) {
-        std::lock_guard<std::mutex> lock(wait_trace_mutex_);
-        wait_trace_records_.push_back(std::move(record));
-    }
-
-    static void write_json_array(std::ostream &out,
-                                 const std::vector<ValueId> &ids) {
-        out << '[';
-        for (std::size_t i = 0; i < ids.size(); ++i) {
-            if (i != 0) out << ',';
-            out << ids[i];
-        }
-        out << ']';
-    }
-
-    static void write_json_waited_for(std::ostream &out,
-                                      const WaitTraceRecord &record) {
-        out << "\"waited_for\": ";
-        if (!record.waited_ordinal) {
-            out << "null";
-            return;
-        }
-        out << "{\"ordinal\": " << *record.waited_ordinal
-            << ", \"op\": \"" << json_escape(record.waited_op) << "\"}";
-    }
-
-    static void write_json_producers(std::ostream &out,
-                                     const WaitTraceRecord &record) {
-        out << "\"producers\": [";
-        for (std::size_t i = 0; i < record.producers.size(); ++i) {
-            if (i != 0) out << ',';
-            const auto &producer = record.producers[i];
-            out << "{\"value\": " << producer.value
-                << ", \"queue\": {\"kind\": \"" << producer.queue_kind
-                << "\", \"index\": " << producer.queue_index
-                << "}, \"ordinal\": " << producer.ordinal
-                << ", \"op\": \"" << json_escape(producer.op) << "\"}";
-        }
-        out << ']';
-    }
-
-    void write_wait_trace() {
-        if (!wait_trace_enabled_) return;
-        std::sort(wait_trace_records_.begin(), wait_trace_records_.end(),
-                  [](const WaitTraceRecord &left,
-                     const WaitTraceRecord &right) {
-                      return left.start_ns < right.start_ns;
-                  });
-        std::uint64_t total_ns = 0;
-        std::uint64_t max_ns = 0;
-        std::map<std::pair<std::string, std::size_t>,
-                 std::pair<std::size_t, std::uint64_t>>
-            per_queue;
-        std::map<std::string, std::pair<std::size_t, std::uint64_t>>
-            per_op;
-        for (const auto &record : wait_trace_records_) {
-            total_ns += record.duration_ns;
-            max_ns = std::max(max_ns, record.duration_ns);
-            auto &queue_stats =
-                per_queue[{record.queue_kind, record.queue_index}];
-            ++queue_stats.first;
-            queue_stats.second += record.duration_ns;
-            auto &op_stats = per_op[record.waited_op];
-            ++op_stats.first;
-            op_stats.second += record.duration_ns;
-        }
-        std::ofstream out(wait_trace_path_, std::ios::out | std::ios::trunc);
-        if (!out)
-            throw std::runtime_error(
-                "cannot open Poseidon Runtime wait trace file: " +
-                wait_trace_path_);
-        out << "{\n  \"format_version\": 1,\n";
-        out << "  \"mode\": \"" << device_execution_mode_name() << "\",\n";
-        out << "  \"worker_count\": " << wait_trace_worker_count_ << ",\n";
-        out << "  \"waits\": [\n";
-        for (std::size_t i = 0; i < wait_trace_records_.size(); ++i) {
-            const auto &record = wait_trace_records_[i];
-            out << "    {\"start_ns\": " << record.start_ns
-                << ", \"duration_ns\": " << record.duration_ns
-                << ", \"queue\": {\"kind\": \"" << record.queue_kind
-                << "\", \"index\": " << record.queue_index << "}, ";
-            write_json_waited_for(out, record);
-            out << ", \"missing_inputs\": ";
-            write_json_array(out, record.missing_inputs);
-            out << ", ";
-            write_json_producers(out, record);
-            out << ", \"wake_reason\": \"" << record.wake_reason << "\"}";
-            if (i + 1 != wait_trace_records_.size()) out << ',';
-            out << '\n';
-        }
-        out << "  ],\n  \"summary\": {\n";
-        out << "    \"wait_count\": " << wait_trace_records_.size() << ",\n";
-        out << "    \"total_ns\": " << total_ns << ",\n";
-        out << "    \"max_ns\": " << max_ns << ",\n";
-        out << "    \"mean_ns\": "
-            << (wait_trace_records_.empty()
-                    ? 0
-                    : total_ns / wait_trace_records_.size())
-            << ",\n";
-        out << "    \"per_queue\": [\n";
-        std::size_t queue_count = 0;
-        for (const auto &entry : per_queue) {
-            out << "      {\"kind\": \"" << entry.first.first
-                << "\", \"index\": " << entry.first.second
-                << ", \"count\": " << entry.second.first
-                << ", \"total_ns\": " << entry.second.second << "}";
-            if (++queue_count != per_queue.size()) out << ',';
-            out << '\n';
-        }
-        out << "    ],\n    \"top_stalled_ops\": [\n";
-        std::vector<std::pair<std::string,
-                              std::pair<std::size_t, std::uint64_t>>>
-            ops(per_op.begin(), per_op.end());
-        std::sort(ops.begin(), ops.end(),
-                  [](const auto &left, const auto &right) {
-                      return left.second.second > right.second.second;
-                  });
-        const std::size_t op_count = std::min<std::size_t>(ops.size(), 20);
-        for (std::size_t i = 0; i < op_count; ++i) {
-            out << "      {\"op\": \"" << json_escape(ops[i].first)
-                << "\", \"count\": " << ops[i].second.first
-                << ", \"total_ns\": " << ops[i].second.second << "}";
-            if (i + 1 != op_count) out << ',';
-            out << '\n';
-        }
-        out << "    ]\n  }\n}\n";
-    }
+    using ParallelTask = std::function<void()>;
 
     const ValueDesc &desc(ValueId id) const {
         for (const auto &value : plan_->values) if (value.id == id) return value;
@@ -728,14 +423,8 @@ private:
 
         parallel_values_.clear();
         parallel_groups_.clear();
-        parallel_dependency_dependents_.clear();
-        parallel_dependency_queues_.clear();
         parallel_failed_.store(false);
         parallel_failure_ = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(parallel_progress_mutex_);
-            parallel_progress_epoch_ = 0;
-        }
 
         for (const auto &item : store_.entries()) {
             const auto *ready =
@@ -759,62 +448,6 @@ private:
         }
         for (const auto &item : parallel_values_)
             item.second->condition.notify_all();
-        notify_parallel_progress();
-        for (const auto &queue : parallel_dependency_queues_)
-            queue->condition.notify_all();
-    }
-
-    void notify_parallel_progress() {
-        if (device_execution_mode_ !=
-            DeviceExecutionMode::PerDeviceReadyWorkers)
-            return;
-        {
-            std::lock_guard<std::mutex> lock(parallel_progress_mutex_);
-            ++parallel_progress_epoch_;
-        }
-        parallel_progress_condition_.notify_all();
-    }
-
-    void enqueue_dependency_task(
-        const std::shared_ptr<DependencyTask> &task) {
-        auto queue = task->queue.lock();
-        if (!queue)
-            throw std::runtime_error(
-                "dependency task lost its execution queue");
-        {
-            std::lock_guard<std::mutex> lock(queue->mutex);
-            queue->ready.push(task);
-        }
-        queue->condition.notify_one();
-    }
-
-    void activate_parallel_dependents(ValueId id) {
-        if (device_execution_mode_ !=
-            DeviceExecutionMode::PerDeviceDependencyWorkers)
-            return;
-        const auto found = parallel_dependency_dependents_.find(id);
-        if (found == parallel_dependency_dependents_.end()) return;
-        for (const auto &task : found->second) {
-            const std::size_t previous =
-                task->pending_inputs.fetch_sub(1, std::memory_order_acq_rel);
-            if (previous == 0)
-                throw std::runtime_error(
-                    "dependency task input was activated twice");
-            if (previous == 1) enqueue_dependency_task(task);
-        }
-    }
-
-    ParallelTaskReadiness parallel_task_readiness(
-        const ParallelTask &task) const {
-        ParallelTaskReadiness readiness = ParallelTaskReadiness::Ready;
-        for (ValueId id : task.input_ids) {
-            auto value = parallel_value(id);
-            std::lock_guard<std::mutex> lock(value->mutex);
-            if (!value->defined) return ParallelTaskReadiness::Blocked;
-            if (!value->value)
-                readiness = ParallelTaskReadiness::PendingCommunication;
-        }
-        return readiness;
     }
 
     void finish_parallel_group(
@@ -852,9 +485,7 @@ private:
                 value->group.reset();
             }
             value->condition.notify_all();
-            activate_parallel_dependents(id);
         }
-        notify_parallel_progress();
         group->completed = true;
     }
 
@@ -918,8 +549,6 @@ private:
             output_value->defined = true;
         }
         output_value->condition.notify_all();
-        activate_parallel_dependents(op.output);
-        notify_parallel_progress();
     }
 
     void execute_parallel_communication(
@@ -953,12 +582,6 @@ private:
                 value->defined = true;
             }
             value->condition.notify_all();
-        }
-        if (device_execution_mode_ ==
-            DeviceExecutionMode::PerDeviceDependencyWorkers) {
-            finish_parallel_group(group, std::nullopt);
-        } else {
-            notify_parallel_progress();
         }
     }
 
@@ -997,12 +620,10 @@ private:
                     op->output, desc(op->output).place);
                 const std::size_t worker =
                     static_cast<std::size_t>(op->place.index) % tasks.size();
-                tasks[worker].push_back(ParallelTask{
-                    instruction.ordinal,
-                    op->inputs,
+                tasks[worker].push_back(
                     [this, op = *op, ordinal = instruction.ordinal, output] {
                         execute_parallel_compute(op, ordinal, output);
-                    }});
+                    });
                 continue;
             }
             if (std::holds_alternative<EncodeOp>(instruction.body))
@@ -1025,302 +646,10 @@ private:
             const int device = parallel_communication_worker(action);
             const std::size_t worker =
                 static_cast<std::size_t>(device) % tasks.size();
-            tasks[worker].push_back(ParallelTask{
-                instruction.ordinal,
-                group->local_input_ids,
-                [this, action, ordinal = instruction.ordinal, group] {
-                    execute_parallel_communication(action, ordinal, group);
-                }});
-        }
-    }
-
-    void append_dependency_task(
-        const std::shared_ptr<DependencyTaskQueue> &queue,
-        std::uint64_t ordinal, std::vector<ValueId> input_ids,
-        std::string op_label, std::function<void()> execute) {
-        auto task = std::make_shared<DependencyTask>();
-        task->ordinal = ordinal;
-        task->input_ids = std::move(input_ids);
-        task->execute = std::move(execute);
-        task->queue = queue;
-        task->queue_position = queue->tasks.size();
-        task->op_label = std::move(op_label);
-        queue->tasks.push_back(std::move(task));
-    }
-
-    void compile_dependency_phase(
-        const std::vector<Instruction> &instructions,
-        const std::vector<std::shared_ptr<DependencyTaskQueue>> &compute_queues,
-        const std::vector<std::shared_ptr<DependencyTaskQueue>> &communication_queues) {
-        for (const auto &instruction : instructions) {
-            if (const auto *op = std::get_if<ComputeOp>(&instruction.body)) {
-                if (op->place.rank != rank_) continue;
-                if (op->place.kind != PlaceKind::Device ||
-                    op->place.index < 0 || op->place.index >= local_devices_)
-                    throw std::runtime_error(
-                        "dependency worker execution requires Device compute operations");
-                auto output = define_parallel_value(
-                    op->output, desc(op->output).place);
-                const std::size_t worker =
-                    static_cast<std::size_t>(op->place.index) %
-                    compute_queues.size();
-                append_dependency_task(
-                    compute_queues[worker], instruction.ordinal, op->inputs,
-                    to_string(op->kind),
-                    [this, op = *op, ordinal = instruction.ordinal, output] {
-                        execute_parallel_compute(op, ordinal, output);
-                    });
-                value_producers_[op->output] = ValueProducer{
-                    "compute", worker, instruction.ordinal, to_string(op->kind)};
-                continue;
-            }
-            if (std::holds_alternative<EncodeOp>(instruction.body))
-                throw std::runtime_error(
-                    "dependency worker execution does not support online Encode");
-
-            const auto action = std::get<CommAction>(instruction.body);
-            auto group = std::make_shared<ParallelGroup>();
-            group->action = action;
-            group->instruction_ordinal = instruction.ordinal;
-            for (std::size_t i = 0; i < action.inputs.size(); ++i)
-                if (action.sources[i].rank == rank_)
-                    group->local_input_ids.push_back(action.inputs[i]);
-            for (std::size_t i = 0; i < action.outputs.size(); ++i) {
-                if (action.destinations[i].rank != rank_) continue;
-                group->local_outputs.push_back(define_parallel_value(
-                    action.outputs[i], action.destinations[i]));
-            }
-            parallel_groups_.push_back(group);
-            const int device = parallel_communication_worker(action);
-            const std::size_t worker =
-                static_cast<std::size_t>(device) % communication_queues.size();
-            append_dependency_task(
-                communication_queues[worker], instruction.ordinal,
-                group->local_input_ids, to_string(action.kind),
+            tasks[worker].push_back(
                 [this, action, ordinal = instruction.ordinal, group] {
                     execute_parallel_communication(action, ordinal, group);
                 });
-            for (const ValueId output : action.outputs)
-                value_producers_[output] = ValueProducer{
-                    "communication", worker, instruction.ordinal,
-                    to_string(action.kind)};
-        }
-    }
-
-    void initialize_dependency_tasks() {
-        for (const auto &queue : parallel_dependency_queues_) {
-            for (const auto &task : queue->tasks) {
-                std::size_t pending = 0;
-                for (ValueId id : task->input_ids) {
-                    auto value = parallel_value(id);
-                    bool materialized = false;
-                    {
-                        std::lock_guard<std::mutex> lock(value->mutex);
-                        materialized = value->value.has_value();
-                    }
-                    if (materialized) continue;
-                    ++pending;
-                    parallel_dependency_dependents_[id].push_back(task);
-                }
-                task->pending_inputs.store(pending, std::memory_order_release);
-            }
-        }
-        for (const auto &queue : parallel_dependency_queues_)
-            for (const auto &task : queue->tasks)
-                if (task->pending_inputs.load(std::memory_order_acquire) == 0)
-                    enqueue_dependency_task(task);
-    }
-
-    void execute_dependency_task_queue(
-        const std::shared_ptr<DependencyTaskQueue> &queue) {
-        for (;;) {
-            std::shared_ptr<DependencyTask> task;
-            bool backfilled = false;
-            std::uint64_t wait_elapsed = 0;
-            std::optional<WaitTraceRecord> wait_trace;
-            {
-                std::unique_lock<std::mutex> lock(queue->mutex);
-                if (queue->ready.empty() &&
-                    queue->completed != queue->tasks.size() &&
-                    !parallel_failed_.load()) {
-                    if (wait_trace_enabled_)
-                        wait_trace = sample_wait_trace(queue);
-                    const auto wait_start = std::chrono::steady_clock::now();
-                    queue->condition.wait(lock, [&] {
-                        return parallel_failed_.load() ||
-                               !queue->ready.empty() ||
-                               queue->completed == queue->tasks.size();
-                    });
-                    wait_elapsed = elapsed_nanoseconds(
-                        wait_start, std::chrono::steady_clock::now());
-                    if (wait_trace) {
-                        wait_trace->duration_ns = wait_elapsed;
-                        wait_trace->wake_reason =
-                            queue->completed == queue->tasks.size()
-                                ? "completed"
-                                : (parallel_failed_.load() ? "failed"
-                                                           : "task_enqueued");
-                        record_wait_trace(std::move(*wait_trace));
-                    }
-                }
-                if (parallel_failed_.load()) return;
-                if (queue->completed == queue->tasks.size()) return;
-                if (queue->ready.empty())
-                    throw std::runtime_error(
-                        "dependency task queue woke without a ready task");
-
-                task = queue->ready.top();
-                queue->ready.pop();
-                backfilled = task->queue_position != queue->next_unfinished;
-                task->completed = true;
-                ++queue->completed;
-                while (queue->next_unfinished < queue->tasks.size() &&
-                       queue->tasks[queue->next_unfinished]->completed)
-                    ++queue->next_unfinished;
-            }
-
-            if (wait_elapsed != 0) {
-                // Count both compute and communication queue waits so the
-                // metric matches the total time workers spent blocked.
-                std::lock_guard<std::mutex> lock(parallel_timing_mutex_);
-                ++timing_.device_ready_wait_calls;
-                timing_.device_ready_wait_nanoseconds += wait_elapsed;
-            }
-            if (backfilled) {
-                std::lock_guard<std::mutex> lock(parallel_timing_mutex_);
-                ++timing_.device_backfill_tasks;
-            }
-            task->execute();
-        }
-    }
-
-    void execute_dependency_parallel_phases() {
-        prepare_parallel_values();
-        const std::size_t worker_count =
-            device_worker_count_ == 0
-                ? static_cast<std::size_t>(local_devices_)
-                : device_worker_count_;
-        if (worker_count == 0 ||
-            worker_count > static_cast<std::size_t>(local_devices_))
-            throw std::runtime_error(
-                "dependency worker count must be between one and local device count");
-
-        std::vector<std::shared_ptr<DependencyTaskQueue>> compute_queues;
-        std::vector<std::shared_ptr<DependencyTaskQueue>> communication_queues;
-        compute_queues.reserve(worker_count);
-        communication_queues.reserve(worker_count);
-        parallel_dependency_queues_.reserve(worker_count * 2);
-        for (std::size_t worker = 0; worker < worker_count; ++worker) {
-            auto compute_queue = std::make_shared<DependencyTaskQueue>();
-            compute_queue->compute_queue = true;
-            compute_queue->index = worker;
-            compute_queues.push_back(compute_queue);
-            parallel_dependency_queues_.push_back(std::move(compute_queue));
-
-            auto communication_queue = std::make_shared<DependencyTaskQueue>();
-            communication_queue->index = worker;
-            communication_queues.push_back(communication_queue);
-            parallel_dependency_queues_.push_back(
-                std::move(communication_queue));
-        }
-
-        wait_trace_worker_count_ = worker_count;
-        value_producers_.clear();
-        compile_dependency_phase(
-            plan_->execution, compute_queues, communication_queues);
-        compile_dependency_phase(
-            plan_->finalization, compute_queues, communication_queues);
-        initialize_dependency_tasks();
-
-        std::vector<std::thread> workers;
-        workers.reserve(parallel_dependency_queues_.size());
-        for (const auto &queue : parallel_dependency_queues_) {
-            workers.emplace_back([this, queue] {
-                try {
-                    execute_dependency_task_queue(queue);
-                } catch (...) {
-                    record_parallel_failure(std::current_exception());
-                }
-            });
-        }
-        for (auto &worker : workers) worker.join();
-        write_wait_trace();
-        if (parallel_failed_.load()) {
-            std::lock_guard<std::mutex> lock(parallel_failure_mutex_);
-            std::rethrow_exception(parallel_failure_);
-        }
-
-        for (ValueId id : plan_->final_outputs) {
-            const auto &output_desc = desc(id);
-            if (output_desc.place.rank != rank_) continue;
-            Value output = resolve_parallel_value(
-                id, output_desc.place, std::nullopt);
-            store_.define_ready(id, output_desc.place, std::move(output));
-        }
-        for (const auto &group : parallel_groups_)
-            if (!group->completed)
-                throw std::runtime_error(
-                    "dependency communication did not complete");
-        parallel_dependency_queues_.clear();
-        parallel_dependency_dependents_.clear();
-    }
-
-    void execute_ready_parallel_tasks(std::vector<ParallelTask> &tasks) {
-        std::size_t remaining = tasks.size();
-        while (remaining != 0) {
-            if (parallel_failed_.load()) return;
-
-            std::uint64_t observed_epoch = 0;
-            {
-                std::lock_guard<std::mutex> lock(parallel_progress_mutex_);
-                observed_epoch = parallel_progress_epoch_;
-            }
-
-            std::optional<std::size_t> first_unfinished;
-            std::optional<std::size_t> pending_communication;
-            std::optional<std::size_t> selected;
-            for (std::size_t index = 0; index < tasks.size(); ++index) {
-                auto &task = tasks[index];
-                if (task.completed) continue;
-                if (!first_unfinished) first_unfinished = index;
-                const auto readiness = parallel_task_readiness(task);
-                if (readiness == ParallelTaskReadiness::Ready) {
-                    selected = index;
-                    break;
-                }
-                if (readiness == ParallelTaskReadiness::PendingCommunication &&
-                    !pending_communication)
-                    pending_communication = index;
-            }
-            if (!selected) selected = pending_communication;
-
-            if (selected) {
-                auto &task = tasks[*selected];
-                if (first_unfinished && *selected != *first_unfinished) {
-                    std::lock_guard<std::mutex> lock(parallel_timing_mutex_);
-                    ++timing_.device_backfill_tasks;
-                }
-                task.completed = true;
-                task.execute();
-                --remaining;
-                continue;
-            }
-
-            const auto wait_start = std::chrono::steady_clock::now();
-            {
-                std::unique_lock<std::mutex> lock(parallel_progress_mutex_);
-                parallel_progress_condition_.wait(lock, [&] {
-                    return parallel_failed_.load() ||
-                           parallel_progress_epoch_ != observed_epoch;
-                });
-            }
-            const auto wait_elapsed = elapsed_nanoseconds(
-                wait_start, std::chrono::steady_clock::now());
-            {
-                std::lock_guard<std::mutex> lock(parallel_timing_mutex_);
-                ++timing_.device_ready_wait_calls;
-                timing_.device_ready_wait_nanoseconds += wait_elapsed;
-            }
         }
     }
 
@@ -1344,14 +673,9 @@ private:
         for (std::size_t device = 0; device < tasks.size(); ++device) {
             workers.emplace_back([this, &tasks, device] {
                 try {
-                    if (device_execution_mode_ ==
-                        DeviceExecutionMode::PerDeviceReadyWorkers) {
-                        execute_ready_parallel_tasks(tasks[device]);
-                    } else {
-                        for (auto &task : tasks[device]) {
-                            if (parallel_failed_.load()) return;
-                            task.execute();
-                        }
+                    for (auto &task : tasks[device]) {
+                        if (parallel_failed_.load()) return;
+                        task();
                     }
                 } catch (...) {
                     record_parallel_failure(std::current_exception());
@@ -1445,27 +769,13 @@ private:
     std::map<std::string, std::vector<double>> bundle_slots_;
     std::unordered_map<ValueId, std::shared_ptr<ParallelValue>> parallel_values_;
     std::vector<std::shared_ptr<ParallelGroup>> parallel_groups_;
-    std::unordered_map<
-        ValueId, std::vector<std::shared_ptr<DependencyTask>>>
-        parallel_dependency_dependents_;
-    std::vector<std::shared_ptr<DependencyTaskQueue>>
-        parallel_dependency_queues_;
     RuntimeTiming timing_;
     std::unique_ptr<std::ofstream> runtime_trace_;
     std::mutex trace_mutex_;
-    bool wait_trace_enabled_ = false;
-    std::string wait_trace_path_;
-    std::size_t wait_trace_worker_count_ = 0;
-    std::vector<WaitTraceRecord> wait_trace_records_;
-    std::mutex wait_trace_mutex_;
-    std::unordered_map<ValueId, ValueProducer> value_producers_;
     std::mutex parallel_timing_mutex_;
     std::atomic<bool> parallel_failed_{false};
     std::mutex parallel_failure_mutex_;
     std::exception_ptr parallel_failure_;
-    std::mutex parallel_progress_mutex_;
-    std::condition_variable parallel_progress_condition_;
-    std::uint64_t parallel_progress_epoch_ = 0;
     bool return_all_values_ = false;
 };
 
