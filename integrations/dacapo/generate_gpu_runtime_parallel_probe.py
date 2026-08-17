@@ -225,25 +225,30 @@ def build_four_gpu_burst(spec_path: Path, segment_length: int,
     return builder.finish(output)
 
 
-def build_four_gpu_interleaved(
-    spec_path: Path, segment_length: int, communication_rounds: int,
-    input_level: int, compute_level: int, online_transfers: bool = True,
+def build_multi_gpu_interleaved(
+    spec_path: Path, device_count: int, plan_id: int, segment_length: int,
+    communication_rounds: int, input_level: int, compute_level: int,
+    online_transfers: bool = True,
 ) -> dict:
-    builder = PlanBuilder(spec_path, device_count=4, plan_id=655360005)
+    if device_count < 2:
+        raise ValueError("interleaved probe requires at least two devices")
+    builder = PlanBuilder(
+        spec_path, device_count=device_count, plan_id=plan_id
+    )
     external = builder.value(HOST, input_level)
     builder.plan["external_inputs"] = [external]
     device_inputs = [
         builder.transfer(
             builder.initialization, external, HOST, device(gpu), input_level
         )
-        for gpu in range(4)
+        for gpu in range(device_count)
     ]
     chains = [
         builder.compute(
             "mod_switch", [device_inputs[gpu]], device(gpu), compute_level,
             {"target_level": compute_level},
         )
-        for gpu in range(4)
+        for gpu in range(device_count)
     ]
 
     # Post each transfer before independent local work. The receive is consumed
@@ -252,10 +257,10 @@ def build_four_gpu_interleaved(
         2 * segment_length, communication_rounds
     )
     for round_index, rotation_count in enumerate(rotations_per_round):
-        distance = round_index % 3 + 1
+        distance = round_index % (device_count - 1) + 1
         incoming: list[str] = []
-        for destination in range(4):
-            source = (destination + distance) % 4
+        for destination in range(device_count):
+            source = (destination + distance) % device_count
             incoming.append(
                 builder.transfer(
                     builder.execution,
@@ -268,7 +273,7 @@ def build_four_gpu_interleaved(
                 else chains[destination]
             )
 
-        for gpu in range(4):
+        for gpu in range(device_count):
             value = rotate_chain(
                 builder, chains[gpu], gpu, compute_level, rotation_count
             )
@@ -277,7 +282,7 @@ def build_four_gpu_interleaved(
             )
 
     gathered = [chains[0]]
-    for gpu in range(1, 4):
+    for gpu in range(1, device_count):
         gathered.append(
             builder.transfer(
                 builder.execution,
@@ -331,17 +336,22 @@ def main() -> None:
             args.operator_spec, args.segment_length, args.communication_rounds,
             args.input_level, args.compute_level
         ),
-        "4gpu.runtime-plan.json": build_four_gpu_interleaved(
-            args.operator_spec, args.segment_length, args.communication_rounds,
-            args.input_level, args.compute_level
+        "4gpu.runtime-plan.json": build_multi_gpu_interleaved(
+            args.operator_spec, 4, 655360005, args.segment_length,
+            args.communication_rounds, args.input_level, args.compute_level
         ),
         "4gpu-burst-transfers.runtime-plan.json": build_four_gpu_burst(
             args.operator_spec, args.segment_length, args.communication_rounds,
             args.input_level, args.compute_level
         ),
-        "4gpu-no-online-transfers.runtime-plan.json": build_four_gpu_interleaved(
-            args.operator_spec, args.segment_length, args.communication_rounds,
-            args.input_level, args.compute_level, online_transfers=False
+        "4gpu-no-online-transfers.runtime-plan.json": build_multi_gpu_interleaved(
+            args.operator_spec, 4, 655360005, args.segment_length,
+            args.communication_rounds, args.input_level, args.compute_level,
+            online_transfers=False
+        ),
+        "8gpu.runtime-plan.json": build_multi_gpu_interleaved(
+            args.operator_spec, 8, 655360008, args.segment_length,
+            args.communication_rounds, args.input_level, args.compute_level
         ),
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)
