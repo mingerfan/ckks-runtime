@@ -120,8 +120,11 @@ def rotate_chain(builder: PlanBuilder, value: str, gpu: int, level: int,
 
 def build_single_gpu(spec_path: Path, segment_length: int,
                      communication_rounds: int, input_level: int,
-                     compute_level: int) -> dict:
-    builder = PlanBuilder(spec_path, device_count=1, plan_id=655360001)
+                     compute_level: int, chain_count: int = 4,
+                     plan_id: int = 655360001) -> dict:
+    if chain_count <= 0:
+        raise ValueError("single-GPU probe chain count must be positive")
+    builder = PlanBuilder(spec_path, device_count=1, plan_id=plan_id)
     external = builder.value(HOST, input_level)
     builder.plan["external_inputs"] = [external]
     on_device = builder.transfer(
@@ -129,7 +132,7 @@ def build_single_gpu(spec_path: Path, segment_length: int,
     )
 
     chains = []
-    for _ in range(4):
+    for _ in range(chain_count):
         value = builder.compute(
             "mod_switch", [on_device], device(0), compute_level,
             {"target_level": compute_level},
@@ -300,6 +303,85 @@ def build_multi_gpu_interleaved(
     return builder.finish(output)
 
 
+def build_eight_gpu_strong_scaling(
+    spec_path: Path, segment_length: int, communication_rounds: int,
+    input_level: int, compute_level: int,
+) -> dict:
+    if communication_rounds < 4 or communication_rounds % 2 != 0:
+        raise ValueError(
+            "strong-scaling probe requires an even communication round count "
+            "of at least four"
+        )
+    builder = PlanBuilder(spec_path, device_count=8, plan_id=655360009)
+    external = builder.value(HOST, input_level)
+    builder.plan["external_inputs"] = [external]
+
+    # Match the four-GPU plan's four Host transfers and four ModSwitch ops.
+    device_inputs = [
+        builder.transfer(
+            builder.initialization, external, HOST, device(gpu), input_level
+        )
+        for gpu in range(4)
+    ]
+    chains = [
+        builder.compute(
+            "mod_switch", [device_inputs[gpu]], device(gpu), compute_level,
+            {"target_level": compute_level},
+        )
+        for gpu in range(4)
+    ]
+
+    # Split each original chain across a second GPU. These four transfers take
+    # the place of four ring transfers so the total transfer count is unchanged.
+    chains.extend(
+        builder.transfer(
+            builder.execution, chains[gpu], device(gpu), device(gpu + 4),
+            compute_level,
+        )
+        for gpu in range(4)
+    )
+    for gpu in range(4):
+        chains[gpu] = builder.compute(
+            "add_cc", [chains[gpu], chains[gpu]], device(gpu), compute_level
+        )
+
+    strong_rounds = communication_rounds // 2 - 1
+    rotations_per_round = distributed_counts(segment_length, strong_rounds)
+    for round_index, rotation_count in enumerate(rotations_per_round):
+        distance = round_index % 7 + 1
+        incoming = []
+        for destination in range(8):
+            source = (destination + distance) % 8
+            incoming.append(
+                builder.transfer(
+                    builder.execution, chains[source], device(source),
+                    device(destination), compute_level,
+                )
+            )
+        for gpu in range(8):
+            value = rotate_chain(
+                builder, chains[gpu], gpu, compute_level, rotation_count
+            )
+            chains[gpu] = builder.compute(
+                "add_cc", [value, incoming[gpu]], device(gpu), compute_level
+            )
+
+    gathered = [chains[0]]
+    for gpu in range(1, 8):
+        gathered.append(
+            builder.transfer(
+                builder.execution, chains[gpu], device(gpu), device(0),
+                compute_level,
+            )
+        )
+    output = gathered[0]
+    for value in gathered[1:]:
+        output = builder.compute(
+            "add_cc", [output, value], device(0), compute_level
+        )
+    return builder.finish(output)
+
+
 def summarize(plan: dict) -> dict:
     computes = [item for item in plan["execution"] if item["kind"] == "compute"]
     return {
@@ -336,6 +418,11 @@ def main() -> None:
             args.operator_spec, args.segment_length, args.communication_rounds,
             args.input_level, args.compute_level
         ),
+        "1gpu-1999.runtime-plan.json": build_single_gpu(
+            args.operator_spec, args.segment_length, args.communication_rounds,
+            args.input_level, args.compute_level, chain_count=8,
+            plan_id=655360010
+        ),
         "4gpu.runtime-plan.json": build_multi_gpu_interleaved(
             args.operator_spec, 4, 655360005, args.segment_length,
             args.communication_rounds, args.input_level, args.compute_level
@@ -352,6 +439,10 @@ def main() -> None:
         "8gpu.runtime-plan.json": build_multi_gpu_interleaved(
             args.operator_spec, 8, 655360008, args.segment_length,
             args.communication_rounds, args.input_level, args.compute_level
+        ),
+        "8gpu-strong.runtime-plan.json": build_eight_gpu_strong_scaling(
+            args.operator_spec, args.segment_length, args.communication_rounds,
+            args.input_level, args.compute_level
         ),
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)
