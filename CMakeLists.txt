@@ -29,6 +29,7 @@ add_library(ckks_runtime_core STATIC
     runtime/plan.cpp
     runtime/verifier.cpp
     runtime/plaintext_bundle.cpp
+    runtime/thread_trace.cpp
     runtime/utils/sha256.cpp
 )
 add_library(ckks_runtime::core ALIAS ckks_runtime_core)
@@ -107,6 +108,11 @@ if(CKKS_RUNTIME_BUILD_TESTS)
         PRIVATE CKKS_RUNTIME_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     ckks_runtime_enable_warnings(runtime_plan_json_tests)
     add_test(NAME runtime_plan_json_tests COMMAND runtime_plan_json_tests)
+
+    add_executable(thread_trace_tests tests/thread_trace_tests.cpp)
+    target_link_libraries(thread_trace_tests PRIVATE ckks_runtime_core)
+    ckks_runtime_enable_warnings(thread_trace_tests)
+    add_test(NAME thread_trace_tests COMMAND thread_trace_tests)
 endif()
 
 if(CKKS_RUNTIME_BUILD_EXPERIMENTS)

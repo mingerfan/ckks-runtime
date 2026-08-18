@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/plaintext_bundle.hpp"
+#include "runtime/thread_trace.hpp"
 #include "runtime/verifier.hpp"
 
 #include <atomic>
@@ -118,6 +119,7 @@ public:
         bundle_slots_.clear();
         return_all_values_ = diff_mode == DiffMode::AllValuesAfterRun;
         timing_ = RuntimeTiming{};
+        ThreadTrace::set_thread_name("rank-" + std::to_string(rank_) + "-main");
         open_trace();
         try {
             const auto setup_start = std::chrono::steady_clock::now();
@@ -154,7 +156,9 @@ public:
             synchronize_final_outputs();
             timing_.online_execution_nanoseconds = elapsed_nanoseconds(
                 online_execution_start, std::chrono::steady_clock::now());
-            return make_artifact(diff_mode);
+            auto artifact = make_artifact(diff_mode);
+            ThreadTrace::write_json(rank_);
+            return artifact;
         } catch (const std::exception &error) {
             const std::string diagnostic = format_error(error.what());
             std::cerr << diagnostic << std::endl;
@@ -205,7 +209,7 @@ private:
                      std::string_view op,
                      std::uint64_t duration_nanoseconds) {
         if (!runtime_trace_) return;
-        std::lock_guard<std::mutex> lock(trace_mutex_);
+        ThreadTraceLockGuard lock(trace_mutex_, "runtime.trace");
         *runtime_trace_ << rank_ << ',' << event << ',' << id << ','
                         << ordinal << ',';
         if (consumer_ordinal) *runtime_trace_ << *consumer_ordinal;
@@ -374,7 +378,13 @@ private:
         auto &group = groups_.at(group_id);
         if (group.completed) return;
         const auto wait_start = std::chrono::steady_clock::now();
+        const std::uint64_t trace_wait_start =
+            ThreadTrace::enabled() ? ThreadTrace::timestamp_ns() : 0;
         auto outputs = api_.wait(group.handle);
+        if (ThreadTrace::enabled())
+            ThreadTrace::record_duration(
+                "runtime.communication_wait", &group, trace_wait_start,
+                ThreadTrace::timestamp_ns());
         const auto wait_elapsed = elapsed_nanoseconds(
             wait_start, std::chrono::steady_clock::now());
         ++timing_.communication_wait_calls;
@@ -443,7 +453,8 @@ private:
         bool expected = false;
         if (!parallel_failed_.compare_exchange_strong(expected, true)) return;
         {
-            std::lock_guard<std::mutex> lock(parallel_failure_mutex_);
+            ThreadTraceLockGuard lock(
+                parallel_failure_mutex_, "runtime.parallel_failure");
             parallel_failure_ = std::move(failure);
         }
         for (const auto &item : parallel_values_)
@@ -453,15 +464,23 @@ private:
     void finish_parallel_group(
         const std::shared_ptr<ParallelGroup> &group,
         std::optional<std::uint64_t> consumer_ordinal) {
-        std::unique_lock<std::mutex> lock(group->mutex);
+        ThreadTraceUniqueLock lock(
+            group->mutex, "runtime.parallel_communication_group");
         if (group->completed) return;
 
         const auto wait_start = std::chrono::steady_clock::now();
+        const std::uint64_t trace_wait_start =
+            ThreadTrace::enabled() ? ThreadTrace::timestamp_ns() : 0;
         auto outputs = api_.wait(group->handle);
+        if (ThreadTrace::enabled())
+            ThreadTrace::record_duration(
+                "runtime.communication_wait", group.get(), trace_wait_start,
+                ThreadTrace::timestamp_ns());
         const auto wait_elapsed = elapsed_nanoseconds(
             wait_start, std::chrono::steady_clock::now());
         {
-            std::lock_guard<std::mutex> timing_lock(parallel_timing_mutex_);
+            ThreadTraceLockGuard timing_lock(
+                parallel_timing_mutex_, "runtime.parallel_timing");
             ++timing_.communication_wait_calls;
             timing_.communication_wait_nanoseconds += wait_elapsed;
         }
@@ -477,7 +496,8 @@ private:
             api_.validate_value(outputs[i], expected_desc);
             auto &value = group->local_outputs[i];
             {
-                std::lock_guard<std::mutex> value_lock(value->mutex);
+                ThreadTraceLockGuard value_lock(
+                    value->mutex, "runtime.parallel_value");
                 if (!value->defined || value->group.get() != group.get())
                     throw std::runtime_error(
                         "parallel communication output state is invalid");
@@ -496,10 +516,11 @@ private:
         for (;;) {
             std::shared_ptr<ParallelGroup> group;
             {
-                std::unique_lock<std::mutex> lock(value->mutex);
-                value->condition.wait(lock, [&] {
+                ThreadTraceUniqueLock lock(
+                    value->mutex, "runtime.parallel_value");
+                lock.wait(value->condition, [&] {
                     return value->defined || parallel_failed_.load();
-                });
+                }, "runtime.value_dependency_wait");
                 if (parallel_failed_.load())
                     throw std::runtime_error("parallel execution was cancelled");
                 if (value->place != expected_place)
@@ -532,7 +553,8 @@ private:
         trace_event("compute", op.output, instruction_ordinal,
                     std::nullopt, to_string(op.kind), elapsed);
         {
-            std::lock_guard<std::mutex> lock(parallel_timing_mutex_);
+            ThreadTraceLockGuard lock(
+                parallel_timing_mutex_, "runtime.parallel_timing");
             ++timing_.compute_calls;
             timing_.compute_including_boot_nanoseconds += elapsed;
             if (op.kind == ComputeKind::Boot) {
@@ -544,7 +566,8 @@ private:
         const auto &output_desc = desc(op.output);
         api_.validate_value(output, output_desc);
         {
-            std::lock_guard<std::mutex> lock(output_value->mutex);
+            ThreadTraceLockGuard lock(
+                output_value->mutex, "runtime.parallel_value");
             output_value->value.emplace(std::move(output));
             output_value->defined = true;
         }
@@ -566,7 +589,8 @@ private:
         const auto post_elapsed = elapsed_nanoseconds(
             post_start, std::chrono::steady_clock::now());
         {
-            std::lock_guard<std::mutex> lock(parallel_timing_mutex_);
+            ThreadTraceLockGuard lock(
+                parallel_timing_mutex_, "runtime.parallel_timing");
             ++timing_.communication_post_calls;
             timing_.communication_post_nanoseconds += post_elapsed;
         }
@@ -576,7 +600,8 @@ private:
         for (std::size_t i = 0; i < group->local_outputs.size(); ++i) {
             auto &value = group->local_outputs[i];
             {
-                std::lock_guard<std::mutex> lock(value->mutex);
+                ThreadTraceLockGuard lock(
+                    value->mutex, "runtime.parallel_value");
                 value->group = group;
                 value->local_slot = i;
                 value->defined = true;
@@ -672,6 +697,9 @@ private:
         workers.reserve(tasks.size());
         for (std::size_t device = 0; device < tasks.size(); ++device) {
             workers.emplace_back([this, &tasks, device] {
+                ThreadTrace::set_thread_name(
+                    "rank-" + std::to_string(rank_) + "-device-worker-" +
+                    std::to_string(device));
                 try {
                     for (auto &task : tasks[device]) {
                         if (parallel_failed_.load()) return;
@@ -684,7 +712,8 @@ private:
         }
         for (auto &worker : workers) worker.join();
         if (parallel_failed_.load()) {
-            std::lock_guard<std::mutex> lock(parallel_failure_mutex_);
+            ThreadTraceLockGuard lock(
+                parallel_failure_mutex_, "runtime.parallel_failure");
             std::rethrow_exception(parallel_failure_);
         }
 
