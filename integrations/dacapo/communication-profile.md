@@ -34,6 +34,47 @@ bytes/us。它不进入 RuntimePlan V1，也不改变 Runtime 的传输语义。
 `host_device` 用于同 rank 的 Host/GPU 传输，`intra_rank` 用于同 rank 的
 不同 GPU，`inter_rank` 用于不同 rank。当前不区分传输方向和具体 GPU 对。
 
+## V2 有序规则
+
+`format_version: 2` 可以在旧 `links` 兜底模型之上增加拓扑和有序的
+point-to-point 规则：
+
+```json
+{
+  "format_version": 2,
+  "coefficient_bytes": 8,
+  "topology": {"rank_to_node": [0, 1]},
+  "links": {"host_device": {}, "intra_rank": {}, "inter_rank": {}},
+  "rules": [
+    {
+      "id": "special-pair",
+      "from": {"kind": "device", "rank": 0, "device": 3},
+      "to": {"kind": "device", "rank": 1, "device": 2},
+      "direction": "both",
+      "transport": "nccl",
+      "cost": {
+        "startup_latency_us": 8,
+        "max_rate_bytes_per_us": 50000,
+        "saturation_bytes": 1048576
+      }
+    }
+  ]
+}
+```
+
+规则数组采用 first-match 语义：从前到后检查，第一条匹配规则生效，后面的
+规则不会覆盖它。`rank`、`device` 和 `node` 可以使用非负整数或 `"*"`；
+`kind` 可以是 `host` 或 `device`。`direction` 默认为 `forward`，也可以写
+`both` 表示反向同样匹配。规则的 `cost` 是完整链路模型，不做字段级合并。
+
+`rank_to_node` 的下标是 MPI rank，值是逻辑节点编号。它用于区分不同 rank
+但位于同一节点的进程间通信与真正的跨节点通信。它的长度必须与 placement
+传入的 `device-counts` rank 数一致。
+
+V1 profile 无需修改，仍按原来的三类 `links` 工作。V2 中如果规则没有匹配，
+则回退到存在的旧 `links` 模型；如果既没有匹配规则也没有兜底模型，placement
+直接报错。Profile 只影响编译期 placement，RuntimePlan V1 不携带这些 cost 字段。
+
 ## Payload 估算
 
 placement 从 CKKS 类型和 OperatorSpec 估算传输量：

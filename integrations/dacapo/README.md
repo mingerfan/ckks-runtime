@@ -28,6 +28,11 @@ nix develop --command ctest --test-dir build/nix --output-on-failure
 
 placement 可通过 `--communication-profile` 使用按 CKKS value 大小估算的通信代价。每类链路配置启动延迟、速率上限和曲线饱和尺寸，也可以提供 `payload_bytes`/`rate_bytes_per_us` 点位表做线性插值。完整格式和公式见 [Placement 通信 Profile](communication-profile.md)。不传该选项时保留原来的两个固定整数，只用于兼容已有命令和测试。
 
+Profile V2 还可以通过 `topology.rank_to_node` 描述 MPI rank 所在的逻辑节点，
+并用有序 `rules` 对具体 `(rank, device)` 对或 rank/node 通配范围进行覆盖。
+规则从前到后采用 first-match；没有命中时回退到 V2 中的旧 `links` 模型。这样
+可以在保持旧 profile 兼容的同时，单独描述某一条 GPU 对或某一组 rank 的速率。
+
 GPU MLP 的 8192 实机校准 profile 可用下面的 preset 生成。它保留
 `synthetic` 默认 preset，不覆盖现有 32768/65536 产物：
 
