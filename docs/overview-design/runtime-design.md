@@ -230,7 +230,7 @@ execute_comm(action):
     local_inputs = 收集本 rank 拥有的源值
 
     group = register_pending_group(
-        api.communicate_async(action, local_inputs))
+        api.communicate_async(action, local_inputs, output_descs))
     把本 rank 的每个输出 ValueId 登记到这个 group
     group 保留到收尾阶段
 ~~~
@@ -245,6 +245,11 @@ execute_comm(action):
 - 都不在本 rank：Api 返回一个空句柄（什么都不做）。
 
 Runtime 不知道 `communicate_async` 底下调的是 send、recv、broadcast、gather、memcpy、MPI 还是 NCCL。
+
+多 rank 的 `PerDeviceWorkers` 模式保留主线程作为双向通信 coordinator。纯本 rank
+的单目标传输由相应 device worker 发布；跨 rank action 由各 rank 主线程按
+RuntimePlan ordinal 顺序发布和完成。这样只有主线程调用 MPI/NCCL，仍满足
+`MPI_THREAD_FUNNELED`，而 device worker 可以继续执行与当前通信无依赖的计算。
 
 ## 8. ensure_ready（用前等待）
 

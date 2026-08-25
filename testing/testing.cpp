@@ -198,7 +198,9 @@ HarnessResult run_mock_cluster(const RuntimePlan &plan,
                                VecExecConfig exec_config,
                                DiffMode diff_mode,
                                bool skip_artifact_digest_checks,
-                               const std::vector<std::optional<std::filesystem::path>> &bundle_dirs) {
+                               const std::vector<std::optional<std::filesystem::path>> &bundle_dirs,
+                               DeviceExecutionMode execution_mode,
+                               std::size_t device_worker_count) {
     cluster_config.world_size = plan.target.world_size;
     auto cluster = std::make_shared<MockCluster>(cluster_config);
     std::vector<std::unique_ptr<MockVecApi>> apis;
@@ -210,7 +212,8 @@ HarnessResult run_mock_cluster(const RuntimePlan &plan,
                                                     cluster_config.fail_compute,
                                                     cluster_config.fail_communicate));
         runtimes.push_back(std::make_unique<SequentialRuntime<MockVecApi>>(rank, plan.target.world_size,
-            plan.target.device_counts.at(static_cast<std::size_t>(rank)), *apis.back()));
+            plan.target.device_counts.at(static_cast<std::size_t>(rank)), *apis.back(),
+            execution_mode, device_worker_count));
     }
     std::vector<std::thread> threads;
     for (int rank = 0; rank < plan.target.world_size; ++rank) {

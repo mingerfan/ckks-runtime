@@ -150,7 +150,8 @@ public:
 
     CommHandle communicate_async(
         const CommAction &action,
-        const std::vector<Value> &local_inputs);
+        const std::vector<Value> &local_inputs,
+        const std::vector<ValueDesc> &output_descs);
 
     std::vector<Value> wait(CommHandle &handle);
 
@@ -167,6 +168,10 @@ public:
 - 源和目标都在本 rank：Api 可以直接本地拷贝；
 - 都不在本 rank：返回一个空句柄；
 - 具体发 send、recv、broadcast、gather、memcpy 还是集合通信，由 Api 根据 action 和本地角色决定。
+
+`output_descs` 与 `action.outputs` 使用相同的完整 slot 顺序。接收端可以据此在
+`communicate_async` 内直接分配目标对象并发布异步接收，不需要先从发送端获取
+对象布局；Api 必须校验 descriptor 的 ValueId、kind 和 Place 与 CommAction 一致。
 
 `wait` 返回本 rank 上由这次通信产生的输出值，顺序和该 rank 在 `action.outputs` 中的下标顺序一致。Runtime 用这些下标把结果安装到各自的 ValueId；数量、类型、位置或顺序不匹配都是致命错误。
 
@@ -340,7 +345,7 @@ Api 的计算、`communicate_async`、`wait` 或 `synchronize` 失败时直接�
 preflight(plan_source_sha256, skip_artifact_digest_checks,
           target, operator_spec, requirements)
 validate_value(value, expected_desc)
-communicate_async(CommAction, local_inputs)
+communicate_async(CommAction, local_inputs, output_descs)
 wait(CommHandle)
 synchronize(Value)
 abort_all(exit_code, reason)

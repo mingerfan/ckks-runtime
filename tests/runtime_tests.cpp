@@ -307,6 +307,69 @@ void test_mock_sync_async_matrix() {
     }
 }
 
+void test_multi_rank_device_workers() {
+    const auto built = make_fanout_plan({2, 1});
+    const auto cipher = make_cipher({1, 2, 3, 4}, "ctx", 8192, 3, 1);
+    const auto plain = make_plain({2, 3, 4, 5}, "ctx", 8192, 3, 1);
+    const auto result = run_mock_cluster(
+        built.plan, built.operator_spec, {{0, cipher}, {1, plain}}, {}, {},
+        DiffMode::FinalOnly, false, {}, DeviceExecutionMode::PerDeviceWorkers);
+    compare_values(
+        result.artifacts.back().values.at(built.plan.final_outputs[0]).value,
+        run_fanout_reference(cipher, plain).at(built.reference_output));
+    for (const auto &stats : result.stats) {
+        require(stats.coordinator_compute_calls == 0,
+                "device compute ran on the coordinator thread");
+        require(stats.worker_compute_calls == stats.compute_calls,
+                "device compute did not run on a worker thread");
+        require(stats.coordinator_communicate_calls > 0,
+                "cross-rank communication did not run on the coordinator");
+        require(stats.completed_handles == stats.communicate_calls,
+                "parallel communication handle was not completed");
+    }
+    require(result.stats.back().worker_communicate_calls > 0,
+            "local Device-to-Host copy did not run on a worker thread");
+}
+
+void test_single_rank_device_worker_replicate() {
+    const auto built = make_fanout_plan({3});
+    const auto cipher = make_cipher({1, 2, 3, 4}, "ctx", 8192, 3, 1);
+    const auto plain = make_plain({2, 3, 4, 5}, "ctx", 8192, 3, 1);
+    const auto result = run_mock_cluster(
+        built.plan, built.operator_spec, {{0, cipher}, {1, plain}}, {}, {},
+        DiffMode::FinalOnly, false, {}, DeviceExecutionMode::PerDeviceWorkers);
+    compare_values(
+        result.artifacts.front().values.at(built.plan.final_outputs[0]).value,
+        run_fanout_reference(cipher, plain).at(built.reference_output));
+    const auto &stats = result.stats.front();
+    require(stats.worker_compute_calls == stats.compute_calls,
+            "single-rank compute did not run on workers");
+    require(stats.worker_communicate_calls >= 3,
+            "local Replicate was not split across device workers");
+    require(stats.completed_handles == stats.communicate_calls,
+            "local Replicate left an incomplete communication handle");
+}
+
+void test_multi_rank_device_worker_failures() {
+    const auto built = make_fanout_plan({2, 1});
+    const auto cipher = make_cipher({1, 2, 3, 4}, "ctx", 8192, 3, 1);
+    const auto plain = make_plain({2, 3, 4, 5}, "ctx", 8192, 3, 1);
+    const auto run = [&](MockClusterConfig config) {
+        return run_mock_cluster(
+            built.plan, built.operator_spec, {{0, cipher}, {1, plain}},
+            std::move(config), {}, DiffMode::FinalOnly, false, {},
+            DeviceExecutionMode::PerDeviceWorkers);
+    };
+    MockClusterConfig compute_failure;
+    compute_failure.fail_compute = ComputeKind::Negate;
+    expect_throw([&] { run(compute_failure); }, "injected compute failure");
+
+    MockClusterConfig communication_failure;
+    communication_failure.fail_communicate.insert(102);
+    expect_throw([&] { run(communication_failure); },
+                 "injected communicate_async failure");
+}
+
 } // namespace
 
 int main() {
@@ -319,6 +382,9 @@ int main() {
         run_test("Host and Device Boot paths", test_boot_paths);
         run_test("preflight and digest debug mode", test_preflight_and_digest_debug_mode);
         run_test("Mock sync/async multi-rank matrix", test_mock_sync_async_matrix);
+        run_test("multi-rank per-device workers", test_multi_rank_device_workers);
+        run_test("single-rank worker Replicate", test_single_rank_device_worker_replicate);
+        run_test("multi-rank device-worker failures", test_multi_rank_device_worker_failures);
         std::cout << "ALL " << tests_run << " TEST GROUPS PASSED\n";
         return 0;
     } catch (const std::exception &error) {

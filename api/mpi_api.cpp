@@ -77,7 +77,18 @@ MpiVecApi::Value MpiVecApi::encode_plaintext(const ValueDesc &output_desc,
 }
 
 MpiVecApi::CommHandle MpiVecApi::communicate_async(const CommAction &action,
-                                                    const std::vector<Value> &local_inputs) {
+                                                    const std::vector<Value> &local_inputs,
+                                                    const std::vector<ValueDesc> &output_descs) {
+    if (output_descs.size() != action.outputs.size() ||
+        action.outputs.size() != action.output_types.size() ||
+        action.outputs.size() != action.destinations.size())
+        throw std::runtime_error("MPI communication output descriptor count mismatch");
+    for (std::size_t slot = 0; slot < output_descs.size(); ++slot)
+        if (output_descs[slot].id != action.outputs[slot] ||
+            output_descs[slot].kind != action.output_types[slot] ||
+            output_descs[slot].place != action.destinations[slot])
+            throw std::runtime_error(
+                "MPI communication output descriptor mismatch");
     CommHandle handle;
     handle.id = action.id;
     for (std::size_t i = 0; i < action.destinations.size(); ++i)

@@ -234,16 +234,23 @@ private:
         bool defined = false;
         std::optional<Value> value;
         std::shared_ptr<ParallelGroup> group;
-        std::size_t local_slot = 0;
+    };
+
+    struct ParallelOutput {
+        ValueId id = 0;
+        std::size_t action_slot = 0;
+        std::shared_ptr<ParallelValue> value;
     };
 
     struct ParallelGroup {
         CommAction action;
         std::uint64_t instruction_ordinal = 0;
         std::vector<ValueId> local_input_ids;
-        std::vector<std::shared_ptr<ParallelValue>> local_outputs;
+        std::vector<ParallelOutput> local_outputs;
         CommHandle handle;
         std::mutex mutex;
+        bool cross_rank = false;
+        bool posted = false;
         bool completed = false;
     };
 
@@ -252,6 +259,14 @@ private:
     const ValueDesc &desc(ValueId id) const {
         for (const auto &value : plan_->values) if (value.id == id) return value;
         throw std::runtime_error("missing value descriptor for " + std::to_string(id));
+    }
+
+    std::vector<ValueDesc> communication_output_descs(
+        const CommAction &action) const {
+        std::vector<ValueDesc> result;
+        result.reserve(action.outputs.size());
+        for (ValueId id : action.outputs) result.push_back(desc(id));
+        return result;
     }
 
     void load_bundle(const RuntimeResources &resources) {
@@ -357,7 +372,8 @@ private:
         group.action = action;
         group.instruction_ordinal = current_->ordinal;
         const auto post_start = std::chrono::steady_clock::now();
-        group.handle = api_.communicate_async(action, local_inputs);
+        group.handle = api_.communicate_async(
+            action, local_inputs, communication_output_descs(action));
         const auto post_elapsed = elapsed_nanoseconds(
             post_start, std::chrono::steady_clock::now());
         ++timing_.communication_post_calls;
@@ -427,12 +443,13 @@ private:
         if (return_all_values_)
             throw std::runtime_error(
                 "per-device worker execution does not support AllValuesAfterRun");
-        if (world_size_ != 1 || local_devices_ <= 0)
+        if (local_devices_ <= 0)
             throw std::runtime_error(
-                "per-device worker execution requires one rank and at least one device");
+                "per-device worker execution requires at least one local device");
 
         parallel_values_.clear();
         parallel_groups_.clear();
+        coordinator_groups_.clear();
         parallel_failed_.store(false);
         parallel_failure_ = nullptr;
 
@@ -467,6 +484,9 @@ private:
         ThreadTraceUniqueLock lock(
             group->mutex, "runtime.parallel_communication_group");
         if (group->completed) return;
+        if (!group->posted)
+            throw std::runtime_error(
+                "parallel communication was waited before it was posted");
 
         const auto wait_start = std::chrono::steady_clock::now();
         const std::uint64_t trace_wait_start =
@@ -491,10 +511,15 @@ private:
             throw std::runtime_error("Api wait returned wrong parallel output count");
 
         for (std::size_t i = 0; i < outputs.size(); ++i) {
-            const ValueId id = group->action.outputs[i];
+            const auto &local_output = group->local_outputs[i];
+            const ValueId id = local_output.id;
+            if (local_output.action_slot >= group->action.outputs.size() ||
+                group->action.outputs[local_output.action_slot] != id)
+                throw std::runtime_error(
+                    "parallel communication output slot mapping is invalid");
             const auto &expected_desc = desc(id);
             api_.validate_value(outputs[i], expected_desc);
-            auto &value = group->local_outputs[i];
+            const auto &value = local_output.value;
             {
                 ThreadTraceLockGuard value_lock(
                     value->mutex, "runtime.parallel_value");
@@ -533,6 +558,19 @@ private:
             if (!group)
                 throw std::runtime_error(
                     "parallel value is defined without data or communication");
+            if (group->cross_rank &&
+                std::this_thread::get_id() != coordinator_thread_) {
+                ThreadTraceUniqueLock lock(
+                    value->mutex, "runtime.remote_value_wait");
+                lock.wait(value->condition, [&] {
+                    return value->value.has_value() ||
+                           parallel_failed_.load();
+                }, "runtime.remote_value_wait");
+                if (parallel_failed_.load())
+                    throw std::runtime_error(
+                        "parallel execution was cancelled");
+                continue;
+            }
             finish_parallel_group(group, consumer_ordinal);
         }
     }
@@ -547,7 +585,13 @@ private:
                 id, op.place, instruction_ordinal));
 
         const auto start = std::chrono::steady_clock::now();
+        const std::uint64_t trace_compute_start =
+            ThreadTrace::enabled() ? ThreadTrace::timestamp_ns() : 0;
         Value output = api_.compute(op, inputs);
+        if (ThreadTrace::enabled())
+            ThreadTrace::record_duration(
+                "runtime.compute", output_value.get(), trace_compute_start,
+                ThreadTrace::timestamp_ns());
         const auto elapsed = elapsed_nanoseconds(
             start, std::chrono::steady_clock::now());
         trace_event("compute", op.output, instruction_ordinal,
@@ -585,7 +629,8 @@ private:
         }
 
         const auto post_start = std::chrono::steady_clock::now();
-        group->handle = api_.communicate_async(action, local_inputs);
+        CommHandle handle = api_.communicate_async(
+            action, local_inputs, communication_output_descs(action));
         const auto post_elapsed = elapsed_nanoseconds(
             post_start, std::chrono::steady_clock::now());
         {
@@ -597,38 +642,92 @@ private:
         trace_event("comm_post", action.id, instruction_ordinal,
                     std::nullopt, to_string(action.kind), post_elapsed);
 
+        {
+            ThreadTraceLockGuard lock(
+                group->mutex, "runtime.parallel_communication_group");
+            group->handle = std::move(handle);
+            group->posted = true;
+        }
+
         for (std::size_t i = 0; i < group->local_outputs.size(); ++i) {
-            auto &value = group->local_outputs[i];
+            const auto &value = group->local_outputs[i].value;
             {
                 ThreadTraceLockGuard lock(
                     value->mutex, "runtime.parallel_value");
                 value->group = group;
-                value->local_slot = i;
                 value->defined = true;
             }
             value->condition.notify_all();
         }
     }
 
-    int parallel_communication_worker(const CommAction &action) const {
-        std::optional<int> worker;
-        const auto select = [&](const Place &place) {
-            if (place.rank != rank_ || place.kind != PlaceKind::Device) return;
-            if (place.index < 0 || place.index >= local_devices_)
-                throw std::runtime_error(
-                    "parallel communication uses an unavailable device");
-            if (worker && *worker != place.index)
-                throw std::runtime_error(
-                    "parallel communication cannot own outputs on multiple devices");
-            worker = place.index;
-        };
-        for (const Place &destination : action.destinations) select(destination);
-        if (!worker)
-            for (const Place &source : action.sources) select(source);
-        if (!worker)
+    bool is_cross_rank_action(const CommAction &action) const {
+        if (action.sources.empty())
+            throw std::runtime_error("parallel communication has no source");
+        const int source_rank = action.sources.front().rank;
+        return std::any_of(
+            action.destinations.begin(), action.destinations.end(),
+            [source_rank](const Place &place) {
+                return place.rank != source_rank;
+            });
+    }
+
+    std::shared_ptr<ParallelGroup> make_parallel_group(
+        CommAction action, std::uint64_t instruction_ordinal,
+        bool cross_rank) {
+        auto group = std::make_shared<ParallelGroup>();
+        group->action = std::move(action);
+        group->instruction_ordinal = instruction_ordinal;
+        group->cross_rank = cross_rank;
+        for (std::size_t i = 0; i < group->action.inputs.size(); ++i)
+            if (group->action.sources[i].rank == rank_)
+                group->local_input_ids.push_back(group->action.inputs[i]);
+        for (std::size_t i = 0; i < group->action.outputs.size(); ++i) {
+            if (group->action.destinations[i].rank != rank_) continue;
+            group->local_outputs.push_back(ParallelOutput{
+                group->action.outputs[i], i,
+                define_parallel_value(group->action.outputs[i],
+                                      group->action.destinations[i])});
+        }
+        parallel_groups_.push_back(group);
+        return group;
+    }
+
+    int local_communication_worker(const CommAction &action) const {
+        if (action.outputs.size() != 1 || action.destinations.size() != 1 ||
+            action.sources.size() != 1)
             throw std::runtime_error(
-                "parallel communication has no local device worker");
-        return *worker;
+                "local parallel communication must have one destination");
+        const Place &destination = action.destinations.front();
+        const Place &source = action.sources.front();
+        const Place *device_place =
+            destination.kind == PlaceKind::Device ? &destination :
+            source.kind == PlaceKind::Device ? &source : nullptr;
+        if (device_place == nullptr || device_place->rank != rank_ ||
+            device_place->index < 0 || device_place->index >= local_devices_)
+            throw std::runtime_error(
+                "local parallel communication has no available device worker");
+        return device_place->index;
+    }
+
+    CommAction local_communication_slice(const CommAction &action,
+                                         std::size_t slot) const {
+        if (action.inputs.size() != 1 || action.sources.size() != 1 ||
+            slot >= action.outputs.size() ||
+            slot >= action.destinations.size() ||
+            slot >= action.output_types.size())
+            throw std::runtime_error(
+                "local parallel communication mapping is invalid");
+        CommAction result;
+        result.id = action.id;
+        result.kind = CommKind::Transfer;
+        result.hint = action.hint;
+        result.inputs = action.inputs;
+        result.sources = action.sources;
+        result.outputs = {action.outputs[slot]};
+        result.destinations = {action.destinations[slot]};
+        result.output_types = {action.output_types[slot]};
+        return result;
     }
 
     void compile_parallel_phase(
@@ -656,30 +755,42 @@ private:
                     "per-device worker execution does not support online Encode");
 
             const auto action = std::get<CommAction>(instruction.body);
-            auto group = std::make_shared<ParallelGroup>();
-            group->action = action;
-            group->instruction_ordinal = instruction.ordinal;
-            for (std::size_t i = 0; i < action.inputs.size(); ++i)
-                if (action.sources[i].rank == rank_)
-                    group->local_input_ids.push_back(action.inputs[i]);
-            for (std::size_t i = 0; i < action.outputs.size(); ++i) {
-                if (action.destinations[i].rank != rank_) continue;
-                group->local_outputs.push_back(define_parallel_value(
-                    action.outputs[i], action.destinations[i]));
+            if (is_cross_rank_action(action)) {
+                const auto device_endpoint = [](const Place &place) {
+                    return place.kind == PlaceKind::Device;
+                };
+                if (!std::all_of(action.sources.begin(), action.sources.end(),
+                                 device_endpoint) ||
+                    !std::all_of(action.destinations.begin(),
+                                 action.destinations.end(), device_endpoint))
+                    throw std::runtime_error(
+                        "multi-rank device workers require Device-only online communication");
+                coordinator_groups_.push_back(make_parallel_group(
+                    action, instruction.ordinal, true));
+                continue;
             }
-            parallel_groups_.push_back(group);
-            const int device = parallel_communication_worker(action);
-            const std::size_t worker =
-                static_cast<std::size_t>(device) % tasks.size();
-            tasks[worker].push_back(
-                [this, action, ordinal = instruction.ordinal, group] {
-                    execute_parallel_communication(action, ordinal, group);
-                });
+            if (action.sources.empty() ||
+                action.sources.front().rank != rank_) continue;
+            for (std::size_t slot = 0; slot < action.outputs.size(); ++slot) {
+                CommAction local = local_communication_slice(action, slot);
+                auto group = make_parallel_group(
+                    local, instruction.ordinal, false);
+                const int device = local_communication_worker(local);
+                const std::size_t worker =
+                    static_cast<std::size_t>(device) % tasks.size();
+                tasks[worker].push_back(
+                    [this, local = std::move(local),
+                     ordinal = instruction.ordinal, group] {
+                        execute_parallel_communication(
+                            local, ordinal, group);
+                    });
+            }
         }
     }
 
     void execute_device_parallel_phases() {
         prepare_parallel_values();
+        coordinator_thread_ = std::this_thread::get_id();
         const std::size_t worker_count =
             device_worker_count_ == 0
                 ? static_cast<std::size_t>(local_devices_)
@@ -710,12 +821,26 @@ private:
                 }
             });
         }
+        try {
+            for (const auto &group : coordinator_groups_) {
+                if (parallel_failed_.load()) break;
+                execute_parallel_communication(
+                    group->action, group->instruction_ordinal, group);
+                finish_parallel_group(group, std::nullopt);
+            }
+        } catch (...) {
+            record_parallel_failure(std::current_exception());
+        }
         for (auto &worker : workers) worker.join();
         if (parallel_failed_.load()) {
             ThreadTraceLockGuard lock(
                 parallel_failure_mutex_, "runtime.parallel_failure");
             std::rethrow_exception(parallel_failure_);
         }
+
+        for (const auto &group : parallel_groups_)
+            if (!group->completed)
+                finish_parallel_group(group, std::nullopt);
 
         for (ValueId id : plan_->final_outputs) {
             const auto &output_desc = desc(id);
@@ -724,10 +849,6 @@ private:
                 id, output_desc.place, std::nullopt);
             store_.define_ready(id, output_desc.place, std::move(output));
         }
-        for (const auto &group : parallel_groups_)
-            if (!group->completed)
-                throw std::runtime_error(
-                    "parallel communication output was never consumed");
     }
 
     void finish_all_groups() {
@@ -798,6 +919,8 @@ private:
     std::map<std::string, std::vector<double>> bundle_slots_;
     std::unordered_map<ValueId, std::shared_ptr<ParallelValue>> parallel_values_;
     std::vector<std::shared_ptr<ParallelGroup>> parallel_groups_;
+    std::vector<std::shared_ptr<ParallelGroup>> coordinator_groups_;
+    std::thread::id coordinator_thread_;
     RuntimeTiming timing_;
     std::unique_ptr<std::ofstream> runtime_trace_;
     std::mutex trace_mutex_;

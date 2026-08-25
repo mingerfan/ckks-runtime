@@ -48,6 +48,9 @@ HarnessResult run_mock_cluster(const RuntimePlan &plan,
                                VecExecConfig exec_config,
                                DiffMode diff_mode = DiffMode::FinalOnly,
                                bool skip_artifact_digest_checks = false,
-                               const std::vector<std::optional<std::filesystem::path>> &bundle_dirs = {});
+                               const std::vector<std::optional<std::filesystem::path>> &bundle_dirs = {},
+                               DeviceExecutionMode execution_mode =
+                                   DeviceExecutionMode::Sequential,
+                               std::size_t device_worker_count = 0);
 
 } // namespace fhegpu

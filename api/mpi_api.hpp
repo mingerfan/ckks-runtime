@@ -53,7 +53,9 @@ public:
     std::string name() const { return "MpiVecApi"; }
     Value encode_plaintext(const ValueDesc &output_desc, const std::vector<double> &slots);
     Value compute(const ComputeOp &op, const std::vector<Value> &inputs);
-    CommHandle communicate_async(const CommAction &action, const std::vector<Value> &local_inputs);
+    CommHandle communicate_async(const CommAction &action,
+                                 const std::vector<Value> &local_inputs,
+                                 const std::vector<ValueDesc> &output_descs);
     std::vector<Value> wait(CommHandle &handle);
     void synchronize(Value &value);
     void preflight(std::string_view plan_source_sha256,

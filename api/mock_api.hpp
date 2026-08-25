@@ -12,6 +12,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <thread>
 
 namespace fhegpu {
 
@@ -68,6 +69,10 @@ struct MockStats {
     std::size_t communicate_calls = 0;
     std::size_t wait_calls = 0;
     std::size_t completed_handles = 0;
+    std::size_t coordinator_compute_calls = 0;
+    std::size_t worker_compute_calls = 0;
+    std::size_t coordinator_communicate_calls = 0;
+    std::size_t worker_communicate_calls = 0;
     std::vector<std::string> implementations;
 };
 
@@ -75,8 +80,13 @@ class MockVecApi {
 public:
     using Value = VecValue;
     struct CommHandle {
+        struct LocalState {
+            std::size_t slot = 0;
+            Value value;
+        };
         TransferId id = 0;
         std::vector<std::size_t> local_slots;
+        std::vector<LocalState> locals;
         std::future<void> sender;
         bool has_sender = false;
         bool waited = false;
@@ -90,7 +100,9 @@ public:
     std::string name() const { return "MockVecApi"; }
     Value encode_plaintext(const ValueDesc &output_desc, const std::vector<double> &slots);
     Value compute(const ComputeOp &op, const std::vector<Value> &inputs);
-    CommHandle communicate_async(const CommAction &action, const std::vector<Value> &local_inputs);
+    CommHandle communicate_async(const CommAction &action,
+                                 const std::vector<Value> &local_inputs,
+                                 const std::vector<ValueDesc> &output_descs);
     std::vector<Value> wait(CommHandle &handle);
     void synchronize(Value &value);
     void preflight(std::string_view plan_source_sha256,
@@ -110,6 +122,7 @@ private:
     std::set<TransferId> fail_communicate_;
     mutable std::mutex stats_mutex_;
     MockStats stats_;
+    std::thread::id runtime_thread_;
     std::uint64_t poly_degree_ = 0;
 };
 
