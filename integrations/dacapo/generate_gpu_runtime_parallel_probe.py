@@ -16,6 +16,72 @@ def device(index: int) -> dict[str, int | str]:
 HOST = {"kind": "host", "rank": 0}
 
 
+def parse_device_counts(value: str) -> list[int]:
+    parts = value.split("x")
+    if not parts or any(not part.isdecimal() for part in parts):
+        raise ValueError("device counts must be nonnegative integers separated by x")
+    counts = [int(part) for part in parts]
+    if any(count <= 0 for count in counts):
+        raise ValueError("probe device counts must be positive")
+    return counts
+
+
+def remap_single_rank_plan(
+    plan: dict, device_counts: list[int], plan_id: int
+) -> dict:
+    """Distribute a rank-0 N-GPU probe over MPI ranks without changing its graph."""
+    total_devices = sum(device_counts)
+    source_counts = plan["target"]["device_counts"]
+    if source_counts != [total_devices]:
+        raise ValueError(
+            "distributed probe remapping requires a single-rank plan with "
+            f"{total_devices} devices"
+        )
+
+    offsets: list[int] = []
+    offset = 0
+    for count in device_counts:
+        offsets.append(offset)
+        offset += count
+
+    def remap_place(place: dict) -> dict:
+        if place.get("kind") == "host":
+            return dict(place)
+        if place.get("kind") != "device" or place.get("rank") != 0:
+            raise ValueError("single-rank probe contains an unexpected Place")
+        global_index = place.get("index")
+        if not isinstance(global_index, int) or not 0 <= global_index < total_devices:
+            raise ValueError("single-rank probe contains an invalid device index")
+        rank = next(
+            rank for rank, start in reversed(list(enumerate(offsets)))
+            if global_index >= start
+        )
+        return {
+            "kind": "device",
+            "rank": rank,
+            "index": global_index - offsets[rank],
+        }
+
+    def remap_instruction(instruction: dict) -> None:
+        for field in ("place",):
+            if field in instruction:
+                instruction[field] = remap_place(instruction[field])
+        for field in ("sources", "destinations"):
+            if field in instruction:
+                instruction[field] = [remap_place(place) for place in instruction[field]]
+
+    result = json.loads(json.dumps(plan))
+    result["plan_id"] = str(plan_id)
+    result["target"]["world_size"] = len(device_counts)
+    result["target"]["device_counts"] = device_counts
+    for value in result["values"]:
+        value["place"] = remap_place(value["place"])
+    for phase in ("initialization", "execution", "finalization"):
+        for instruction in result[phase]:
+            remap_instruction(instruction)
+    return result
+
+
 class PlanBuilder:
     def __init__(self, spec_path: Path, device_count: int, plan_id: int) -> None:
         spec_bytes = spec_path.read_bytes()
@@ -385,7 +451,9 @@ def build_eight_gpu_strong_scaling(
 def summarize(plan: dict) -> dict:
     computes = [item for item in plan["execution"] if item["kind"] == "compute"]
     return {
-        "devices": plan["target"]["device_counts"][0],
+        "devices": sum(plan["target"]["device_counts"]),
+        "device_counts": plan["target"]["device_counts"],
+        "world_size": plan["target"]["world_size"],
         "values": len(plan["values"]),
         "initialization_instructions": len(plan["initialization"]),
         "execution_instructions": len(plan["execution"]),
@@ -407,11 +475,24 @@ def main() -> None:
     parser.add_argument("--communication-rounds", type=int, default=48)
     parser.add_argument("--input-level", type=int, default=39)
     parser.add_argument("--compute-level", type=int, default=31)
+    parser.add_argument(
+        "--distributed-device-counts",
+        help="Also distribute the 8-GPU probe over ranks, e.g. 4x4",
+    )
+    parser.add_argument("--distributed-plan-id", type=int, default=655360408)
     args = parser.parse_args()
     if args.segment_length <= 0 or args.communication_rounds <= 0:
         parser.error("segment length and communication rounds must be positive")
     if args.compute_level >= args.input_level:
         parser.error("compute level must be lower than input level")
+    distributed_counts = None
+    if args.distributed_device_counts:
+        try:
+            distributed_counts = parse_device_counts(args.distributed_device_counts)
+        except ValueError as error:
+            parser.error(str(error))
+        if sum(distributed_counts) != 8:
+            parser.error("distributed probe device counts must sum to 8")
 
     plans = {
         "1gpu.runtime-plan.json": build_single_gpu(
@@ -445,6 +526,14 @@ def main() -> None:
             args.input_level, args.compute_level
         ),
     }
+    if distributed_counts is not None:
+        plans[
+            f"{'x'.join(str(count) for count in distributed_counts)}.runtime-plan.json"
+        ] = remap_single_rank_plan(
+            plans["8gpu.runtime-plan.json"],
+            distributed_counts,
+            args.distributed_plan_id,
+        )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for filename, plan in plans.items():
         path = args.output_dir / filename
