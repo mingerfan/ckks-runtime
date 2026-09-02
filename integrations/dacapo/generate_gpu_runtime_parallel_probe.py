@@ -297,10 +297,17 @@ def build_four_gpu_burst(spec_path: Path, segment_length: int,
 def build_multi_gpu_interleaved(
     spec_path: Path, device_count: int, plan_id: int, segment_length: int,
     communication_rounds: int, input_level: int, compute_level: int,
-    online_transfers: bool = True,
+    online_transfers: bool = True, chains_per_device: int = 1,
 ) -> dict:
     if device_count < 2:
         raise ValueError("interleaved probe requires at least two devices")
+    if chains_per_device <= 0:
+        raise ValueError("chains per device must be positive")
+    if chains_per_device != 1 and (device_count, chains_per_device) != (4, 2):
+        raise ValueError(
+            "balanced multi-chain reduction currently requires four devices "
+            "and two chains per device"
+        )
     builder = PlanBuilder(
         spec_path, device_count=device_count, plan_id=plan_id
     )
@@ -313,10 +320,13 @@ def build_multi_gpu_interleaved(
         for gpu in range(device_count)
     ]
     chains = [
-        builder.compute(
-            "mod_switch", [device_inputs[gpu]], device(gpu), compute_level,
-            {"target_level": compute_level},
-        )
+        [
+            builder.compute(
+                "mod_switch", [device_inputs[gpu]], device(gpu), compute_level,
+                {"target_level": compute_level},
+            )
+            for _ in range(chains_per_device)
+        ]
         for gpu in range(device_count)
     ]
 
@@ -327,46 +337,106 @@ def build_multi_gpu_interleaved(
     )
     for round_index, rotation_count in enumerate(rotations_per_round):
         distance = round_index % (device_count - 1) + 1
-        incoming: list[str] = []
+        incoming: list[list[str]] = [[] for _ in range(device_count)]
         for destination in range(device_count):
             source = (destination + distance) % device_count
-            incoming.append(
-                builder.transfer(
-                    builder.execution,
-                    chains[source],
-                    device(source),
-                    device(destination),
-                    compute_level,
+            for chain_index in range(chains_per_device):
+                incoming[destination].append(
+                    builder.transfer(
+                        builder.execution,
+                        chains[source][chain_index],
+                        device(source),
+                        device(destination),
+                        compute_level,
+                    )
+                    if online_transfers
+                    else chains[destination][chain_index]
                 )
-                if online_transfers
-                else chains[destination]
-            )
 
         for gpu in range(device_count):
-            value = rotate_chain(
-                builder, chains[gpu], gpu, compute_level, rotation_count
-            )
-            chains[gpu] = builder.compute(
-                "add_cc", [value, incoming[gpu]], device(gpu), compute_level
-            )
+            for chain_index in range(chains_per_device):
+                value = rotate_chain(
+                    builder, chains[gpu][chain_index], gpu, compute_level,
+                    rotation_count
+                )
+                chains[gpu][chain_index] = builder.compute(
+                    "add_cc", [value, incoming[gpu][chain_index]],
+                    device(gpu), compute_level
+                )
 
-    gathered = [chains[0]]
-    for gpu in range(1, device_count):
-        gathered.append(
-            builder.transfer(
-                builder.execution,
-                chains[gpu],
-                device(gpu),
-                device(0),
-                compute_level,
+    if chains_per_device == 1:
+        gathered = [chains[0][0]]
+        for gpu in range(1, device_count):
+            gathered.append(
+                builder.transfer(
+                    builder.execution,
+                    chains[gpu][0],
+                    device(gpu),
+                    device(0),
+                    compute_level,
+                )
             )
+        output = gathered[0]
+        for value in gathered[1:]:
+            output = builder.compute(
+                "add_cc", [output, value], device(0), compute_level
+            )
+        return builder.finish(output)
+
+    # Four local reductions plus a three-level distributed tree place the
+    # seven final adds on devices [2, 2, 2, 1]. Both inputs move for the last
+    # add so that no one device inherits two extra reduction operations.
+    local_sums = [
+        builder.compute(
+            "add_cc", chains[gpu], device(gpu), compute_level
         )
-    output = gathered[0]
-    for value in gathered[1:]:
-        output = builder.compute(
-            "add_cc", [output, value], device(0), compute_level
+        for gpu in range(4)
+    ]
+    left_input = builder.transfer(
+        builder.execution, local_sums[1], device(1), device(0), compute_level
+    )
+    left = builder.compute(
+        "add_cc", [local_sums[0], left_input], device(0), compute_level
+    )
+    right_input = builder.transfer(
+        builder.execution, local_sums[3], device(3), device(2), compute_level
+    )
+    right = builder.compute(
+        "add_cc", [local_sums[2], right_input], device(2), compute_level
+    )
+    final_inputs = [
+        builder.transfer(
+            builder.execution, value, device(source), device(1), compute_level
         )
-    return builder.finish(output)
+        for value, source in ((left, 0), (right, 2))
+    ]
+    return builder.finish(
+        builder.compute(
+            "add_cc", final_inputs, device(1), compute_level
+        )
+    )
+
+
+def validate_balanced_four_gpu_probe(
+    plan: dict, expected_compute_count: int
+) -> None:
+    computes = [
+        item for item in plan["execution"] if item["kind"] == "compute"
+    ]
+    counts = [
+        sum(item["place"] == device(gpu) for item in computes)
+        for gpu in range(4)
+    ]
+    if (len(computes) != expected_compute_count or
+            max(counts) - min(counts) > 1):
+        raise RuntimeError(
+            "4-GPU probe must contain the expected balanced computes, "
+            f"expected {expected_compute_count}, got {counts}"
+        )
+    for item in plan["execution"]:
+        if (item["kind"] == "transfer" and
+                item["sources"][0] == item["destinations"][0]):
+            raise RuntimeError("4-GPU probe contains a same-place transfer")
 
 
 def build_eight_gpu_strong_scaling(
@@ -450,6 +520,11 @@ def build_eight_gpu_strong_scaling(
 
 def summarize(plan: dict) -> dict:
     computes = [item for item in plan["execution"] if item["kind"] == "compute"]
+    compute_by_device = {}
+    for item in computes:
+        place = item["place"]
+        key = f"{place['rank']}:{place['index']}"
+        compute_by_device[key] = compute_by_device.get(key, 0) + 1
     return {
         "devices": sum(plan["target"]["device_counts"]),
         "device_counts": plan["target"]["device_counts"],
@@ -460,6 +535,8 @@ def summarize(plan: dict) -> dict:
         "execution_transfers": sum(
             item["kind"] == "transfer" for item in plan["execution"]
         ),
+        "compute_instructions": len(computes),
+        "compute_by_device": compute_by_device,
         "compute_ops": {
             op: sum(item["op"] == op for item in computes)
             for op in ("mod_switch", "rotate", "add_cc")
@@ -494,6 +571,26 @@ def main() -> None:
         if sum(distributed_counts) != 8:
             parser.error("distributed probe device counts must sum to 8")
 
+    four_gpu = build_multi_gpu_interleaved(
+        args.operator_spec, 4, 655360011, args.segment_length,
+        args.communication_rounds, args.input_level, args.compute_level,
+        chains_per_device=2
+    )
+    expected_four_gpu_computes = (
+        8 * (1 + 2 * args.segment_length + args.communication_rounds) + 7
+    )
+    validate_balanced_four_gpu_probe(
+        four_gpu, expected_four_gpu_computes
+    )
+    four_gpu_no_online_transfers = build_multi_gpu_interleaved(
+        args.operator_spec, 4, 655360012, args.segment_length,
+        args.communication_rounds, args.input_level, args.compute_level,
+        online_transfers=False, chains_per_device=2
+    )
+    validate_balanced_four_gpu_probe(
+        four_gpu_no_online_transfers, expected_four_gpu_computes
+    )
+
     plans = {
         "1gpu.runtime-plan.json": build_single_gpu(
             args.operator_spec, args.segment_length, args.communication_rounds,
@@ -504,19 +601,13 @@ def main() -> None:
             args.input_level, args.compute_level, chain_count=8,
             plan_id=655360010
         ),
-        "4gpu.runtime-plan.json": build_multi_gpu_interleaved(
-            args.operator_spec, 4, 655360005, args.segment_length,
-            args.communication_rounds, args.input_level, args.compute_level
-        ),
+        "4gpu.runtime-plan.json": four_gpu,
         "4gpu-burst-transfers.runtime-plan.json": build_four_gpu_burst(
             args.operator_spec, args.segment_length, args.communication_rounds,
             args.input_level, args.compute_level
         ),
-        "4gpu-no-online-transfers.runtime-plan.json": build_multi_gpu_interleaved(
-            args.operator_spec, 4, 655360005, args.segment_length,
-            args.communication_rounds, args.input_level, args.compute_level,
-            online_transfers=False
-        ),
+        "4gpu-no-online-transfers.runtime-plan.json":
+            four_gpu_no_online_transfers,
         "8gpu.runtime-plan.json": build_multi_gpu_interleaved(
             args.operator_spec, 8, 655360008, args.segment_length,
             args.communication_rounds, args.input_level, args.compute_level
