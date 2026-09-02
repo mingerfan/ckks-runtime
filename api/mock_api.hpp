@@ -73,6 +73,8 @@ struct MockStats {
     std::size_t worker_compute_calls = 0;
     std::size_t coordinator_communicate_calls = 0;
     std::size_t worker_communicate_calls = 0;
+    std::map<int, std::thread::id> device_compute_threads;
+    std::map<TransferId, std::vector<std::thread::id>> communication_threads;
     std::vector<std::string> implementations;
 };
 

@@ -113,6 +113,9 @@ MockVecApi::Value MockVecApi::compute(const ComputeOp &op, const std::vector<Val
             ++stats_.coordinator_compute_calls;
         else
             ++stats_.worker_compute_calls;
+        if (op.place.kind == PlaceKind::Device)
+            stats_.device_compute_threads.emplace(
+                op.place.index, std::this_thread::get_id());
     }
     if (fail_compute_ && *fail_compute_ == op.kind) throw std::runtime_error("injected compute failure");
     return executor_.compute(op, inputs);
@@ -138,6 +141,8 @@ MockVecApi::CommHandle MockVecApi::communicate_async(
             ++stats_.coordinator_communicate_calls;
         else
             ++stats_.worker_communicate_calls;
+        stats_.communication_threads[action.id].push_back(
+            std::this_thread::get_id());
         stats_.implementations.push_back(action.kind == CommKind::Replicate && action.hint == CommHint::Broadcast
                                              ? "point-to-point broadcast fallback" : "point-to-point");
     }

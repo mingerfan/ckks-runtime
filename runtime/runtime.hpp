@@ -700,9 +700,11 @@ private:
                 "local parallel communication must have one destination");
         const Place &destination = action.destinations.front();
         const Place &source = action.sources.front();
+        // Device-to-Device copies follow the producer so the destination
+        // worker can keep executing until it consumes the copied value.
         const Place *device_place =
-            destination.kind == PlaceKind::Device ? &destination :
-            source.kind == PlaceKind::Device ? &source : nullptr;
+            source.kind == PlaceKind::Device ? &source :
+            destination.kind == PlaceKind::Device ? &destination : nullptr;
         if (device_place == nullptr || device_place->rank != rank_ ||
             device_place->index < 0 || device_place->index >= local_devices_)
             throw std::runtime_error(

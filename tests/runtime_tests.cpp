@@ -348,6 +348,25 @@ void test_single_rank_device_worker_replicate() {
             "local Replicate was not split across device workers");
     require(stats.completed_handles == stats.communicate_calls,
             "local Replicate left an incomplete communication handle");
+
+    const auto &replicate =
+        std::get<CommAction>(built.plan.execution.at(1).body);
+    const int source_device = replicate.sources.front().index;
+    const auto compute_thread = stats.device_compute_threads.find(source_device);
+    const auto communication_threads =
+        stats.communication_threads.find(replicate.id);
+    require(compute_thread != stats.device_compute_threads.end(),
+            "source device worker thread was not recorded");
+    require(communication_threads != stats.communication_threads.end() &&
+                communication_threads->second.size() == replicate.outputs.size(),
+            "local Replicate communication threads were not recorded");
+    require(std::all_of(
+                communication_threads->second.begin(),
+                communication_threads->second.end(),
+                [&](std::thread::id thread) {
+                    return thread == compute_thread->second;
+                }),
+            "local Device-to-Device copy was not submitted by its source worker");
 }
 
 void test_multi_rank_device_worker_failures() {
