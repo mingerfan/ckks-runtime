@@ -137,6 +137,7 @@ public:
         current_value_.reset();
         store_ = ValueStore<Api>{};
         groups_.clear();
+        reset_parallel_execution_state();
         bundle_slots_.clear();
         return_all_values_ = diff_mode == DiffMode::AllValuesAfterRun;
         timing_ = RuntimeTiming{};
@@ -493,12 +494,6 @@ private:
             throw std::runtime_error(
                 "per-device worker execution requires at least one local device");
 
-        parallel_values_.clear();
-        parallel_groups_.clear();
-        coordinator_groups_.clear();
-        parallel_failed_.store(false);
-        parallel_failure_ = nullptr;
-
         for (const auto &item : store_.entries()) {
             const auto *ready =
                 std::get_if<typename ValueStore<Api>::Ready>(&item.second);
@@ -510,6 +505,14 @@ private:
             value->defined = true;
         }
         store_ = ValueStore<Api>{};
+    }
+
+    void reset_parallel_execution_state() {
+        parallel_values_.clear();
+        parallel_groups_.clear();
+        coordinator_groups_.clear();
+        parallel_failed_.store(false);
+        parallel_failure_ = nullptr;
     }
 
     void record_parallel_failure(std::exception_ptr failure) {
