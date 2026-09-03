@@ -279,7 +279,7 @@ Runtime 不需要能力查询，也不参与降级。
 
 ## 12. 异步与等待
 
-`communicate_async` 必须在不等待远端完成的情况下返回，具体的 request/event 都藏在 CommHandle 里。
+`communicate_async` 必须在不等待远端完成的情况下返回，具体的 request/event 都藏在 CommHandle 里。Api 可以再实现可选的 `posted_outputs(handle)`，立即返回已经分配好的本地输出句柄；这些句柄可以尚未完成，但必须携带后续 stream 能等待的依赖。
 
 Runtime 维护：
 
@@ -288,11 +288,11 @@ ValueId -> Ready 的值
 ValueId -> Pending（通信句柄 + 输出下标）
 ~~~
 
-同一个句柄可以被多个输出 ValueId 引用，但每个 ValueId 只对应一个 Place 和一个输出下标。消费方需要某个输出时：Pending → `Api.wait` → Ready。
+同一个句柄可以被多个输出 ValueId 引用，但每个 ValueId 只对应一个 Place 和一个输出下标。支持立即发布时，本地 Device 输出直接成为 Ready，消费 Api 在自己的 stream 上等 event；不能立即发布的输出仍走 Pending → `Api.wait` → Ready。
 
 计算与通信之间的顺序契约（详见架构文档第 13 节）：
 
-> 计算函数返回后，输出对同一个 Api 实例上后续发起的调用可见（包括 `communicate_async`）。`wait` 是 Runtime 对异步通信的唯一显式等待点;同步计算或数据读取仍可能占用调用线程。发布最终输出前另有一次 `synchronize`。
+> 计算或通信返回本地值句柄后，后续 Api 调用必须能用该句柄建立依赖。GPU Api 用 stream/event 保序，不要求 CPU 在消费者提交前等待完成。
 
 Poseidon 兼容层内部使用异步 GPU kernel 时，用 stream/event 保证这个可见性即可，不必每个算子后都做全局同步。
 
@@ -314,7 +314,7 @@ Poseidon 兼容层内部使用异步 GPU kernel 时，用 stream/event 保证这
 2. 每个动作的物理来源/目标在编译期确定；
 3. `communicate_async` 不等待远端完成；
 4. 接收方在解释到这条动作时立即发布接收；
-5. 消费方只等待之前已经启动的句柄；
+5. 消费方只依赖之前已经发布的句柄；GPU 依赖在 stream 上等待；
 6. 集合通信的参与者和顺序全局一致；
 7. 计算的按 rank 跳过不会跳过通信动作；
 8. 任意错误调用 `abort_all`。

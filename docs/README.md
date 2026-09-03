@@ -53,7 +53,7 @@ Poseidon 通过 `PoseidonCpuApi` 和 `PoseidonGpuApi` 接入 Runtime。GPU 计�
 | Encode | 把编码前的浮点 slots 变成 Host CKKS 明文的初始化指令；数据可以直接内联，也可以用 `content` 哈希引用 bundle |
 | `content` | 原始 float64 字节的 SHA-256，标识“用哪份数据”，不是 ValueId |
 | external input | 调用方在每次运行时传入的参数。随计划固定发布的权重由 Encode 产生；动态传入的权重仍可以是 external input |
-| Ready / Pending | Runtime 已拿到可交给 Api 的值句柄 / 通信还没产出本地值句柄。Ready 不保证底层 GPU kernel 已经完成 |
+| Ready / Pending | Runtime 已拿到可交给 Api 的值句柄 / 通信还没产出本地值句柄。Ready 不保证底层 GPU 工作已经完成，值句柄可以携带 stream/event 依赖 |
 | OperatorSpec | 版本化的后端配置：CKKS 参数边界、算子支持、lazy-rescale、boot profile 和代价。普通算子的元信息变化规则仍由 RuntimePlan 定义 |
 | `scale_log2` | scale 的二进制指数；40 表示逻辑 scale 为 `2^40` |
 | fail-fast | 出错就立刻带上下文报错并停掉整个执行组，不做重试和恢复 |

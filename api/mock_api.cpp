@@ -59,10 +59,11 @@ bool MockCluster::key_available(const KeyRequirement &key) const {
 void MockCluster::publish(TransferId id, std::size_t slot, VecValue value) {
     const int delay = delay_ms(id, slot);
     if (delay) std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    VecValue published = value.deep_copy();
     std::lock_guard<std::mutex> lock(mutex_);
     if (aborted_) throw ClusterPanic(abort_reason_);
     if (config_.fail_publish.count(id)) throw std::runtime_error("injected mock publish failure");
-    if (!messages_.emplace(Key{id, slot}, value.deep_copy()).second) throw std::runtime_error("duplicate mock message");
+    if (!messages_.emplace(Key{id, slot}, std::move(published)).second) throw std::runtime_error("duplicate mock message");
     cv_.notify_all();
 }
 
@@ -149,6 +150,7 @@ MockVecApi::CommHandle MockVecApi::communicate_async(
     if (fail_communicate_.count(action.id)) throw std::runtime_error("injected communicate_async failure");
     CommHandle handle;
     handle.id = action.id;
+    handle.outputs.resize(action.outputs.size());
     for (std::size_t i = 0; i < action.destinations.size(); ++i)
         if (action.destinations[i].rank == rank_) handle.local_slots.push_back(i);
 
@@ -160,14 +162,28 @@ MockVecApi::CommHandle MockVecApi::communicate_async(
         auto cluster = cluster_;
         std::vector<std::size_t> remote_slots;
         for (std::size_t i = 0; i < destinations.size(); ++i) {
-            if (destinations[i].rank == rank_)
-                handle.locals.push_back({i, source.deep_copy()});
-            else
+            if (destinations[i].rank == rank_) {
+                const auto &desc = output_descs[i];
+                Value output = Value::pending(
+                    desc.kind,
+                    VecMetadata{desc.context, poly_degree_, desc.level,
+                                desc.scale_log2, desc.ntt, desc.components});
+                handle.outputs[i].emplace(output);
+                handle.tasks.push_back(std::async(
+                    std::launch::async, [source, output] {
+                        try {
+                            output.fulfill(source.materialize());
+                        } catch (...) {
+                            output.fail(std::current_exception());
+                            throw;
+                        }
+                    }));
+            } else {
                 remote_slots.push_back(i);
+            }
         }
         if (!remote_slots.empty()) {
-            handle.has_sender = true;
-            handle.sender = std::async(
+            handle.tasks.push_back(std::async(
                 std::launch::async,
                 [source, remote_slots = std::move(remote_slots), id, cluster] {
                     try {
@@ -179,29 +195,59 @@ MockVecApi::CommHandle MockVecApi::communicate_async(
                         cluster->abort_all(
                             std::string("mock sender failed: ") + error.what());
                     }
-                });
+                }));
         }
     } else if (!local_inputs.empty()) {
         throw std::runtime_error("non-source rank supplied communication input");
     }
+    if (action.sources.at(0).rank != rank_) {
+        for (std::size_t slot : handle.local_slots) {
+            const auto &desc = output_descs[slot];
+            Value output = Value::pending(
+                desc.kind,
+                VecMetadata{desc.context, poly_degree_, desc.level,
+                            desc.scale_log2, desc.ntt, desc.components});
+            handle.outputs[slot].emplace(output);
+            const TransferId id = action.id;
+            auto cluster = cluster_;
+            handle.tasks.push_back(std::async(
+                std::launch::async, [cluster, id, slot, output] {
+                    try {
+                        output.fulfill(
+                            cluster->receive(id, slot).materialize());
+                    } catch (...) {
+                        output.fail(std::current_exception());
+                        throw;
+                    }
+                }));
+        }
+    }
     return handle;
+}
+
+std::vector<std::optional<MockVecApi::Value>> MockVecApi::posted_outputs(
+    CommHandle &handle) const {
+    if (handle.waited)
+        throw std::runtime_error(
+            "communication outputs requested after wait");
+    return handle.outputs;
 }
 
 std::vector<MockVecApi::Value> MockVecApi::wait(CommHandle &handle) {
     if (handle.waited) throw std::runtime_error("communication handle waited twice");
     handle.waited = true;
-    { std::lock_guard<std::mutex> lock(stats_mutex_); ++stats_.wait_calls; }
-    if (handle.has_sender) handle.sender.get();
+    {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        ++stats_.wait_calls;
+        stats_.wait_compute_calls[handle.id].push_back(stats_.compute_calls);
+    }
+    for (auto &task : handle.tasks) task.get();
     std::vector<Value> outputs;
     for (std::size_t slot : handle.local_slots) {
-        const auto local = std::find_if(
-            handle.locals.begin(), handle.locals.end(),
-            [slot](const CommHandle::LocalState &item) {
-                return item.slot == slot;
-            });
-        outputs.push_back(local == handle.locals.end()
-                              ? cluster_->receive(handle.id, slot)
-                              : local->value.deep_copy());
+        if (!handle.outputs.at(slot))
+            throw std::runtime_error(
+                "mock communication has no posted local output");
+        outputs.push_back(handle.outputs[slot]->deep_copy());
     }
     if (cluster_->corrupt_output_count(handle.id) && !outputs.empty()) outputs.pop_back();
     if (cluster_->corrupt_output_type(handle.id) && !outputs.empty()) {
@@ -230,6 +276,10 @@ void MockVecApi::preflight(std::string_view plan_source_sha256,
                            const OperatorSpec &operator_spec,
                            const PlanRequirements &requirements) {
     runtime_thread_ = std::this_thread::get_id();
+    {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        stats_.runtime_thread = runtime_thread_;
+    }
     poly_degree_ = operator_spec.poly_degree;
     if (target.capability_version != 1) throw std::runtime_error("MockVecApi does not support target capability_version");
     for (RequiredCapability capability : requirements.capabilities)

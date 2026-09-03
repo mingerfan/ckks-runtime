@@ -23,12 +23,33 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
 
 namespace fhegpu {
+
+namespace detail {
+
+template <class Api, class = void>
+struct HasPostedOutputs : std::false_type {};
+
+template <class Api>
+struct HasPostedOutputs<
+    Api, std::void_t<decltype(std::declval<Api &>().posted_outputs(
+             std::declval<typename Api::CommHandle &>()))>> : std::true_type {};
+
+template <class Api, class = void>
+struct UsesBackgroundCommunicationIssuer : std::false_type {};
+
+template <class Api>
+struct UsesBackgroundCommunicationIssuer<
+    Api, std::void_t<decltype(Api::background_communication_issuer)>>
+    : std::bool_constant<Api::background_communication_issuer> {};
+
+} // namespace detail
 
 enum class DiffMode { FinalOnly, AllValuesAfterRun };
 enum class DeviceExecutionMode { Sequential, PerDeviceWorkers };
@@ -220,6 +241,7 @@ private:
     struct PendingGroup {
         CommAction action;
         std::vector<ValueId> local_output_ids;
+        std::vector<bool> local_output_posted;
         CommHandle handle;
         std::uint64_t instruction_ordinal = 0;
         bool completed = false;
@@ -267,6 +289,18 @@ private:
         result.reserve(action.outputs.size());
         for (ValueId id : action.outputs) result.push_back(desc(id));
         return result;
+    }
+
+    std::vector<std::optional<Value>> posted_outputs(
+        const CommAction &action, CommHandle &handle) {
+        if constexpr (detail::HasPostedOutputs<Api>::value) {
+            auto outputs = api_.posted_outputs(handle);
+            if (outputs.size() != action.outputs.size())
+                throw std::runtime_error(
+                    "Api posted_outputs returned wrong output count");
+            return outputs;
+        }
+        return std::vector<std::optional<Value>>(action.outputs.size());
     }
 
     void load_bundle(const RuntimeResources &resources) {
@@ -374,6 +408,7 @@ private:
         const auto post_start = std::chrono::steady_clock::now();
         group.handle = api_.communicate_async(
             action, local_inputs, communication_output_descs(action));
+        auto posted = posted_outputs(action, group.handle);
         const auto post_elapsed = elapsed_nanoseconds(
             post_start, std::chrono::steady_clock::now());
         ++timing_.communication_post_calls;
@@ -385,7 +420,16 @@ private:
             if (action.destinations[i].rank != rank_) continue;
             const std::size_t local_slot = group.local_output_ids.size();
             group.local_output_ids.push_back(action.outputs[i]);
-            store_.define_pending(action.outputs[i], action.destinations[i], group_id, local_slot);
+            group.local_output_posted.push_back(posted[i].has_value());
+            if (posted[i]) {
+                const auto &expected_desc = desc(action.outputs[i]);
+                api_.validate_value(*posted[i], expected_desc);
+                store_.define_ready(action.outputs[i], action.destinations[i],
+                                    std::move(*posted[i]));
+            } else {
+                store_.define_pending(action.outputs[i], action.destinations[i],
+                                      group_id, local_slot);
+            }
         }
         groups_.push_back(std::move(group));
     }
@@ -414,7 +458,9 @@ private:
             const ValueId id = group.local_output_ids[i];
             const auto &expected_desc = desc(id);
             api_.validate_value(outputs[i], expected_desc);
-            store_.lookup(id) = typename ValueStore<Api>::Ready{expected_desc.place, std::move(outputs[i])};
+            if (!group.local_output_posted[i])
+                store_.lookup(id) = typename ValueStore<Api>::Ready{
+                    expected_desc.place, std::move(outputs[i])};
         }
         group.completed = true;
     }
@@ -523,11 +569,20 @@ private:
             {
                 ThreadTraceLockGuard value_lock(
                     value->mutex, "runtime.parallel_value");
-                if (!value->defined || value->group.get() != group.get())
+                if (!value->defined)
                     throw std::runtime_error(
                         "parallel communication output state is invalid");
-                value->value.emplace(std::move(outputs[i]));
-                value->group.reset();
+                if (value->value) {
+                    if (value->group)
+                        throw std::runtime_error(
+                            "posted communication output still owns a pending group");
+                } else {
+                    if (value->group.get() != group.get())
+                        throw std::runtime_error(
+                            "pending communication output group is invalid");
+                    value->value.emplace(std::move(outputs[i]));
+                    value->group.reset();
+                }
             }
             value->condition.notify_all();
         }
@@ -558,8 +613,7 @@ private:
             if (!group)
                 throw std::runtime_error(
                     "parallel value is defined without data or communication");
-            if (group->cross_rank &&
-                std::this_thread::get_id() != coordinator_thread_) {
+            if (group->cross_rank) {
                 ThreadTraceUniqueLock lock(
                     value->mutex, "runtime.remote_value_wait");
                 lock.wait(value->condition, [&] {
@@ -631,6 +685,7 @@ private:
         const auto post_start = std::chrono::steady_clock::now();
         CommHandle handle = api_.communicate_async(
             action, local_inputs, communication_output_descs(action));
+        auto posted = posted_outputs(action, handle);
         const auto post_elapsed = elapsed_nanoseconds(
             post_start, std::chrono::steady_clock::now());
         {
@@ -649,12 +704,24 @@ private:
             group->posted = true;
         }
 
-        for (std::size_t i = 0; i < group->local_outputs.size(); ++i) {
-            const auto &value = group->local_outputs[i].value;
+        for (const auto &local_output : group->local_outputs) {
+            const auto &value = local_output.value;
+            auto &output = posted.at(local_output.action_slot);
+            if (group->cross_rank &&
+                detail::UsesBackgroundCommunicationIssuer<Api>::value &&
+                !output)
+                throw std::runtime_error(
+                    "background communication did not publish a local output");
             {
                 ThreadTraceLockGuard lock(
                     value->mutex, "runtime.parallel_value");
-                value->group = group;
+                if (output) {
+                    const auto &expected_desc = desc(local_output.id);
+                    api_.validate_value(*output, expected_desc);
+                    value->value.emplace(std::move(*output));
+                } else {
+                    value->group = group;
+                }
                 value->defined = true;
             }
             value->condition.notify_all();
@@ -732,6 +799,33 @@ private:
         return result;
     }
 
+    CommAction cross_rank_communication_slice(
+        const CommAction &action) const {
+        if (action.inputs.size() != 1 || action.sources.size() != 1 ||
+            action.outputs.size() != action.destinations.size() ||
+            action.outputs.size() != action.output_types.size())
+            throw std::runtime_error(
+                "cross-rank parallel communication mapping is invalid");
+        CommAction result;
+        result.id = action.id;
+        result.hint = action.hint;
+        result.inputs = action.inputs;
+        result.sources = action.sources;
+        const int source_rank = action.sources.front().rank;
+        for (std::size_t slot = 0; slot < action.outputs.size(); ++slot) {
+            if (action.destinations[slot].rank == source_rank) continue;
+            result.outputs.push_back(action.outputs[slot]);
+            result.destinations.push_back(action.destinations[slot]);
+            result.output_types.push_back(action.output_types[slot]);
+        }
+        if (result.outputs.empty())
+            throw std::runtime_error(
+                "cross-rank parallel communication has no remote destination");
+        result.kind = result.outputs.size() == 1
+            ? CommKind::Transfer : CommKind::Replicate;
+        return result;
+    }
+
     void compile_parallel_phase(
         const std::vector<Instruction> &instructions,
         std::vector<std::vector<ParallelTask>> &tasks) {
@@ -757,7 +851,9 @@ private:
                     "per-device worker execution does not support online Encode");
 
             const auto action = std::get<CommAction>(instruction.body);
-            if (is_cross_rank_action(action)) {
+            const bool has_cross_rank_destination =
+                is_cross_rank_action(action);
+            if (has_cross_rank_destination) {
                 const auto device_endpoint = [](const Place &place) {
                     return place.kind == PlaceKind::Device;
                 };
@@ -767,13 +863,17 @@ private:
                                  action.destinations.end(), device_endpoint))
                     throw std::runtime_error(
                         "multi-rank device workers require Device-only online communication");
+                auto cross_rank_action =
+                    cross_rank_communication_slice(action);
                 coordinator_groups_.push_back(make_parallel_group(
-                    action, instruction.ordinal, true));
-                continue;
+                    std::move(cross_rank_action), instruction.ordinal, true));
             }
             if (action.sources.empty() ||
                 action.sources.front().rank != rank_) continue;
             for (std::size_t slot = 0; slot < action.outputs.size(); ++slot) {
+                if (has_cross_rank_destination &&
+                    action.destinations[slot].rank != rank_)
+                    continue;
                 CommAction local = local_communication_slice(action, slot);
                 auto group = make_parallel_group(
                     local, instruction.ordinal, false);
@@ -792,7 +892,6 @@ private:
 
     void execute_device_parallel_phases() {
         prepare_parallel_values();
-        coordinator_thread_ = std::this_thread::get_id();
         const std::size_t worker_count =
             device_worker_count_ == 0
                 ? static_cast<std::size_t>(local_devices_)
@@ -823,17 +922,36 @@ private:
                 }
             });
         }
-        try {
-            for (const auto &group : coordinator_groups_) {
-                if (parallel_failed_.load()) break;
-                execute_parallel_communication(
-                    group->action, group->instruction_ordinal, group);
-                finish_parallel_group(group, std::nullopt);
+        std::thread communication_issuer;
+        if constexpr (detail::UsesBackgroundCommunicationIssuer<Api>::value) {
+            communication_issuer = std::thread([this] {
+                ThreadTrace::set_thread_name(
+                    "rank-" + std::to_string(rank_) +
+                    "-communication-issuer");
+                try {
+                    for (const auto &group : coordinator_groups_) {
+                        if (parallel_failed_.load()) return;
+                        execute_parallel_communication(
+                            group->action, group->instruction_ordinal, group);
+                    }
+                } catch (...) {
+                    record_parallel_failure(std::current_exception());
+                }
+            });
+        } else {
+            try {
+                for (const auto &group : coordinator_groups_) {
+                    if (parallel_failed_.load()) break;
+                    execute_parallel_communication(
+                        group->action, group->instruction_ordinal, group);
+                    finish_parallel_group(group, std::nullopt);
+                }
+            } catch (...) {
+                record_parallel_failure(std::current_exception());
             }
-        } catch (...) {
-            record_parallel_failure(std::current_exception());
         }
         for (auto &worker : workers) worker.join();
+        if (communication_issuer.joinable()) communication_issuer.join();
         if (parallel_failed_.load()) {
             ThreadTraceLockGuard lock(
                 parallel_failure_mutex_, "runtime.parallel_failure");
@@ -922,7 +1040,6 @@ private:
     std::unordered_map<ValueId, std::shared_ptr<ParallelValue>> parallel_values_;
     std::vector<std::shared_ptr<ParallelGroup>> parallel_groups_;
     std::vector<std::shared_ptr<ParallelGroup>> coordinator_groups_;
-    std::thread::id coordinator_thread_;
     RuntimeTiming timing_;
     std::unique_ptr<std::ofstream> runtime_trace_;
     std::mutex trace_mutex_;

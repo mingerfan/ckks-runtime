@@ -215,7 +215,7 @@ execute_compute(op):
 
 计算函数的完成契约（详见架构文档第 13 节）：
 
-> 计算函数返回后，输出对同一个 Api 实例上后续发起的调用保证可见（包括交给 `communicate_async`）。`wait` 是 Runtime 对异步通信的唯一显式等待点;同步计算、文件读取或 Encode 本身仍可能占用调用线程。发布最终输出前调用 `synchronize`。
+> 计算或通信函数返回一个本地值句柄后，后续 Api 调用必须能用这个句柄建立依赖。GPU Api 用 stream/event 保序，不要求 CPU 先等数据完成；运行结束和 Host 物化时才做完成等待。
 
 也就是说，Api 内部可以异步地启动 GPU kernel，用 stream/event 保证调用之间的先后顺序，而不必每个算子都同步一次。紧接着调用的 `validate_value` 只检查句柄自带的不可变元信息，不能等待 kernel 或物化 slots。Runtime 不接触 CUDA event，也感知不到这层异步。
 
@@ -229,9 +229,10 @@ Host compute 必须由计划明确指定。GPU boot 的 CPU 模拟就是 Device�
 execute_comm(action):
     local_inputs = 收集本 rank 拥有的源值
 
-    group = register_pending_group(
-        api.communicate_async(action, local_inputs, output_descs))
-    把本 rank 的每个输出 ValueId 登记到这个 group
+    handle = api.communicate_async(action, local_inputs, output_descs)
+    posted = api.posted_outputs(handle) // 可选接口
+    已发布的本地值登记为 Ready；其余本地值登记为 Pending
+    group = register_group(handle)
     group 保留到收尾阶段
 ~~~
 
@@ -246,10 +247,11 @@ execute_comm(action):
 
 Runtime 不知道 `communicate_async` 底下调的是 send、recv、broadcast、gather、memcpy、MPI 还是 NCCL。
 
-多 rank 的 `PerDeviceWorkers` 模式保留主线程作为双向通信 coordinator。纯本 rank
-的单目标传输由相应 device worker 发布；跨 rank action 由各 rank 主线程按
-RuntimePlan ordinal 顺序发布和完成。这样只有主线程调用 MPI/NCCL，仍满足
-`MPI_THREAD_FUNNELED`，而 device worker 可以继续执行与当前通信无依赖的计算。
+多 rank 的 `PerDeviceWorkers` 模式为每个 MPI rank 建一个通信提交线程。跨 rank
+action 由它按 RuntimePlan ordinal 顺序提交，但不在每条 action 后等待完成。
+纯本 rank 的 D2D 由 source worker 提交，H2D 由目标 worker 提交，D2H 由 source
+worker 提交。一条 Replicate 同时包含本地和远端目标时，Runtime 会按这两个职责
+拆开提交，仍保留原 transfer id。主线程只负责启动、收尾和错误传播。
 
 ## 8. ensure_ready（用前等待）
 
@@ -261,7 +263,7 @@ Value &ensure_ready(ValueId id, Place expected_place):
     assert entry.place == expected_place
 
     if entry 是 Ready:
-        return entry.value
+        return entry.value // 句柄可携带尚未完成的 event
 
     if entry 是 Pending:
         group = pending_groups.lookup(entry.group_id)
@@ -274,7 +276,10 @@ Value &ensure_ready(ValueId id, Place expected_place):
     panic("值不存在")
 ~~~
 
-`expected_place` 只用来检查消费方的本地性，不参与寻址。等待只发生在真正要用数据的时候；一次 `wait` 可以同时把同一个通信动作的多个输出变成 Ready。不依赖这个值的指令可以继续执行，直到碰上自己的 Pending 输入。
+`expected_place` 只用来检查消费方的本地性，不参与寻址。支持
+`posted_outputs` 的 GPU Api 会立即返回带完成事件的 Ready 句柄；消费计算把
+`cudaStreamWaitEvent` 插进自己的 stream，CPU 不等数据完成。不支持该接口的旧
+Api 仍使用 Pending，并在消费前调用 `wait`，所以接口保持向后兼容。
 
 首期不提供"探测是否完成""推进进度""取消"这类接口。Api 内部想用进度线程、`MPI_Test`、CUDA event 都可以，对 runtime 不可见。
 
@@ -282,7 +287,7 @@ Value &ensure_ready(ValueId id, Place expected_place):
 
 - Runtime 的单线程只负责按计划发起指令；
 - 异步 Api 可以让不同设备上的任务并行执行；
-- `wait` 排得太早会挡住后续工作，因此编译器应尽早发起通信、尽量推迟消费；
+- GPU 值依赖由 stream/event 保序；CPU `wait` 只留给旧 Api、Host 物化和最终收尾；
 - 当前 VecExecutor 的同步模式没有重叠，异步模式用每设备一个工作线程模拟真实时序。
 
 完整契约见架构文档第 13 节和测试文档第 2.1 节。

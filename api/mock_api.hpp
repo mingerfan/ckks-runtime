@@ -73,24 +73,23 @@ struct MockStats {
     std::size_t worker_compute_calls = 0;
     std::size_t coordinator_communicate_calls = 0;
     std::size_t worker_communicate_calls = 0;
+    std::thread::id runtime_thread;
     std::map<int, std::thread::id> device_compute_threads;
     std::map<TransferId, std::vector<std::thread::id>> communication_threads;
+    std::map<TransferId, std::vector<std::size_t>> wait_compute_calls;
     std::vector<std::string> implementations;
 };
 
 class MockVecApi {
 public:
     using Value = VecValue;
+    static constexpr bool background_communication_issuer = true;
+
     struct CommHandle {
-        struct LocalState {
-            std::size_t slot = 0;
-            Value value;
-        };
         TransferId id = 0;
         std::vector<std::size_t> local_slots;
-        std::vector<LocalState> locals;
-        std::future<void> sender;
-        bool has_sender = false;
+        std::vector<std::optional<Value>> outputs;
+        std::vector<std::future<void>> tasks;
         bool waited = false;
     };
 
@@ -105,6 +104,7 @@ public:
     CommHandle communicate_async(const CommAction &action,
                                  const std::vector<Value> &local_inputs,
                                  const std::vector<ValueDesc> &output_descs);
+    std::vector<std::optional<Value>> posted_outputs(CommHandle &handle) const;
     std::vector<Value> wait(CommHandle &handle);
     void synchronize(Value &value);
     void preflight(std::string_view plan_source_sha256,

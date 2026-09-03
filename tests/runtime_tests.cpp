@@ -317,18 +317,157 @@ void test_multi_rank_device_workers() {
     compare_values(
         result.artifacts.back().values.at(built.plan.final_outputs[0]).value,
         run_fanout_reference(cipher, plain).at(built.reference_output));
-    for (const auto &stats : result.stats) {
+    const auto &cross_rank =
+        std::get<CommAction>(built.plan.execution.at(1).body);
+    const int source_rank = cross_rank.sources.front().rank;
+    const int source_device = cross_rank.sources.front().index;
+    for (std::size_t rank = 0; rank < result.stats.size(); ++rank) {
+        const auto &stats = result.stats[rank];
         require(stats.coordinator_compute_calls == 0,
                 "device compute ran on the coordinator thread");
         require(stats.worker_compute_calls == stats.compute_calls,
                 "device compute did not run on a worker thread");
-        require(stats.coordinator_communicate_calls > 0,
-                "cross-rank communication did not run on the coordinator");
+        const auto issuer = stats.communication_threads.find(cross_rank.id);
+        require(issuer != stats.communication_threads.end(),
+                "cross-rank communication issuer was not recorded");
+        const auto source_worker =
+            stats.device_compute_threads.find(source_device);
+        const auto is_device_worker = [&](std::thread::id thread) {
+            return std::any_of(
+                stats.device_compute_threads.begin(),
+                stats.device_compute_threads.end(),
+                [&](const auto &entry) { return entry.second == thread; });
+        };
+        const auto communication_issuer_count = static_cast<std::size_t>(
+            std::count_if(
+                issuer->second.begin(), issuer->second.end(),
+                [&](std::thread::id thread) {
+                    return thread != stats.runtime_thread &&
+                           !is_device_worker(thread);
+                }));
+        require(communication_issuer_count == 1,
+                "cross-rank communication did not use exactly one dedicated issuer");
+        if (static_cast<int>(rank) == source_rank) {
+            require(source_worker != stats.device_compute_threads.end(),
+                    "source device worker was not recorded");
+            require(std::count(
+                        issuer->second.begin(), issuer->second.end(),
+                        source_worker->second) == 1,
+                    "same-rank copy in a mixed action was not submitted by the source worker");
+        }
         require(stats.completed_handles == stats.communicate_calls,
                 "parallel communication handle was not completed");
     }
     require(result.stats.back().worker_communicate_calls > 0,
             "local Device-to-Host copy did not run on a worker thread");
+}
+
+void test_multi_rank_bidirectional_dependency_chain() {
+    auto built = make_fanout_plan({1, 1});
+    auto &plan = built.plan;
+    const auto old_final =
+        std::get<CommAction>(plan.finalization.front().body);
+    const ValueId rank1_branch = old_final.inputs.front();
+    const ValueId old_final_output = old_final.outputs.front();
+    const auto branch_desc = *std::find_if(
+        plan.values.begin(), plan.values.end(),
+        [&](const ValueDesc &value) { return value.id == rank1_branch; });
+    plan.values.erase(
+        std::remove_if(
+            plan.values.begin(), plan.values.end(),
+            [&](const ValueDesc &value) {
+                return value.id == old_final_output;
+            }),
+        plan.values.end());
+    ValueId next_value = std::max_element(
+        plan.values.begin(), plan.values.end(),
+        [](const ValueDesc &a, const ValueDesc &b) { return a.id < b.id; })->id + 1;
+
+    const ValueId returned = next_value++;
+    auto returned_desc = branch_desc;
+    returned_desc.id = returned;
+    returned_desc.place = {PlaceKind::Device, 0, 0};
+    plan.values.push_back(returned_desc);
+
+    const TransferId return_transfer = old_final.id;
+    const std::size_t return_ordinal = plan.finalization.front().ordinal;
+    plan.execution.push_back({
+        return_ordinal,
+        CommAction{return_transfer, CommKind::Transfer,
+                   CommHint::PointToPoint, {rank1_branch}, {returned},
+                   {branch_desc.place}, {returned_desc.place},
+                   {ValueKind::Ciphertext}}});
+
+    const ValueId rank0_result = next_value++;
+    auto result_desc = returned_desc;
+    result_desc.id = rank0_result;
+    plan.values.push_back(result_desc);
+    plan.execution.push_back({
+        return_ordinal + 1,
+        ComputeOp{ComputeKind::Negate, {returned}, rank0_result,
+                  returned_desc.place, {}}});
+
+    const ValueId final = next_value++;
+    auto final_desc = result_desc;
+    final_desc.id = final;
+    final_desc.place = {PlaceKind::Host, 0, 0};
+    plan.values.push_back(final_desc);
+    plan.finalization = {{
+        return_ordinal + 2,
+        CommAction{return_transfer + 1, CommKind::Transfer, CommHint::Auto,
+                   {rank0_result}, {final}, {result_desc.place},
+                   {final_desc.place}, {ValueKind::Ciphertext}}}};
+    plan.final_outputs = {final};
+
+    const auto cipher = make_cipher({1, 2, 3, 4}, "ctx", 8192, 3, 1);
+    const auto plain = make_plain({2, 3, 4, 5}, "ctx", 8192, 3, 1);
+    MockClusterConfig config;
+    // Delay the forward publish so the reverse send is posted first. This
+    // catches communication implementations that wait for a source while
+    // holding the receive-side message lock.
+    config.delay_seed = 64;
+    config.max_delay_ms = 7;
+    const auto result = run_mock_cluster(
+        plan, built.operator_spec, {{0, cipher}, {1, plain}}, config,
+        VecExecConfig{VecExecMode::Async, 31, 3}, DiffMode::FinalOnly,
+        false, {}, DeviceExecutionMode::PerDeviceWorkers);
+    compare_values(
+        result.artifacts.front().values.at(final).value,
+        run_fanout_reference(cipher, plain).at(2));
+
+    const auto &forward = std::get<CommAction>(plan.execution.at(1).body);
+    for (const auto &stats : result.stats) {
+        const auto forward_threads =
+            stats.communication_threads.find(forward.id);
+        const auto return_threads =
+            stats.communication_threads.find(return_transfer);
+        require(forward_threads != stats.communication_threads.end() &&
+                    forward_threads->second.size() == 1 &&
+                    return_threads != stats.communication_threads.end() &&
+                    return_threads->second.size() == 1 &&
+                    forward_threads->second.front() ==
+                        return_threads->second.front(),
+                "bidirectional communication did not use one ordered issuer");
+        require(forward_threads->second.front() != stats.runtime_thread,
+                "bidirectional communication ran on the Runtime main thread");
+        require(std::none_of(
+                    stats.device_compute_threads.begin(),
+                    stats.device_compute_threads.end(),
+                    [&](const auto &entry) {
+                        return entry.second == forward_threads->second.front();
+                    }),
+                "bidirectional communication ran on a device worker");
+        for (TransferId id : {forward.id, return_transfer}) {
+            const auto waits = stats.wait_compute_calls.find(id);
+            require(waits != stats.wait_compute_calls.end() &&
+                        std::all_of(
+                            waits->second.begin(), waits->second.end(),
+                            [](std::size_t compute_calls) {
+                                return compute_calls > 0;
+                            }),
+                    "communication completion was waited before dependent compute was submitted");
+        }
+    }
 }
 
 void test_single_rank_device_worker_replicate() {
@@ -402,6 +541,8 @@ int main() {
         run_test("preflight and digest debug mode", test_preflight_and_digest_debug_mode);
         run_test("Mock sync/async multi-rank matrix", test_mock_sync_async_matrix);
         run_test("multi-rank per-device workers", test_multi_rank_device_workers);
+        run_test("multi-rank bidirectional dependency chain",
+                 test_multi_rank_bidirectional_dependency_chain);
         run_test("single-rank worker Replicate", test_single_rank_device_worker_replicate);
         run_test("multi-rank device-worker failures", test_multi_rank_device_worker_failures);
         std::cout << "ALL " << tests_run << " TEST GROUPS PASSED\n";

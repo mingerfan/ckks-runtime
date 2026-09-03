@@ -79,8 +79,8 @@ VecExecMode::Async   // 每个模拟设备一个工作线程，模拟 GPU 的发
 - `compute` 把任务放进目标设备的队列后立即返回，不等计算完成；
 - `compute` 返回一个可传递的值句柄，任务完成后结果才写入句柄；后续任务真正用到它时再等待；
 - 同一设备队列先进先出，天然满足"输出对后续调用可见"的契约；跨设备的依赖通过值的共享状态传递；
-- `communicate_async` 把"取源值并发送"作为任务放进源设备的队列，保证它排在产生该值的计算之后；
-- `wait` 是 Runtime 对异步通信的唯一显式等待点;同步模式的 `compute` 本身会占用调用线程；
+- `communicate_async` 立即发布带共享完成状态的本地输出，后台任务按依赖取源值并发送；
+- 消费任务可以先入队，真正读取数据时才等待共享完成状态；`wait` 负责最终收尾；
 - 可配置每个任务的固定或随机（带种子）延迟，用来放大不同设备之间的进度差。
 
 异步模式专门要测的东西：
@@ -111,7 +111,7 @@ Mock Api 的行为模型：
 
 ~~~text
 communicate_async
-  -> 建立 Pending 句柄
+  -> 建立带共享完成状态的本地输出句柄
   -> 按通信类型登记来源/目标
   -> 按测试配置立即或延迟完成
 
@@ -198,7 +198,7 @@ rank 1 -> Runtime1(RuntimeEnvironment{rank=1, ...}, ValueStore1, Api1)
 %4 = mul %3, %x @Device(rank0,1)
 ~~~
 
-覆盖：同 rank 设备间；跨 rank 设备间；来源目标在同一 rank；旁观者 rank 空操作；消费方等待 Pending；发送句柄在收尾阶段被等待。
+覆盖：同 rank 设备间；跨 rank 设备间；来源目标在同一 rank；旁观者 rank 空操作；消费者先提交后异步等待；发送句柄在收尾阶段被等待。
 
 ### 5.6 Replicate 与降级
 
@@ -214,7 +214,11 @@ rank 1 -> Runtime1(RuntimeEnvironment{rank=1, ...}, ValueStore1, Api1)
 
 ### 5.7 异步顺序
 
-接收方比发送方先到达通信指令；发送方先到；消费方比通信完成先到；不相关的指令可以在 Pending 期间继续执行；`wait` 之后输出变 Ready；源值保留到收尾；使用新的 Runtime 实例重复运行同一份计划时，传输 ID 不串。当前 `SequentialRuntime` 实例本身是一次性的。
+接收方比发送方先到达通信指令；发送方先到；消费方比通信完成先提交；双向
+`rank0 -> rank1 compute -> rank0` 依赖链不死锁；混合 Replicate 的本地副本由
+source worker 提交、远端部分由同一个有序通信线程提交；完成等待发生在消费者
+提交之后或最终收尾；源值保留到收尾；使用新的 Runtime 实例重复运行同一份计划
+时，传输 ID 不串。当前 `SequentialRuntime` 实例本身是一次性的。
 
 ### 5.8 Fail-fast
 
