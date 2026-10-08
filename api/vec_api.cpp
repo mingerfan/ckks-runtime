@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <future>
 #include <limits>
 #include <stdexcept>
 
@@ -70,11 +71,41 @@ VecValue VecExecutor::compute(const ComputeOp &op, const std::vector<VecValue> &
                 const int delay = next_delay_ms();
                 if (delay) std::this_thread::sleep_for(std::chrono::milliseconds(delay));
                 output.fulfill(compute_now(op, inputs));
-            } catch (...) { output.fail(std::current_exception()); }
+            } catch (...) {
+                const auto failure = std::current_exception();
+                output.fail(failure);
+                std::lock_guard<std::mutex> lock(workers_mutex_);
+                if (!failure_) failure_ = failure;
+            }
         });
     }
     worker.cv.notify_one();
     return output;
+}
+
+void VecExecutor::drain() {
+    std::vector<std::future<void>> completions;
+    {
+        std::lock_guard<std::mutex> workers_lock(workers_mutex_);
+        if (stopped_) throw std::runtime_error("VecExecutor is stopped");
+        for (auto &item : workers_) {
+            auto completed = std::make_shared<std::promise<void>>();
+            completions.push_back(completed->get_future());
+            auto &worker = *item.second;
+            {
+                std::lock_guard<std::mutex> lock(worker.mutex);
+                worker.tasks.emplace_back([completed] { completed->set_value(); });
+            }
+            worker.cv.notify_one();
+        }
+    }
+    for (auto &completed : completions) completed.get();
+    std::exception_ptr failure;
+    {
+        std::lock_guard<std::mutex> lock(workers_mutex_);
+        failure.swap(failure_);
+    }
+    if (failure) std::rethrow_exception(failure);
 }
 
 VecMetadata VecExecutor::compute_metadata(const ComputeOp &op, const std::vector<VecValue> &inputs) const {

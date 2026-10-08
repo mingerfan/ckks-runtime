@@ -153,6 +153,7 @@ public:
             const PlanRequirements requirements = PlanVerifier::verify(
                 *plan_, resources.operator_spec, resources.skip_artifact_digest_checks);
             PlanVerifier::verify_runtime_target(*plan_, rank_, world_size_, local_devices_);
+            check_memory_instruction_support(diff_mode);
             load_bundle(resources);
             api_.preflight(loaded_plan.source_sha256,
                            resources.skip_artifact_digest_checks,
@@ -176,9 +177,13 @@ public:
                 finish_all_groups();
             }
             synchronize_final_outputs();
+            api_.drain();
             timing_.online_execution_nanoseconds = elapsed_nanoseconds(
                 online_execution_start, std::chrono::steady_clock::now());
             auto artifact = make_artifact(diff_mode);
+            store_ = ValueStore<Api>{};
+            groups_.clear();
+            reset_parallel_execution_state();
             ThreadTrace::write_json(rank_);
             return artifact;
         } catch (const std::exception &error) {
@@ -190,6 +195,26 @@ public:
     }
 
 private:
+    // Release execution and compute_reuse are still pending (steps 3 and 4).
+    // Reject memory instructions before submitting API work.
+    void check_memory_instruction_support(DiffMode mode) {
+        const auto check_phase = [&](const std::vector<Instruction> &instructions) {
+            for (const auto &instruction : instructions) {
+                const bool release = std::holds_alternative<ReleaseOp>(instruction.body);
+                const auto *op = std::get_if<ComputeOp>(&instruction.body);
+                if (!release && (!op || !op->reuse_input)) continue;
+                current_ = &instruction;
+                if (mode == DiffMode::AllValuesAfterRun)
+                    throw std::runtime_error("AllValuesAfterRun is incompatible with Release/reuse_input");
+                throw std::runtime_error(release ? "Release execution is not implemented"
+                                                 : "reuse_input execution is not implemented");
+            }
+        };
+        check_phase(plan_->initialization);
+        check_phase(plan_->execution);
+        check_phase(plan_->finalization);
+    }
+
     static std::uint64_t elapsed_nanoseconds(
         std::chrono::steady_clock::time_point start,
         std::chrono::steady_clock::time_point finish) {
@@ -242,6 +267,7 @@ private:
     struct PendingGroup {
         CommAction action;
         std::vector<ValueId> local_output_ids;
+        std::vector<std::size_t> local_output_slots;
         std::vector<bool> local_output_posted;
         CommHandle handle;
         std::uint64_t instruction_ordinal = 0;
@@ -299,6 +325,9 @@ private:
             if (outputs.size() != action.outputs.size())
                 throw std::runtime_error(
                     "Api posted_outputs returned wrong output count");
+            for (std::size_t slot = 0; slot < outputs.size(); ++slot)
+                if (action.destinations[slot].rank != rank_ && outputs[slot])
+                    throw std::runtime_error("Api posted_outputs returned a remote output");
             return outputs;
         }
         return std::vector<std::optional<Value>>(action.outputs.size());
@@ -342,7 +371,8 @@ private:
             current_ = &instruction;
             if (const auto *encode = std::get_if<EncodeOp>(&instruction.body)) execute_encode(*encode);
             else if (const auto *op = std::get_if<ComputeOp>(&instruction.body)) execute_compute(*op);
-            else execute_communication(std::get<CommAction>(instruction.body));
+            else if (const auto *action = std::get_if<CommAction>(&instruction.body)) execute_communication(*action);
+            else throw std::runtime_error("Release execution is not implemented");
         }
         current_ = nullptr;
     }
@@ -421,6 +451,7 @@ private:
             if (action.destinations[i].rank != rank_) continue;
             const std::size_t local_slot = group.local_output_ids.size();
             group.local_output_ids.push_back(action.outputs[i]);
+            group.local_output_slots.push_back(i);
             group.local_output_posted.push_back(posted[i].has_value());
             if (posted[i]) {
                 const auto &expected_desc = desc(action.outputs[i]);
@@ -454,14 +485,22 @@ private:
                     current_ ? std::optional<std::uint64_t>(current_->ordinal)
                              : std::nullopt,
                     to_string(group.action.kind), wait_elapsed);
-        if (outputs.size() != group.local_output_ids.size()) throw std::runtime_error("Api wait returned wrong output count");
-        for (std::size_t i = 0; i < outputs.size(); ++i) {
+        if (outputs.size() != group.action.outputs.size()) throw std::runtime_error("Api wait returned wrong output count");
+        for (std::size_t slot = 0; slot < outputs.size(); ++slot)
+            if (group.action.destinations[slot].rank != rank_ && outputs[slot])
+                throw std::runtime_error("Api wait returned a remote output");
+        for (std::size_t i = 0; i < group.local_output_ids.size(); ++i) {
             const ValueId id = group.local_output_ids[i];
+            auto &output = outputs[group.local_output_slots[i]];
+            if (group.local_output_posted[i]) {
+                if (output) throw std::runtime_error("Api delivered a communication output twice");
+                continue;
+            }
+            if (!output) throw std::runtime_error("Api wait omitted a pending communication output");
             const auto &expected_desc = desc(id);
-            api_.validate_value(outputs[i], expected_desc);
-            if (!group.local_output_posted[i])
-                store_.lookup(id) = typename ValueStore<Api>::Ready{
-                    expected_desc.place, std::move(outputs[i])};
+            api_.validate_value(*output, expected_desc);
+            store_.lookup(id) = typename ValueStore<Api>::Ready{
+                expected_desc.place, std::move(*output)};
         }
         group.completed = true;
     }
@@ -556,18 +595,21 @@ private:
         trace_event("comm_wait", group->action.id,
                     group->instruction_ordinal, consumer_ordinal,
                     to_string(group->action.kind), wait_elapsed);
-        if (outputs.size() != group->local_outputs.size())
+        if (outputs.size() != group->action.outputs.size())
             throw std::runtime_error("Api wait returned wrong parallel output count");
+        for (std::size_t slot = 0; slot < outputs.size(); ++slot)
+            if (group->action.destinations[slot].rank != rank_ && outputs[slot])
+                throw std::runtime_error("Api wait returned a remote parallel output");
 
-        for (std::size_t i = 0; i < outputs.size(); ++i) {
-            const auto &local_output = group->local_outputs[i];
+        for (const auto &local_output : group->local_outputs) {
             const ValueId id = local_output.id;
             if (local_output.action_slot >= group->action.outputs.size() ||
                 group->action.outputs[local_output.action_slot] != id)
                 throw std::runtime_error(
                     "parallel communication output slot mapping is invalid");
             const auto &expected_desc = desc(id);
-            api_.validate_value(outputs[i], expected_desc);
+            auto &output = outputs[local_output.action_slot];
+            if (output) api_.validate_value(*output, expected_desc);
             const auto &value = local_output.value;
             {
                 ThreadTraceLockGuard value_lock(
@@ -576,14 +618,18 @@ private:
                     throw std::runtime_error(
                         "parallel communication output state is invalid");
                 if (value->value) {
+                    if (output)
+                        throw std::runtime_error("Api delivered a parallel communication output twice");
                     if (value->group)
                         throw std::runtime_error(
                             "posted communication output still owns a pending group");
                 } else {
+                    if (!output)
+                        throw std::runtime_error("Api wait omitted a pending parallel communication output");
                     if (value->group.get() != group.get())
                         throw std::runtime_error(
                             "pending communication output group is invalid");
-                    value->value.emplace(std::move(outputs[i]));
+                    value->value.emplace(std::move(*output));
                     value->group.reset();
                 }
             }
@@ -852,6 +898,8 @@ private:
             if (std::holds_alternative<EncodeOp>(instruction.body))
                 throw std::runtime_error(
                     "per-device worker execution does not support online Encode");
+            if (std::holds_alternative<ReleaseOp>(instruction.body))
+                throw std::runtime_error("Release execution is not implemented");
 
             const auto action = std::get<CommAction>(instruction.body);
             const bool has_cross_rank_destination =
@@ -1019,6 +1067,8 @@ private:
                 out << " op=Encode output=" << encode->output;
             else if (const auto *op = std::get_if<ComputeOp>(&current_->body))
                 out << " op=" << to_string(op->kind) << " output=" << op->output << " place=" << to_string(op->place);
+            else if (const auto *release = std::get_if<ReleaseOp>(&current_->body))
+                out << " op=Release value_id=" << release->value;
             else {
                 const auto &action = std::get<CommAction>(current_->body);
                 out << " op=" << to_string(action.kind) << " transfer_id=" << action.id;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <iosfwd>
 #include <optional>
@@ -68,6 +69,7 @@ struct ComputeOp {
     ValueId output = 0;
     Place place;
     ComputeAttrs attrs;
+    std::optional<std::size_t> reuse_input = std::nullopt;
 };
 
 struct CommAction {
@@ -81,7 +83,11 @@ struct CommAction {
     std::vector<ValueKind> output_types;
 };
 
-using InstructionBody = std::variant<EncodeOp, ComputeOp, CommAction>;
+struct ReleaseOp {
+    ValueId value = 0;
+};
+
+using InstructionBody = std::variant<EncodeOp, ComputeOp, CommAction, ReleaseOp>;
 
 struct Instruction {
     std::size_t ordinal = 0;

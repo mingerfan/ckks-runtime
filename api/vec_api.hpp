@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <map>
 #include <memory>
@@ -30,6 +31,7 @@ public:
     VecExecutor &operator=(const VecExecutor &) = delete;
 
     VecValue compute(const ComputeOp &op, const std::vector<VecValue> &inputs);
+    void drain();
     void stop();
 
 private:
@@ -48,6 +50,7 @@ private:
 
     VecExecConfig config_;
     std::mutex workers_mutex_;
+    std::exception_ptr failure_;
     std::map<Place, std::unique_ptr<Worker>> workers_;
     std::mt19937_64 random_;
     std::mutex random_mutex_;

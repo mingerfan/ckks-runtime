@@ -105,7 +105,9 @@ public:
                                  const std::vector<Value> &local_inputs,
                                  const std::vector<ValueDesc> &output_descs);
     std::vector<std::optional<Value>> posted_outputs(CommHandle &handle) const;
-    std::vector<Value> wait(CommHandle &handle);
+    std::vector<std::optional<Value>> wait(CommHandle &handle);
+    void collect_completed() {}
+    void drain() { executor_.drain(); }
     void synchronize(Value &value);
     void preflight(std::string_view plan_source_sha256,
                    bool skip_artifact_digest_checks,
@@ -117,6 +119,7 @@ public:
     MockStats stats() const;
 
 private:
+    std::vector<std::optional<Value>> take_outputs(CommHandle &handle) const;
     int rank_;
     std::shared_ptr<MockCluster> cluster_;
     VecExecutor executor_;

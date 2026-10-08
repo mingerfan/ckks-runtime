@@ -1,5 +1,5 @@
 {
-  "format_version": 2,
+  "format_version": 3,
   "plan_id": "1",
   "target": {
     "target_id": "poseidon-ckks-cpu",

@@ -170,7 +170,7 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                                       const LoadedOperatorSpec &loaded_spec,
                                       bool skip_artifact_digest_checks) {
     const auto &spec = loaded_spec.spec;
-    if (plan.format_version != 1) fail("unsupported format version");
+    if (plan.format_version != 1 && plan.format_version != 2) fail("unsupported format version");
     if (spec.format_version != 1 && spec.format_version != 2)
         fail("unsupported OperatorSpec format version");
     if (plan.target.target_id.empty()) fail("target id is empty");
@@ -210,6 +210,31 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
         if (!defined.insert(id).second) fail("duplicate external input " + std::to_string(id));
     }
 
+    // Count operand occurrences over all phases; Release is not a data use.
+    std::unordered_map<ValueId, std::size_t> uses;
+    const auto count_uses = [&](const std::vector<Instruction> &list) {
+        for (const auto &instruction : list) {
+            if (const auto *op = std::get_if<ComputeOp>(&instruction.body)) {
+                for (ValueId id : op->inputs) ++uses[id];
+            } else if (const auto *action = std::get_if<CommAction>(&instruction.body)) {
+                for (ValueId id : action->inputs) ++uses[id];
+            }
+        }
+    };
+    count_uses(plan.initialization);
+    count_uses(plan.execution);
+    count_uses(plan.finalization);
+    const std::unordered_set<ValueId> returned(plan.final_outputs.begin(), plan.final_outputs.end());
+    std::unordered_set<ValueId> computed;
+    std::unordered_map<ValueId, std::string> unavailable;
+    const auto check_available = [&](ValueId id, const Instruction &instruction) {
+        const std::string where = "instruction #" + std::to_string(instruction.ordinal) +
+                                  " ValueId " + std::to_string(id);
+        if (!defined.count(id)) fail(where + " is undefined or used before definition (use-before-definition)");
+        const auto found = unavailable.find(id);
+        if (found != unavailable.end()) fail(where + " was already " + found->second);
+    };
+
     std::set<RequiredCapability> capabilities;
     std::set<KeyRequirement> keys;
     std::unordered_set<TransferId> transfers;
@@ -236,14 +261,41 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                     fail("unknown Encode payload");
                 }
             } else if (const auto *op = std::get_if<ComputeOp>(&instruction.body)) {
+                if (op->reuse_input && plan.format_version == 1)
+                    fail("instruction #" + std::to_string(instruction.ordinal) + " reuse_input requires format version 2");
                 check_place(plan, op->place);
                 for (ValueId id : op->inputs) {
                     mentioned.insert(id);
-                    if (!defined.count(id)) fail("undefined or use-before-definition ValueId " + std::to_string(id));
+                    check_available(id, instruction);
                 }
                 mentioned.insert(op->output);
                 if (!defined.insert(op->output).second) fail("duplicate definition of ValueId " + std::to_string(op->output));
+                if (op->reuse_input) {
+                    if (op->inputs.empty())
+                        fail("instruction #" + std::to_string(instruction.ordinal) + " reuse_input requires input 0");
+                    const ValueId input = op->inputs[0];
+                    const auto reuse_error = [&](const std::string &reason) {
+                        fail("instruction #" + std::to_string(instruction.ordinal) + " reuse_input for ValueId " +
+                             std::to_string(input) + ": " + reason);
+                    };
+                    if (*op->reuse_input != 0) reuse_error("only input 0 can be reused");
+                    const bool supported = op->place.kind == PlaceKind::Host
+                        ? (op->kind == ComputeKind::Negate || op->kind == ComputeKind::Rotate)
+                        : (op->kind == ComputeKind::AddCP || op->kind == ComputeKind::SubCP || op->kind == ComputeKind::Rotate);
+                    if (!supported) reuse_error(to_string(op->kind) + " does not support reuse on " + to_string(op->place));
+                    if (!computed.count(input)) reuse_error("input must be produced by a computation, not an external input or communication");
+                    if (returned.count(input)) reuse_error("final output cannot be overwritten");
+                    if (uses.at(input) != 1)
+                        reuse_error("input must have exactly one use across all phases, including communication (" +
+                                    std::to_string(uses.at(input)) + " uses)");
+                    const auto &input_desc = lookup(descs, input, "reuse input");
+                    const auto &output_desc = lookup(descs, op->output, "reuse output");
+                    if (input_desc.place != output_desc.place || !same_metadata(input_desc, output_desc))
+                        reuse_error("input and output metadata must match");
+                    unavailable.emplace(input, "overwritten by reuse at instruction #" + std::to_string(instruction.ordinal));
+                }
                 verify_compute_metadata(*op, descs);
+                computed.insert(op->output);
                 const auto support = spec.operators.find(op->kind);
                 if (support == spec.operators.end() || !support->second.supported)
                     fail(to_string(op->kind) + " is unsupported by OperatorSpec");
@@ -289,7 +341,7 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                 if (action->inputs.size() != 1 || action->sources.size() != 1)
                     fail(to_string(action->kind) + " requires one input and source");
                 mentioned.insert(action->inputs[0]);
-                if (!defined.count(action->inputs[0])) fail("communication source is undefined or used before definition");
+                check_available(action->inputs[0], instruction);
                 const auto &source = lookup(descs, action->inputs[0], "communication source");
                 check_place(plan, action->sources[0]);
                 if (source.place != action->sources[0]) fail("communication source Place mismatch");
@@ -310,6 +362,15 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                         fail("communication changes kind or CKKS metadata");
                     if (!defined.insert(output.id).second) fail("duplicate definition of communication output");
                 }
+            } else if (const auto *release = std::get_if<ReleaseOp>(&instruction.body)) {
+                const std::string where = "instruction #" + std::to_string(instruction.ordinal) +
+                                          " Release ValueId " + std::to_string(release->value);
+                if (plan.format_version == 1) fail(where + " requires format version 2");
+                lookup(descs, release->value, where);
+                mentioned.insert(release->value);
+                check_available(release->value, instruction);
+                if (returned.count(release->value)) fail(where + " is a final output and cannot be released");
+                unavailable.emplace(release->value, "released at instruction #" + std::to_string(instruction.ordinal));
             } else {
                 fail("unknown instruction body");
             }

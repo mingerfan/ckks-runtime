@@ -263,7 +263,7 @@ def make_artifacts():
 
     invalid = {}
     invalid["i001_unknown_format_version.json"] = copy.deepcopy(valid["v001_inline_encode_host_compute.json"])
-    invalid["i001_unknown_format_version.json"]["format_version"] = 2
+    invalid["i001_unknown_format_version.json"]["format_version"] = 3
     invalid["i002_float_scale_log2.json"] = copy.deepcopy(valid["v001_inline_encode_host_compute.json"])
     invalid["i002_float_scale_log2.json"]["values"][0]["scale_log2"] = 40.0
     invalid["i003_duplicate_value_id.json"] = copy.deepcopy(valid["v001_inline_encode_host_compute.json"])

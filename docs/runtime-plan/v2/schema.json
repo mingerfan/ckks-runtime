@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ckks-runtime/runtime-plan/v2/schema.json",
+  "title": "RuntimePlan V2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format_version", "plan_id", "target", "values", "external_inputs", "initialization", "execution", "finalization", "final_outputs"],
+  "properties": {
+    "format_version": { "const": 2 },
+    "plan_id": { "$ref": "#/$defs/id64" },
+    "target": { "$ref": "#/$defs/target" },
+    "plaintext_bundle": { "$ref": "#/$defs/plaintextBundleRef" },
+    "values": { "type": "array", "items": { "$ref": "#/$defs/valueDesc" } },
+    "external_inputs": { "type": "array", "items": { "$ref": "#/$defs/id64" } },
+    "initialization": { "$ref": "#/$defs/instructionList" },
+    "execution": { "$ref": "#/$defs/instructionList" },
+    "finalization": { "$ref": "#/$defs/instructionList" },
+    "final_outputs": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/id64" } }
+  },
+  "$defs": {
+    "id64": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" },
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "nonnegativeInteger": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
+    "place": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["kind", "rank"], "properties": { "kind": { "const": "host" }, "rank": { "$ref": "#/$defs/nonnegativeInteger" } } },
+        { "type": "object", "additionalProperties": false, "required": ["kind", "rank", "index"], "properties": { "kind": { "const": "device" }, "rank": { "$ref": "#/$defs/nonnegativeInteger" }, "index": { "$ref": "#/$defs/nonnegativeInteger" } } }
+      ]
+    },
+    "target": {
+      "type": "object", "additionalProperties": false,
+      "required": ["target_id", "capability_version", "operator_spec", "world_size", "device_counts"],
+      "properties": {
+        "target_id": { "type": "string", "minLength": 1 },
+        "capability_version": { "type": "integer", "minimum": 1 },
+        "operator_spec": { "type": "object", "additionalProperties": false, "required": ["id", "version", "source_sha256"], "properties": { "id": { "type": "string", "minLength": 1 }, "version": { "type": "integer", "minimum": 1 }, "source_sha256": { "$ref": "#/$defs/sha256" } } },
+        "world_size": { "type": "integer", "minimum": 1 },
+        "device_counts": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/nonnegativeInteger" } }
+      }
+    },
+    "plaintextBundleRef": { "type": "object", "additionalProperties": false, "required": ["id", "version", "manifest_sha256"], "properties": { "id": { "type": "string", "minLength": 1 }, "version": { "type": "integer", "minimum": 1 }, "manifest_sha256": { "$ref": "#/$defs/sha256" } } },
+    "valueDesc": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "kind", "place", "context", "level", "scale_log2", "ntt", "components"],
+      "properties": { "id": { "$ref": "#/$defs/id64" }, "kind": { "enum": ["plaintext", "ciphertext"] }, "place": { "$ref": "#/$defs/place" }, "context": { "type": "string", "minLength": 1 }, "level": { "$ref": "#/$defs/nonnegativeInteger" }, "scale_log2": { "$ref": "#/$defs/nonnegativeInteger" }, "ntt": { "type": "boolean" }, "components": { "type": "integer", "minimum": 1 } }
+    },
+    "instructionList": { "type": "array", "items": { "$ref": "#/$defs/instruction" } },
+    "instruction": { "oneOf": [ { "$ref": "#/$defs/encode" }, { "$ref": "#/$defs/compute" }, { "$ref": "#/$defs/communication" }, { "$ref": "#/$defs/release" } ] },
+    "encode": {
+      "type": "object", "additionalProperties": false, "required": ["ordinal", "kind", "payload", "output"],
+      "properties": {
+        "ordinal": { "$ref": "#/$defs/nonnegativeInteger" }, "kind": { "const": "encode" }, "output": { "$ref": "#/$defs/id64" },
+        "payload": { "oneOf": [
+          { "type": "object", "additionalProperties": false, "required": ["kind", "values"], "properties": { "kind": { "const": "inline" }, "values": { "type": "array", "minItems": 1, "items": { "type": "number" } } } },
+          { "type": "object", "additionalProperties": false, "required": ["kind", "content"], "properties": { "kind": { "const": "bundle" }, "content": { "$ref": "#/$defs/sha256" } } }
+        ] }
+      }
+    },
+    "compute": {
+      "type": "object", "additionalProperties": false, "required": ["ordinal", "kind", "op", "place", "inputs", "output"],
+      "properties": {
+        "ordinal": { "$ref": "#/$defs/nonnegativeInteger" }, "kind": { "const": "compute" },
+        "op": { "enum": ["add_cc", "add_cp", "sub_cc", "sub_cp", "mul_cc", "mul_cp", "negate", "rotate", "rescale", "mod_switch", "relinearize", "boot"] },
+        "place": { "$ref": "#/$defs/place" }, "inputs": { "type": "array", "minItems": 1, "maxItems": 2, "items": { "$ref": "#/$defs/id64" } }, "output": { "$ref": "#/$defs/id64" }, "attrs": { "type": "object" }, "reuse_input": { "$ref": "#/$defs/nonnegativeInteger" }
+      },
+      "allOf": [
+        { "if": { "properties": { "op": { "enum": ["add_cc", "add_cp", "sub_cc", "sub_cp", "mul_cc", "mul_cp", "negate", "relinearize"] } } }, "then": { "not": { "required": ["attrs"] } } },
+        { "if": { "properties": { "op": { "const": "rotate" } } }, "then": { "required": ["attrs"], "properties": { "attrs": { "type": "object", "additionalProperties": false, "required": ["steps"], "properties": { "steps": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647, "not": { "const": 0 } } } } } } },
+        { "if": { "properties": { "op": { "const": "rescale" } } }, "then": { "required": ["attrs"], "properties": { "attrs": { "type": "object", "additionalProperties": false, "required": ["target_level", "target_scale_log2"], "properties": { "target_level": { "$ref": "#/$defs/nonnegativeInteger" }, "target_scale_log2": { "$ref": "#/$defs/nonnegativeInteger" } } } } } },
+        { "if": { "properties": { "op": { "const": "mod_switch" } } }, "then": { "required": ["attrs"], "properties": { "attrs": { "type": "object", "additionalProperties": false, "required": ["target_level"], "properties": { "target_level": { "$ref": "#/$defs/nonnegativeInteger" } } } } } },
+        { "if": { "properties": { "op": { "const": "boot" } } }, "then": { "required": ["attrs"], "properties": { "attrs": { "type": "object", "additionalProperties": false, "required": ["target_level", "target_scale_log2", "target_components", "operator_profile", "implementation"], "properties": { "target_level": { "$ref": "#/$defs/nonnegativeInteger" }, "target_scale_log2": { "$ref": "#/$defs/nonnegativeInteger" }, "target_components": { "type": "integer", "minimum": 1 }, "operator_profile": { "type": "string", "minLength": 1 }, "implementation": { "enum": ["native", "decrypt_reencrypt"] } } } } } }
+      ]
+    },
+    "release": {
+      "type": "object", "additionalProperties": false, "required": ["ordinal", "kind", "value"],
+      "properties": { "ordinal": { "$ref": "#/$defs/nonnegativeInteger" }, "kind": { "const": "release" }, "value": { "$ref": "#/$defs/id64" } }
+    },
+    "communication": {
+      "type": "object", "additionalProperties": false,
+      "required": ["ordinal", "kind", "transfer_id", "hint", "inputs", "outputs", "sources", "destinations", "output_kinds"],
+      "properties": {
+        "ordinal": { "$ref": "#/$defs/nonnegativeInteger" }, "kind": { "enum": ["transfer", "replicate"] }, "transfer_id": { "$ref": "#/$defs/id64" },
+        "hint": { "enum": ["auto", "point_to_point", "broadcast", "tree", "ring", "host_staged"] },
+        "inputs": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "$ref": "#/$defs/id64" } }, "outputs": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/id64" } },
+        "sources": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "$ref": "#/$defs/place" } }, "destinations": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/place" } },
+        "output_kinds": { "type": "array", "minItems": 1, "items": { "enum": ["plaintext", "ciphertext"] } }
+      }
+    }
+  }
+}

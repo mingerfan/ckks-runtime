@@ -528,6 +528,74 @@ void test_multi_rank_device_worker_failures() {
                  "injected communicate_async failure");
 }
 
+void test_vec_drain_reports_unobserved_failure() {
+    VecExecutor executor({VecExecMode::Async, 7, 10});
+    auto input = make_cipher({1, 2, 3, 4}, "ctx", 8192, 3, 1);
+    // Metadata can be prepared before the asynchronous task reads Rotate attrs.
+    auto output = executor.compute(
+        {ComputeKind::Rotate, {0}, 1, {PlaceKind::Device, 0, 0}, {}}, {input});
+    expect_throw([&] { executor.drain(); });
+    expect_throw([&] { (void)output.materialize(); });
+}
+
+void test_communication_delivered_once() {
+    const auto built = make_fanout_plan({2});
+    auto cluster = std::make_shared<MockCluster>(MockClusterConfig{});
+    MockVecApi api(0, cluster, {VecExecMode::Async, 77, 10});
+    api.preflight("sha256:" + std::string(64, '0'), false, built.plan.target,
+                  built.operator_spec.spec, {});
+    const auto &action = std::get<CommAction>(built.plan.initialization[1].body);
+    std::vector<ValueDesc> descs;
+    for (ValueId id : action.outputs)
+        for (const auto &desc : built.plan.values)
+            if (desc.id == id) descs.push_back(desc);
+    const auto input = make_plain({2, 3, 4, 5}, "ctx", 8192, 3, 1);
+    auto handle = api.communicate_async(action, {input}, descs);
+    auto posted = api.posted_outputs(handle);
+    require(posted.size() == 2 && posted[0] && posted[1], "Replicate did not post both slots");
+    auto repeated = api.posted_outputs(handle);
+    require(repeated.size() == 2 && !repeated[0] && !repeated[1], "Replicate posted twice");
+    auto waited = api.wait(handle);
+    require(waited.size() == 2 && !waited[0] && !waited[1], "wait repeated posted values");
+    require(!handle.outputs[0] && !handle.outputs[1] && handle.tasks.empty(),
+            "completed communication handle retained values or tasks");
+    compare_values(*posted[0], input);
+    compare_values(*posted[1], input);
+
+    handle = api.communicate_async(action, {input}, descs);
+    waited = api.wait(handle);
+    require(waited.size() == 2 && waited[0] && waited[1], "wait omitted unposted slots");
+    compare_values(*waited[0], input);
+    compare_values(*waited[1], input);
+}
+
+void test_mixed_posted_and_waited_outputs() {
+    class MixedApi : public MockVecApi {
+    public:
+        using MockVecApi::MockVecApi;
+        std::vector<std::optional<Value>> posted_outputs(CommHandle &handle) const {
+            auto outputs = MockVecApi::posted_outputs(handle);
+            for (std::size_t slot = 0; slot < outputs.size(); slot += 2) {
+                handle.outputs[slot].swap(outputs[slot]);
+            }
+            return outputs;
+        }
+    };
+    const auto built = make_fanout_plan({3});
+    const auto cipher = make_cipher({1, 2, 3, 4}, "ctx", 8192, 3, 1);
+    const auto plain = make_plain({2, 3, 4, 5}, "ctx", 8192, 3, 1);
+    for (auto mode : {DeviceExecutionMode::Sequential, DeviceExecutionMode::PerDeviceWorkers}) {
+        auto cluster = std::make_shared<MockCluster>(MockClusterConfig{});
+        MixedApi api(0, cluster, {VecExecMode::Async, 31, 10});
+        SequentialRuntime<MixedApi> runtime(0, 1, 3, api, mode);
+        auto artifact = runtime.run({built.plan, "sha256:" + std::string(64, '0')},
+                                    {built.operator_spec, std::nullopt, false},
+                                    {{0, cipher}, {1, plain}});
+        compare_values(artifact.values.at(built.plan.final_outputs.front()).value,
+                       run_fanout_reference(cipher, plain).at(built.reference_output));
+    }
+}
+
 } // namespace
 
 int main() {
@@ -545,6 +613,9 @@ int main() {
                  test_multi_rank_bidirectional_dependency_chain);
         run_test("single-rank worker Replicate", test_single_rank_device_worker_replicate);
         run_test("multi-rank device-worker failures", test_multi_rank_device_worker_failures);
+        run_test("drain reports unobserved async failure", test_vec_drain_reports_unobserved_failure);
+        run_test("communication results are delivered once", test_communication_delivered_once);
+        run_test("mixed posted and waited output slots", test_mixed_posted_and_waited_outputs);
         std::cout << "ALL " << tests_run << " TEST GROUPS PASSED\n";
         return 0;
     } catch (const std::exception &error) {

@@ -72,7 +72,9 @@ VecValue MockCluster::receive(TransferId id, std::size_t slot) {
     cv_.wait(lock, [&] { return aborted_ || messages_.count(Key{id, slot}) != 0; });
     if (aborted_) throw ClusterPanic(abort_reason_);
     if (config_.fail_wait.count(id)) throw std::runtime_error("injected mock wait failure");
-    return messages_.at(Key{id, slot}).deep_copy();
+    auto value = std::move(messages_.at(Key{id, slot}));
+    messages_.erase(Key{id, slot});
+    return value;
 }
 
 [[noreturn]] void MockCluster::abort_all(const std::string &reason) {
@@ -230,37 +232,41 @@ std::vector<std::optional<MockVecApi::Value>> MockVecApi::posted_outputs(
     if (handle.waited)
         throw std::runtime_error(
             "communication outputs requested after wait");
-    return handle.outputs;
+    return take_outputs(handle);
 }
 
-std::vector<MockVecApi::Value> MockVecApi::wait(CommHandle &handle) {
+std::vector<std::optional<MockVecApi::Value>> MockVecApi::take_outputs(
+    CommHandle &handle) const {
+    std::vector<std::optional<Value>> outputs(handle.outputs.size());
+    outputs.swap(handle.outputs);
+    if (cluster_->corrupt_output_count(handle.id) && !outputs.empty()) outputs.pop_back();
+    auto first = std::find_if(outputs.begin(), outputs.end(),
+                              [](const auto &value) { return value.has_value(); });
+    if (cluster_->corrupt_output_type(handle.id) && first != outputs.end()) {
+        VecPayload payload = (*first)->materialize();
+        payload.kind = payload.kind == ValueKind::Ciphertext ? ValueKind::Plaintext : ValueKind::Ciphertext;
+        payload.metadata.components = payload.kind == ValueKind::Plaintext ? 1 : 2;
+        first->emplace(VecValue::ready(std::move(payload)));
+    }
+    if (cluster_->corrupt_output_metadata(handle.id) && first != outputs.end()) {
+        VecPayload payload = (*first)->materialize();
+        ++payload.metadata.level;
+        first->emplace(VecValue::ready(std::move(payload)));
+    }
+    return outputs;
+}
+
+std::vector<std::optional<MockVecApi::Value>> MockVecApi::wait(CommHandle &handle) {
     if (handle.waited) throw std::runtime_error("communication handle waited twice");
-    handle.waited = true;
     {
         std::lock_guard<std::mutex> lock(stats_mutex_);
         ++stats_.wait_calls;
         stats_.wait_compute_calls[handle.id].push_back(stats_.compute_calls);
     }
     for (auto &task : handle.tasks) task.get();
-    std::vector<Value> outputs;
-    for (std::size_t slot : handle.local_slots) {
-        if (!handle.outputs.at(slot))
-            throw std::runtime_error(
-                "mock communication has no posted local output");
-        outputs.push_back(handle.outputs[slot]->deep_copy());
-    }
-    if (cluster_->corrupt_output_count(handle.id) && !outputs.empty()) outputs.pop_back();
-    if (cluster_->corrupt_output_type(handle.id) && !outputs.empty()) {
-        VecPayload payload = outputs.front().materialize();
-        payload.kind = payload.kind == ValueKind::Ciphertext ? ValueKind::Plaintext : ValueKind::Ciphertext;
-        payload.metadata.components = payload.kind == ValueKind::Plaintext ? 1 : 2;
-        outputs.front() = VecValue::ready(std::move(payload));
-    }
-    if (cluster_->corrupt_output_metadata(handle.id) && !outputs.empty()) {
-        VecPayload payload = outputs.front().materialize();
-        ++payload.metadata.level;
-        outputs.front() = VecValue::ready(std::move(payload));
-    }
+    auto outputs = take_outputs(handle);
+    handle.tasks.clear();
+    handle.waited = true;
     {
         std::lock_guard<std::mutex> lock(stats_mutex_);
         ++stats_.completed_handles;

@@ -69,6 +69,7 @@ Poseidon 通过 `PoseidonCpuApi` 和 `PoseidonGpuApi` 接入 Runtime。GPU 计�
 ### 协议规范（V1 已冻结）
 
 - [RuntimePlan V1 规范](runtime-plan/v1/specification.md)：已冻结的计划字段、SSA/元信息规则、原始字节摘要和执行边界。配套 [schema.json](runtime-plan/v1/schema.json)、[明文数据包格式](runtime-plan/v1/plaintext-bundle.md)、[版本兼容规则](runtime-plan/v1/compatibility.md) 和 [合法/非法样例集](runtime-plan/v1/testdata/README.md)。
+- [RuntimePlan V2：Release 与 reuse_input](runtime-plan/v2/specification.md)：新增释放和原位标记的解析、打印、合法性检查；实际执行留到后续步骤。配套 [schema.json](runtime-plan/v2/schema.json) 和 CPU/GPU 三次原位链样例。
 - [CKKS OperatorSpec V1 规范](operator-spec/v1/specification.md):目标后端的算子能力、level/`scale_log2` 边界、boot profile 和代价模型。配套 [schema.json](operator-spec/v1/schema.json) 和 [占位 profile](operator-spec/v1/profiles/README.md)(CPU eager / GPU lazy)。
 - [CKKS OperatorSpec V2 规范](operator-spec/v2/specification.md):在 V1 语义基础上增加逐 level 噪声、Boot 代价和来源信息；当前用于保存 [按旧 reader 实际语义迁移的 Dacapo profile](operator-spec/v2/profiles/README.md)。
 

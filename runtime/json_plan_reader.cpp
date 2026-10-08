@@ -199,13 +199,15 @@ Instruction read_encode(const Json &value, const std::string &path) {
             EncodeOp{std::move(parsed), read_id(value.at("output"), doc, path + ".output")}};
 }
 
-Instruction read_compute(const Json &value, const std::string &path) {
+Instruction read_compute(const Json &value, const std::string &path, std::uint32_t version) {
     if (!value.contains("op")) fail(doc, path, "missing required field 'op'");
+    if (value.contains("reuse_input") && version == 1)
+        fail(doc, path + ".reuse_input", "reuse_input requires format version 2");
     const ComputeKind kind = read_compute_kind(value.at("op"), path + ".op");
     if (compute_requires_attrs(kind))
-        require_members(value, doc, path, {"ordinal", "kind", "op", "place", "inputs", "output", "attrs"});
+        require_members(value, doc, path, {"ordinal", "kind", "op", "place", "inputs", "output", "attrs"}, {"reuse_input"});
     else
-        require_members(value, doc, path, {"ordinal", "kind", "op", "place", "inputs", "output"});
+        require_members(value, doc, path, {"ordinal", "kind", "op", "place", "inputs", "output"}, {"reuse_input"});
     ComputeOp op;
     op.kind = kind;
     op.place = read_place(value.at("place"), path + ".place");
@@ -213,6 +215,8 @@ Instruction read_compute(const Json &value, const std::string &path) {
     op.output = read_id(value.at("output"), doc, path + ".output");
     op.attrs = compute_requires_attrs(kind) ? read_compute_attrs(kind, value.at("attrs"), path + ".attrs")
                                             : ComputeAttrs{std::monostate{}};
+    if (value.contains("reuse_input"))
+        op.reuse_input = static_cast<std::size_t>(read_nonnegative_int(value.at("reuse_input"), doc, path + ".reuse_input"));
     return {static_cast<std::size_t>(read_nonnegative_int(value.at("ordinal"), doc, path + ".ordinal")), std::move(op)};
 }
 
@@ -233,21 +237,27 @@ Instruction read_comm(const Json &value, const std::string &path, CommKind kind)
             std::move(action)};
 }
 
-Instruction read_instruction(const Json &value, const std::string &path) {
+Instruction read_instruction(const Json &value, const std::string &path, std::uint32_t version) {
     if (!value.is_object() || !value.contains("kind")) fail(doc, path, "missing required field 'kind'");
     const std::string kind = read_string(value.at("kind"), doc, path + ".kind");
     if (kind == "encode") return read_encode(value, path);
-    if (kind == "compute") return read_compute(value, path);
+    if (kind == "compute") return read_compute(value, path, version);
     if (kind == "transfer") return read_comm(value, path, CommKind::Transfer);
     if (kind == "replicate") return read_comm(value, path, CommKind::Replicate);
+    if (kind == "release") {
+        if (version == 1) fail(doc, path + ".kind", "Release requires format version 2");
+        require_members(value, doc, path, {"ordinal", "kind", "value"});
+        return {static_cast<std::size_t>(read_nonnegative_int(value.at("ordinal"), doc, path + ".ordinal")),
+                ReleaseOp{read_id(value.at("value"), doc, path + ".value")}};
+    }
     fail(doc, path + ".kind", "unknown instruction kind '" + kind + "'");
 }
 
-std::vector<Instruction> read_instructions(const Json &value, const std::string &path) {
+std::vector<Instruction> read_instructions(const Json &value, const std::string &path, std::uint32_t version) {
     if (!value.is_array()) fail(doc, path, "expected array");
     std::vector<Instruction> result;
     for (std::size_t i = 0; i < value.size(); ++i)
-        result.push_back(read_instruction(value[i], item_path(path, i)));
+        result.push_back(read_instruction(value[i], item_path(path, i), version));
     return result;
 }
 
@@ -258,7 +268,8 @@ RuntimePlan read_document(const Json &root) {
                     {"plaintext_bundle"});
     RuntimePlan plan;
     plan.format_version = static_cast<std::uint32_t>(read_nonnegative_int(root.at("format_version"), doc, "$.format_version"));
-    if (plan.format_version != 1) fail(doc, "$.format_version", "unsupported format version");
+    if (plan.format_version != 1 && plan.format_version != 2)
+        fail(doc, "$.format_version", "unsupported format version");
     plan.plan_id = read_id(root.at("plan_id"), doc, "$.plan_id");
     plan.target = read_target(root.at("target"), "$.target");
     if (root.contains("plaintext_bundle")) plan.plaintext_bundle = read_bundle_ref(root.at("plaintext_bundle"), "$.plaintext_bundle");
@@ -267,9 +278,9 @@ RuntimePlan read_document(const Json &root) {
     for (std::size_t i = 0; i < values.size(); ++i)
         plan.values.push_back(read_value_desc(values[i], item_path("$.values", i)));
     plan.external_inputs = read_ids(root.at("external_inputs"), "$.external_inputs");
-    plan.initialization = read_instructions(root.at("initialization"), "$.initialization");
-    plan.execution = read_instructions(root.at("execution"), "$.execution");
-    plan.finalization = read_instructions(root.at("finalization"), "$.finalization");
+    plan.initialization = read_instructions(root.at("initialization"), "$.initialization", plan.format_version);
+    plan.execution = read_instructions(root.at("execution"), "$.execution", plan.format_version);
+    plan.finalization = read_instructions(root.at("finalization"), "$.finalization", plan.format_version);
     plan.final_outputs = read_ids(root.at("final_outputs"), "$.final_outputs");
     return plan;
 }

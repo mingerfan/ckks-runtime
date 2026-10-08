@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -42,6 +43,7 @@ public:
     struct LocalState { std::size_t slot = 0; Value value; };
     struct CommHandle {
         TransferId id = 0;
+        std::size_t output_count = 0;
         std::vector<std::size_t> local_slots;
         std::vector<SendState> sends;
         std::vector<RecvState> receives;
@@ -56,7 +58,9 @@ public:
     CommHandle communicate_async(const CommAction &action,
                                  const std::vector<Value> &local_inputs,
                                  const std::vector<ValueDesc> &output_descs);
-    std::vector<Value> wait(CommHandle &handle);
+    std::vector<std::optional<Value>> wait(CommHandle &handle);
+    void collect_completed() {}
+    void drain() {}
     void synchronize(Value &value);
     void preflight(std::string_view plan_source_sha256,
                    bool skip_artifact_digest_checks,

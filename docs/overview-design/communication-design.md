@@ -153,9 +153,13 @@ public:
         const std::vector<Value> &local_inputs,
         const std::vector<ValueDesc> &output_descs);
 
-    std::vector<Value> wait(CommHandle &handle);
+    // Optional early delivery; both methods use action.outputs slot order.
+    std::vector<std::optional<Value>> posted_outputs(CommHandle &handle);
+    std::vector<std::optional<Value>> wait(CommHandle &handle);
 
     void synchronize(Value &value);
+    void collect_completed();
+    void drain();
 
     [[noreturn]] void abort_all(int exit_code, const std::string &reason);
 };
@@ -173,7 +177,9 @@ public:
 `communicate_async` 内直接分配目标对象并发布异步接收，不需要先从发送端获取
 对象布局；Api 必须校验 descriptor 的 ValueId、kind 和 Place 与 CommAction 一致。
 
-`wait` 返回本 rank 上由这次通信产生的输出值，顺序和该 rank 在 `action.outputs` 中的下标顺序一致。Runtime 用这些下标把结果安装到各自的 ValueId；数量、类型、位置或顺序不匹配都是致命错误。
+`wait` 返回与完整 `action.outputs` 等长的 optional 数组，只在原位置交付
+尚未交付的本地结果。Runtime 用原下标把结果安装到各自的 ValueId；数量、
+类型、位置、遗漏或重复交付不匹配都是致命错误。
 
 `synchronize` 只在运行结束发布最终输出前调用，使 Api 内部异步计算的异常仍由 Runtime 的 fail-fast 顶层捕获。它不用于逐指令同步。
 
@@ -281,6 +287,11 @@ Runtime 不需要能力查询，也不参与降级。
 
 `communicate_async` 必须在不等待远端完成的情况下返回，具体的 request/event 都藏在 CommHandle 里。Api 可以再实现可选的 `posted_outputs(handle)`，立即返回已经分配好的本地输出句柄；这些句柄可以尚未完成，但必须携带后续 stream 能等待的依赖。
 
+`posted_outputs` 和 `wait` 都返回与 `action.outputs` 等长的 optional 数组，
+下标对应原输出位置。每个结果只交付一次：非本 rank 的输出、提前交过的
+输出，在 `wait` 中为空。尚未提前交付的本地结果必须在 `wait` 中出现。
+Runtime 检查重复交付、遗漏和位置；Api 将交付的值移出通信状态，不保留副本。
+
 Runtime 维护：
 
 ~~~text
@@ -298,13 +309,18 @@ Poseidon 兼容层内部使用异步 GPU kernel 时，用 stream/event 保证这
 
 ## 13. 发送侧的生命周期
 
-首期不做精细回收：
+GPU Api 按每次工作的完成事件保存输入、输出和必要的临时数据。
+`collect_completed()` 查询事件并清理已完成工作，不等待未完成工作；
+计算、传输提交成功和通信等待结束后调用它。传输请求完成后清掉 pinned
+Host 暂存，但保留结果携带的依赖事件。下载的暂存区在构造 Host 结果后清掉。
 
-- 所有值保留到运行结束；
-- 所有发送句柄保留到收尾阶段；
-- 收尾时逐个等待，全部完成后统一释放。
+Runtime 收尾先等待所有通信句柄，再调用 `drain()` 等完所有已提交计算，
+包括不在最终输出依赖链中的工作。返回结果交给调用方后清掉内部值表和
+通信状态。CPU 计算同步执行；Mock 的异步计算在 `drain` 中等完各工作队列。
+MPI 发送在对应 `wait` 完成后清掉序列化缓冲区。
 
-这会增加内存占用，但避免了"数据还在异步发送、源就被释放了"的问题。后续内存规划再加精细回收。
+目前尚未执行计划中的 Release，Runtime 中间值仍保留到收尾；提前释放由
+后续实施步骤接入。Api 已完成工作的引用不再一直保留到析构。
 
 ## 14. 无死锁论证
 
@@ -348,6 +364,8 @@ validate_value(value, expected_desc)
 communicate_async(CommAction, local_inputs, output_descs)
 wait(CommHandle)
 synchronize(Value)
+collect_completed()
+drain()
 abort_all(exit_code, reason)
 ~~~
 

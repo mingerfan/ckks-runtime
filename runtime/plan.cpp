@@ -113,7 +113,11 @@ void RuntimePlan::print(std::ostream &out) const {
             } else if (const auto *op = std::get_if<ComputeOp>(&inst.body)) {
                 out << '%' << op->output << " = " << to_string(op->kind) << '(';
                 for (std::size_t i = 0; i < op->inputs.size(); ++i) { if (i) out << ','; out << '%' << op->inputs[i]; }
-                out << ") @ " << to_string(op->place) << '\n';
+                out << ") @ " << to_string(op->place);
+                if (op->reuse_input) out << " reuse_input=" << *op->reuse_input;
+                out << '\n';
+            } else if (const auto *release = std::get_if<ReleaseOp>(&inst.body)) {
+                out << "Release(%" << release->value << ")\n";
             } else {
                 const auto &a = std::get<CommAction>(inst.body);
                 out << to_string(a.kind) << " transfer=" << a.id << " hint=" << to_string(a.hint) << " outputs=";

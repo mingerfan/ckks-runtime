@@ -110,6 +110,8 @@ ValueId instruction_output(const Instruction &instruction) {
         return encode->output;
     if (const auto *op = std::get_if<ComputeOp>(&instruction.body))
         return op->output;
+    if (std::holds_alternative<ReleaseOp>(instruction.body))
+        throw std::runtime_error("Release has no instruction output");
     const auto &action = std::get<CommAction>(instruction.body);
     if (action.outputs.size() != 1)
         throw std::runtime_error(
@@ -121,6 +123,7 @@ std::string instruction_name(const Instruction &instruction) {
     if (std::holds_alternative<EncodeOp>(instruction.body)) return "Encode";
     if (const auto *op = std::get_if<ComputeOp>(&instruction.body))
         return to_string(op->kind);
+    if (std::holds_alternative<ReleaseOp>(instruction.body)) return "Release";
     return to_string(std::get<CommAction>(instruction.body).kind);
 }
 
@@ -130,6 +133,13 @@ public:
         : reference_(reference), distributed_(distributed) {}
 
     void verify() {
+        for (const auto *plan : {&reference_, &distributed_}) {
+            for (const Instruction *instruction : instructions(*plan)) {
+                const auto *op = std::get_if<ComputeOp>(&instruction->body);
+                if (std::holds_alternative<ReleaseOp>(instruction->body) || (op && op->reuse_input))
+                    throw std::runtime_error("all-value diff is incompatible with Release/reuse_input");
+            }
+        }
         verify_targets();
         index_reference();
         index_transfers();

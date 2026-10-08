@@ -269,6 +269,8 @@ Value &ensure_ready(ValueId id, Place expected_place):
         group = pending_groups.lookup(entry.group_id)
         outputs = api.wait(group.handle)
         for (output_id, output) in 按 slot 对应的本地输出:
+            if output 已提前交付: assert outputs[slot] 为空; continue
+            assert outputs[slot] 有值
             api.validate_value(output, value_desc(output_id))
             value_store.define_ready(output_id, value_desc(output_id).place, output)
         return value_store.lookup_ready(id).value
@@ -279,7 +281,8 @@ Value &ensure_ready(ValueId id, Place expected_place):
 `expected_place` 只用来检查消费方的本地性，不参与寻址。支持
 `posted_outputs` 的 GPU Api 会立即返回带完成事件的 Ready 句柄；消费计算把
 `cudaStreamWaitEvent` 插进自己的 stream，CPU 不等数据完成。不支持该接口的旧
-Api 仍使用 Pending，并在消费前调用 `wait`，所以接口保持向后兼容。
+Api 仍使用 Pending，并在消费前调用 `wait`。两个交付接口的返回数组均与
+`action.outputs` 等长，每个结果只交付一次，不能把本地结果压缩后重编号。
 
 首期不提供"探测是否完成""推进进度""取消"这类接口。Api 内部想用进度线程、`MPI_Test`、CUDA event 都可以，对 runtime 不可见。
 
@@ -322,15 +325,17 @@ Api 仍使用 Pending，并在消费前调用 `wait`，所以接口保持向后�
 
 ## 10. 生命周期
 
-目标实现为避免过度设计，首期不做"最后一次使用后回收"：
+当前尚未执行计划中的 Release，中间值仍保留到收尾：
 
 - 所有 Ready 的值保留到收尾阶段；
 - 所有发送句柄保留到收尾阶段；
-- 收尾完成全部等待后统一释放。
+- 收尾完成所有通信等待并调用 `api.drain()`，等完所有已提交计算后统一释放。
 
-这会增加内存占用，但直接保证了发送源不会在异步发送完成前被释放。
+最终输出交给调用方后，Runtime 清空内部值表和通信状态。GPU Api 已按工作
+完成事件回收自己的引用；源数据不会在计算或传输完成前销毁。
 
-> **当前实现：** `SequentialRuntime` 的 `ValueStore` 和通信组是对象成员，`run()` 前后都不会清空。因此一个实例只能执行一次；如果以后支持复用，必须在每次运行前重置全部状态。
+> **当前实现：** `SequentialRuntime` 在每次 `run()` 前重置状态，在成功返回结果
+> 前清空内部值表和通信组。同一个实例可以重复运行；调用方持有的结果继续有效。
 
 逐指令对比正是利用了这个特性：所有指令发起完之后，做完收尾等待，把还活着的值拷贝出来，等 runtime 停止后离线比较。正常执行路径不插入逐指令的观察点或同步；不开这个测试选项就没有任何额外开销。RunArtifact 是测试设施，不属于 Runtime/Api 的稳定接口，开启它的测试不用于性能计时。
 

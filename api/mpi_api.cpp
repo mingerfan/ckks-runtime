@@ -91,6 +91,7 @@ MpiVecApi::CommHandle MpiVecApi::communicate_async(const CommAction &action,
                 "MPI communication output descriptor mismatch");
     CommHandle handle;
     handle.id = action.id;
+    handle.output_count = action.outputs.size();
     for (std::size_t i = 0; i < action.destinations.size(); ++i)
         if (action.destinations[i].rank == rank_) handle.local_slots.push_back(i);
 
@@ -136,7 +137,7 @@ MpiVecApi::CommHandle MpiVecApi::communicate_async(const CommAction &action,
     return handle;
 }
 
-std::vector<MpiVecApi::Value> MpiVecApi::wait(CommHandle &handle) {
+std::vector<std::optional<MpiVecApi::Value>> MpiVecApi::wait(CommHandle &handle) {
     if (handle.waited) throw std::runtime_error("MPI communication handle waited twice");
     handle.waited = true;
     for (auto &send : handle.sends)
@@ -155,9 +156,11 @@ std::vector<MpiVecApi::Value> MpiVecApi::wait(CommHandle &handle) {
         completed.push_back(LocalState{recv.slot, decode_value(recv.header, std::move(recv.slots))});
     }
     std::sort(completed.begin(), completed.end(), [](const LocalState &a, const LocalState &b) { return a.slot < b.slot; });
-    std::vector<Value> outputs;
-    outputs.reserve(completed.size());
-    for (auto &item : completed) outputs.push_back(std::move(item.value));
+    std::vector<std::optional<Value>> outputs(handle.output_count);
+    for (auto &item : completed) outputs.at(item.slot).emplace(std::move(item.value));
+    handle.sends.clear();
+    handle.receives.clear();
+    handle.locals.clear();
     return outputs;
 }
 

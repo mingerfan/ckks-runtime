@@ -109,6 +109,14 @@ if(CKKS_RUNTIME_BUILD_TESTS)
     ckks_runtime_enable_warnings(runtime_plan_json_tests)
     add_test(NAME runtime_plan_json_tests COMMAND runtime_plan_json_tests)
 
+    add_executable(runtime_plan_memory_tests tests/runtime_plan_memory_tests.cpp)
+    target_link_libraries(runtime_plan_memory_tests
+        PRIVATE ckks_runtime_plan_json ckks_runtime_test_support)
+    target_compile_definitions(runtime_plan_memory_tests
+        PRIVATE CKKS_RUNTIME_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    ckks_runtime_enable_warnings(runtime_plan_memory_tests)
+    add_test(NAME runtime_plan_memory_tests COMMAND runtime_plan_memory_tests)
+
     add_executable(thread_trace_tests tests/thread_trace_tests.cpp)
     target_link_libraries(thread_trace_tests PRIVATE ckks_runtime_core)
     ckks_runtime_enable_warnings(thread_trace_tests)
