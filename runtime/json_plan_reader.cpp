@@ -98,6 +98,7 @@ TargetConfig read_target(const Json &value, const std::string &path) {
     target.world_size = read_positive_int(value.at("world_size"), doc, path + ".world_size");
     const auto &counts = value.at("device_counts");
     if (!counts.is_array()) fail(doc, path + ".device_counts", "expected array");
+    target.device_counts.reserve(counts.size());
     for (std::size_t i = 0; i < counts.size(); ++i)
         target.device_counts.push_back(read_nonnegative_int(counts[i], doc, item_path(path + ".device_counts", i)));
     if (target.device_counts.size() != static_cast<std::size_t>(target.world_size))
@@ -121,6 +122,7 @@ ValueDesc read_value_desc(const Json &value, const std::string &path) {
 std::vector<ValueId> read_ids(const Json &value, const std::string &path) {
     if (!value.is_array()) fail(doc, path, "expected array");
     std::vector<ValueId> result;
+    result.reserve(value.size());
     for (std::size_t i = 0; i < value.size(); ++i)
         result.push_back(read_id(value[i], doc, item_path(path, i)));
     return result;
@@ -129,6 +131,7 @@ std::vector<ValueId> read_ids(const Json &value, const std::string &path) {
 std::vector<Place> read_places(const Json &value, const std::string &path) {
     if (!value.is_array()) fail(doc, path, "expected array");
     std::vector<Place> result;
+    result.reserve(value.size());
     for (std::size_t i = 0; i < value.size(); ++i)
         result.push_back(read_place(value[i], item_path(path, i)));
     return result;
@@ -137,6 +140,7 @@ std::vector<Place> read_places(const Json &value, const std::string &path) {
 std::vector<ValueKind> read_value_kinds(const Json &value, const std::string &path) {
     if (!value.is_array()) fail(doc, path, "expected array");
     std::vector<ValueKind> result;
+    result.reserve(value.size());
     for (std::size_t i = 0; i < value.size(); ++i)
         result.push_back(read_value_kind(value[i], item_path(path, i)));
     return result;
@@ -186,6 +190,7 @@ Instruction read_encode(const Json &value, const std::string &path) {
         const auto &values = payload.at("values");
         if (!values.is_array() || values.empty()) fail(doc, path + ".payload.values", "expected non-empty array");
         InlineEncodePayload inline_payload;
+        inline_payload.values.reserve(values.size());
         for (std::size_t i = 0; i < values.size(); ++i)
             inline_payload.values.push_back(read_finite_double(values[i], doc, item_path(path + ".payload.values", i)));
         parsed = std::move(inline_payload);
@@ -261,6 +266,7 @@ Instruction read_instruction(const Json &value, const std::string &path, std::ui
 std::vector<Instruction> read_instructions(const Json &value, const std::string &path, std::uint32_t version) {
     if (!value.is_array()) fail(doc, path, "expected array");
     std::vector<Instruction> result;
+    result.reserve(value.size());
     for (std::size_t i = 0; i < value.size(); ++i)
         result.push_back(read_instruction(value[i], item_path(path, i), version));
     return result;
@@ -280,6 +286,7 @@ RuntimePlan read_document(const Json &root) {
     if (root.contains("plaintext_bundle")) plan.plaintext_bundle = read_bundle_ref(root.at("plaintext_bundle"), "$.plaintext_bundle");
     const auto &values = root.at("values");
     if (!values.is_array()) fail(doc, "$.values", "expected array");
+    plan.values.reserve(values.size());
     for (std::size_t i = 0; i < values.size(); ++i)
         plan.values.push_back(read_value_desc(values[i], item_path("$.values", i)));
     plan.external_inputs = read_ids(root.at("external_inputs"), "$.external_inputs");

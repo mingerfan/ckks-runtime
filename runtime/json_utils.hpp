@@ -11,7 +11,6 @@
 #include <initializer_list>
 #include <iterator>
 #include <limits>
-#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -136,30 +135,71 @@ inline std::string read_sha256(const Json &value, const std::string &document,
     return digest;
 }
 
+// Use the public SAX interface. The DOM callback parser scans the complete
+// parent array at every object_end, even when the callback discards nothing.
+class StrictJsonSax : public nlohmann::json_sax<Json> {
+public:
+    explicit StrictJsonSax(const std::string &document) : document_(document) {}
+
+    bool null() override { return value(nullptr); }
+    bool boolean(bool v) override { return value(v); }
+    bool number_integer(Json::number_integer_t v) override { return value(v); }
+    bool number_unsigned(Json::number_unsigned_t v) override { return value(v); }
+    bool number_float(Json::number_float_t v, const std::string &) override { return value(v); }
+    bool string(std::string &v) override { return value(std::move(v)); }
+    bool binary(Json::binary_t &v) override { return value(std::move(v)); }
+    bool start_object(std::size_t) override {
+        frames_.push_back({Json::object(), {}});
+        return true;
+    }
+    bool start_array(std::size_t) override {
+        frames_.push_back({Json::array(), {}});
+        return true;
+    }
+    bool key(std::string &v) override {
+        auto &frame = frames_.back();
+        if (frame.container.contains(v))
+            fail(document_, "$", "duplicate object key '" + v + "'");
+        frame.key = std::move(v);
+        return true;
+    }
+    bool end_object() override { return end_container(); }
+    bool end_array() override { return end_container(); }
+    bool parse_error(std::size_t position, const std::string &,
+                     const Json::exception &error) override {
+        fail(document_, "byte " + std::to_string(position), error.what());
+    }
+    Json take_result() { return std::move(result_); }
+
+private:
+    struct Frame { Json container; std::string key; };
+    bool value(Json v) {
+        if (frames_.empty()) result_ = std::move(v);
+        else {
+            auto &frame = frames_.back();
+            if (frame.container.is_array()) frame.container.push_back(std::move(v));
+            else frame.container.emplace(std::move(frame.key), std::move(v));
+        }
+        return true;
+    }
+    bool end_container() {
+        Json v = std::move(frames_.back().container);
+        frames_.pop_back();
+        return value(std::move(v));
+    }
+    std::string document_;
+    std::vector<Frame> frames_;
+    Json result_;
+};
+
 inline Json parse(std::string_view text, const std::string &document) {
     if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xef &&
         static_cast<unsigned char>(text[1]) == 0xbb &&
         static_cast<unsigned char>(text[2]) == 0xbf)
         fail(document, "$", "UTF-8 BOM is not allowed");
-    std::vector<std::set<std::string>> object_keys;
-    const auto callback = [&](int, Json::parse_event_t event, Json &parsed) {
-        if (event == Json::parse_event_t::object_start) object_keys.emplace_back();
-        else if (event == Json::parse_event_t::key) {
-            if (object_keys.empty()) fail(document, "$", "invalid parser object state");
-            const std::string key = parsed.get<std::string>();
-            if (!object_keys.back().insert(key).second)
-                fail(document, "$", "duplicate object key '" + key + "'");
-        } else if (event == Json::parse_event_t::object_end) {
-            if (object_keys.empty()) fail(document, "$", "invalid parser object state");
-            object_keys.pop_back();
-        }
-        return true;
-    };
-    try { return Json::parse(text.begin(), text.end(), callback, true, false); }
-    catch (const std::runtime_error &) { throw; }
-    catch (const Json::exception &error) {
-        fail(document, "$", std::string("JSON parsing failed: ") + error.what());
-    }
+    StrictJsonSax sax(document);
+    Json::sax_parse(text.begin(), text.end(), &sax);
+    return sax.take_result();
 }
 
 inline std::string read_file_bytes(const std::string &path) {

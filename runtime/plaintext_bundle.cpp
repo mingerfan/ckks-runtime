@@ -31,6 +31,7 @@ std::vector<BlobEntry> read_manifest(const Json &root, const PlaintextBundleRef 
     if (!blobs.is_array()) fail(doc, "$.blobs", "expected array");
     std::set<std::string> seen;
     std::vector<BlobEntry> result;
+    result.reserve(blobs.size());
     for (std::size_t i = 0; i < blobs.size(); ++i) {
         const std::string path = item_path("$.blobs", i);
         require_members(blobs[i], doc, path, {"content", "byte_length"});

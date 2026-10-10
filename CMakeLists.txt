@@ -129,6 +129,11 @@ if(CKKS_RUNTIME_BUILD_TESTS)
 endif()
 
 if(CKKS_RUNTIME_BUILD_EXPERIMENTS)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(runtime_plan_io_benchmark tools/runtime_plan_io_benchmark.cpp)
+        target_link_libraries(runtime_plan_io_benchmark PRIVATE ckks_runtime_plan_json)
+        ckks_runtime_enable_warnings(runtime_plan_io_benchmark)
+    endif()
     add_executable(dacapo_mlp_vec_experiment
         experiments/dacapo_mlp_vec.cpp)
     target_link_libraries(dacapo_mlp_vec_experiment

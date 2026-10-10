@@ -1,4 +1,5 @@
 #include "runtime/json_plan_reader.hpp"
+#include "runtime/json_utils.hpp"
 #include "runtime/operator_spec_reader.hpp"
 #include "runtime/plaintext_bundle.hpp"
 #include "runtime/utils/sha256.hpp"
@@ -155,6 +156,28 @@ void test_strict_json_and_operator_spec() {
     expect_throw([&] { OperatorSpecReader::read_text(v1_noise_text); }, "must be null in V1");
 }
 
+void test_strict_sax_containers() {
+    for (const auto &text : {R"({"x":1,"\u0078":2})",
+                             R"([{"nested":{"x":[],"x":{}}}])",
+                             R"({"a":[{"x":1},{"x":2}],"a":[]})"})
+        expect_throw([&] { json_utils::parse(text, "SAX test"); }, "duplicate object key");
+    for (const auto &text : {"{} trailing", "[{}", "{\"x\":1e400}", "{\"x\":]"})
+        expect_throw([&] { json_utils::parse(text, "SAX test"); }, "byte");
+    const auto value = json_utils::parse(R"({"a":[{},[],null,true,-1,2,3.5,"text"],"b":{}})", "SAX test");
+    require(value == json_utils::Json::parse(R"({"a":[{},[],null,true,-1,2,3.5,"text"],"b":{}})"),
+            "SAX containers differ from normal JSON parsing");
+    std::string large = "[";
+    for (int i = 0; i < 100000; ++i) {
+        if (i) large += ',';
+        large += R"({"value":1})";
+    }
+    large += ']';
+    require(json_utils::parse(large, "large array").size() == 100000,
+            "large object array was not parsed completely");
+    expect_throw([] { OperatorSpecReader::read_text(R"({"id":"a","\u0069d":"b"})"); },
+                 "duplicate object key");
+}
+
 void test_dacapo_operator_spec_v2_profiles() {
     const auto profile_dir = source_dir / "docs/operator-spec/v2/profiles";
     const auto cpu = OperatorSpecReader::read_file((profile_dir / "dacapo-heaan-cpu.v1.json").string());
@@ -300,6 +323,7 @@ int main() {
         run_test("valid RuntimePlan V1 samples", test_valid_samples);
         run_test("invalid RuntimePlan V1 samples", test_invalid_samples);
         run_test("strict JSON and OperatorSpec constraints", test_strict_json_and_operator_spec);
+        run_test("strict SAX container parsing", test_strict_sax_containers);
         run_test("Dacapo OperatorSpec V2 profiles", test_dacapo_operator_spec_v2_profiles);
         run_test("rank-local bundle loading", test_rank_local_bundle_loading);
         std::cout << "ALL " << tests_run << " JSON TEST GROUPS PASSED\n";
