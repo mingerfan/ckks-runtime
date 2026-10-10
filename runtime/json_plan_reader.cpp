@@ -244,7 +244,7 @@ Instruction read_instruction(const Json &value, const std::string &path, std::ui
     if (kind == "fence") {
         if (version < 3) fail(doc, path + ".kind", "Fence requires format version 3");
         require_members(value, doc, path, {"ordinal", "kind"});
-        return {read_id(value.at("ordinal"), doc, path + ".ordinal"), FenceOp{}};
+        return {static_cast<std::size_t>(read_nonnegative_int(value.at("ordinal"), doc, path + ".ordinal")), FenceOp{}};
     }
     if (kind == "compute") return read_compute(value, path, version);
     if (kind == "transfer") return read_comm(value, path, CommKind::Transfer);

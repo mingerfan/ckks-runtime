@@ -134,6 +134,8 @@ public:
 
     void verify() {
         for (const auto *plan : {&reference_, &distributed_}) {
+            if (plan->format_version == 3)
+                throw std::runtime_error("all-value alignment does not support V3 streaming plans");
             for (const Instruction *instruction : instructions(*plan)) {
                 const auto *op = std::get_if<ComputeOp>(&instruction->body);
                 if (std::holds_alternative<ReleaseOp>(instruction->body) || (op && op->reuse_input))

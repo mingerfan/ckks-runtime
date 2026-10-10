@@ -76,6 +76,9 @@ struct ArtifactValue { Place place; Value value; };
 
 // Wall time inside Api::compute. Asynchronous APIs report submission time.
 struct RuntimeTiming {
+    std::size_t encode_calls = 0, bundle_read_calls = 0, fence_calls = 0;
+    std::uint64_t encode_nanoseconds = 0, bundle_read_nanoseconds = 0;
+    std::uint64_t bundle_read_bytes = 0, raw_peak_bytes = 0, fence_nanoseconds = 0;
     std::size_t compute_calls = 0;
     std::size_t boot_calls = 0;
     std::uint64_t compute_including_boot_nanoseconds = 0;
@@ -499,37 +502,54 @@ private:
         current_ = nullptr;
     }
 
-    Value encode_value(const EncodeOp &op) {
+    Value encode_value(const EncodeOp &op, std::uint64_t ordinal) {
         const auto &output_desc = desc(op.output);
-        const auto start = std::chrono::steady_clock::now();
         std::vector<double> slots;
         if (const auto *inline_payload = std::get_if<InlineEncodePayload>(&op.payload))
             slots = inline_payload->values;
         else {
             const auto &content = std::get<BundleEncodePayload>(op.payload).content;
+            const auto start = std::chrono::steady_clock::now();
             slots = bundle_index_ ? bundle_index_->read(content) : bundle_slots_.at(content);
+            if (bundle_index_) {
+                const auto elapsed = elapsed_nanoseconds(start, std::chrono::steady_clock::now());
+                ++timing_.bundle_read_calls;
+                timing_.bundle_read_nanoseconds += elapsed;
+                timing_.bundle_read_bytes += slots.size() * sizeof(double);
+                timing_.raw_peak_bytes = std::max(timing_.raw_peak_bytes,
+                    static_cast<std::uint64_t>(slots.size() * sizeof(double) * 2));
+                trace_event("bundle_read", op.output, ordinal, std::nullopt, "Read", elapsed);
+            }
         }
         for (double &value : slots) if (value == 0.0) value = 0.0;
+        const auto start = std::chrono::steady_clock::now();
         Value output = api_.encode_plaintext(output_desc, slots);
         api_.validate_value(output, output_desc);
-        trace_event("encode", op.output, 0, std::nullopt, "Encode",
-                    elapsed_nanoseconds(start, std::chrono::steady_clock::now()));
+        const auto elapsed = elapsed_nanoseconds(start, std::chrono::steady_clock::now());
+        ++timing_.encode_calls;
+        timing_.encode_nanoseconds += elapsed;
+        trace_event("encode", op.output, ordinal, std::nullopt, "Encode", elapsed);
         return output;
     }
 
     void execute_encode(const EncodeOp &op) {
         const auto &output_desc = desc(op.output);
         if (output_desc.place.rank != rank_) return;
-        store_.define_ready(op.output, output_desc.place, encode_value(op));
+        store_.define_ready(op.output, output_desc.place, encode_value(op, current_->ordinal));
     }
 
     void execute_fence() {
         const auto start = std::chrono::steady_clock::now();
         finish_all_groups();
         api_.drain();
-        trace_event("fence", 0, current_ ? current_->ordinal : 0,
-                    std::nullopt, "Fence",
-                    elapsed_nanoseconds(start, std::chrono::steady_clock::now()));
+        record_fence(current_ ? current_->ordinal : 0, start);
+    }
+
+    void record_fence(std::uint64_t ordinal, std::chrono::steady_clock::time_point start) {
+        const auto elapsed = elapsed_nanoseconds(start, std::chrono::steady_clock::now());
+        ++timing_.fence_calls;
+        timing_.fence_nanoseconds += elapsed;
+        trace_event("fence", 0, ordinal, std::nullopt, "Fence", elapsed);
     }
 
     Value &ensure_ready(ValueId id, const Place &expected_place) {
@@ -1093,8 +1113,8 @@ private:
             if (const auto *encode = std::get_if<EncodeOp>(&instruction.body)) {
                 if (desc(encode->output).place.rank != rank_) continue;
                 auto output = define_parallel_value(encode->output, desc(encode->output).place);
-                tasks.back().push_back([this, op = *encode, output] {
-                    auto encoded = encode_value(op);
+                tasks.back().push_back([this, op = *encode, ordinal = instruction.ordinal, output] {
+                    auto encoded = encode_value(op, ordinal);
                     {
                         ThreadTraceLockGuard lock(output->mutex, "runtime.parallel_value");
                         if (!can_clear(output->uses)) output->value.emplace(std::move(encoded));
@@ -1171,10 +1191,11 @@ private:
                 if (end != phase->size() && !std::holds_alternative<FenceOp>((*phase)[end].body)) continue;
                 std::vector<std::vector<ParallelTask>> tasks(worker_count + 1);
                 compile_parallel_phase(*phase, tasks, begin, end);
+                const auto start = std::chrono::steady_clock::now();
                 run_parallel_batch(tasks);
                 if (end != phase->size()) {
                     api_.drain();
-                    trace_event("fence", 0, (*phase)[end].ordinal, std::nullopt, "Fence", 0);
+                    record_fence((*phase)[end].ordinal, start);
                 }
                 begin = end + 1;
             }
