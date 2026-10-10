@@ -348,7 +348,7 @@ int main() {
         std::cout << "[PASS] abandoned posted/pending outputs in both execution modes\n";
         test_mock_multirank_release();
         std::cout << "[PASS] Mock multi-device and multi-rank Release fanout\n";
-        std::cout << "ALL 5 RELEASE TEST GROUPS PASSED\n";
+        std::cout << "ALL 6 RELEASE TEST GROUPS PASSED\n";
         return 0;
     } catch (const std::exception &error) {
         std::cerr << "[FAIL] " << error.what() << '\n';

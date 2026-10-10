@@ -1212,10 +1212,12 @@ private:
         std::vector<std::thread> workers;
         workers.reserve(tasks.size());
         for (std::size_t device = 0; device < tasks.size(); ++device) {
+            if (tasks[device].empty()) continue;
             workers.emplace_back([this, &tasks, device] {
                 ThreadTrace::set_thread_name(
-                    "rank-" + std::to_string(rank_) + "-device-worker-" +
-                    std::to_string(device));
+                    "rank-" + std::to_string(rank_) +
+                    (device + 1 == tasks.size() ? "-cpu-worker" :
+                     "-device-worker-" + std::to_string(device)));
                 try {
                     for (auto &task : tasks[device]) {
                         if (parallel_failed_.load()) return;

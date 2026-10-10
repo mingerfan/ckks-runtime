@@ -50,3 +50,10 @@ workspaces, encoder workspace, allocator pools and fragmentation are excluded.
 The runtime consumes the compiler schedule; it does not impose a dynamic quota
 on arbitrary handwritten V3 plans. Actual upload overlap needs CUDA trace
 measurement; existing allocation readiness waits are preserved.
+
+RuntimeTiming exposes Encode/read counts, bytes and wall time, the no-cache raw
+read upper bound, and Fence count/wall time. In worker mode Fence time includes
+executing and joining the batch queues; in sequential mode it measures the final
+communication wait and API drain. These timings must not be summed as disjoint
+GPU execution intervals. POSEIDON_RUNTIME_TRACE emits per-value Encode/read and
+Fence records; POSEIDON_THREAD_TRACE additionally records upload packing spans.

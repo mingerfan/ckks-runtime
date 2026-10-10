@@ -99,8 +99,11 @@ std::vector<double> PlaintextBundleLoader::read(const std::string &content) cons
     if (error) throw std::runtime_error("cannot open file: " + path.string() + ": " + error.message());
     if (length != found->second)
         throw std::runtime_error("bundle blob byte length mismatch: " + content);
-    const auto bytes = json_utils::read_file_bytes(path.string());
-    if (bytes.size() != found->second)
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw std::runtime_error("cannot open file: " + path.string());
+    std::string bytes(static_cast<std::size_t>(found->second), '\0');
+    input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (!input || input.peek() != std::char_traits<char>::eof())
         throw std::runtime_error("bundle blob byte length mismatch: " + content);
     if (json_utils::source_sha256(bytes) != content)
         throw std::runtime_error("bundle blob content SHA-256 mismatch: " + content);
