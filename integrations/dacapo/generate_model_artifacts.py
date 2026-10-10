@@ -171,6 +171,7 @@ def build_optimizer_command(args, traced: Path, spec: dict,
     command = [
         str(args.hecate_opt),
         "--dacapo",
+        f"--boot-placement={args.boot_placement}",
         f"--ckks-config={compiler_profile}",
         f"--waterline={args.waterline}",
         "--enable-debug-printer",
@@ -249,6 +250,9 @@ def main() -> None:
                         default=DACAPO / "build" / "nix" / "bin" / "hecate-opt")
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument("--waterline", type=int, default=40)
+    parser.add_argument("--boot-placement", choices=("optimized", "greedy", "depth-dp"),
+                        default="optimized",
+                        help="Use greedy for lazy refresh or depth-dp for fast depth-boundary planning")
     parser.add_argument("--plan-id", type=int, default=1)
     parser.add_argument("--inline-payload-max-bytes", type=int, default=4096)
     parser.add_argument(
