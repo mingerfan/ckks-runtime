@@ -224,14 +224,22 @@ public:
 private:
     int_type underflow() override {
         const auto read_start = stats_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        try { input_.read(buffer_.data(), static_cast<std::streamsize>(buffer_.size())); }
-        catch (const std::ios_base::failure &) {
-            if (input_.bad() || !input_.eof()) throw;
-        }
-        if (stats_) stats_->read_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - read_start).count();
-        const auto count = input_.gcount();
         if (input_.bad() || (input_.fail() && !input_.eof()))
             throw std::runtime_error("failed to read file: " + document_);
+        std::streamsize count = 0;
+        try {
+            do {
+                const auto received = input_.rdbuf()->sgetn(buffer_.data() + count,
+                    static_cast<std::streamsize>(buffer_.size()) - count);
+                if (received == 0) break;
+                count += received;
+                // Short reads are not necessarily EOF. Collect the initial
+                // three bytes before exposing them, so a split BOM cannot pass.
+            } while (first_ && count < 3);
+        } catch (const std::exception &error) {
+            throw std::runtime_error("failed to read file: " + document_ + ": " + error.what());
+        }
+        if (stats_) stats_->read_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - read_start).count();
         if (count == 0) return traits_type::eof();
         if (first_ && count >= 3 && static_cast<unsigned char>(buffer_[0]) == 0xef &&
             static_cast<unsigned char>(buffer_[1]) == 0xbb && static_cast<unsigned char>(buffer_[2]) == 0xbf)

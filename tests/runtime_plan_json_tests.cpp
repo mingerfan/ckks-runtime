@@ -165,6 +165,26 @@ void test_streaming_plan_boundaries() {
                              "external_inputs", "plan_id", "values", "format_version"})
         ordered[name] = root.at(name);
     const auto compact = ordered.dump();
+    class ShortReadBuffer : public std::stringbuf {
+    public:
+        ShortReadBuffer(const std::string &text, std::streamsize chunk)
+            : std::stringbuf(text), chunk_(chunk) {}
+    private:
+        std::streamsize xsgetn(char *target, std::streamsize count) override {
+            return std::stringbuf::xsgetn(target, std::min(count, chunk_));
+        }
+        std::streamsize chunk_;
+    };
+    for (std::streamsize chunk : {1, 2, 7}) {
+        ShortReadBuffer buffer(compact, chunk);
+        std::istream input(&buffer);
+        const auto loaded = RuntimePlanJsonReader::read(input);
+        compare_records(loaded.plan, root);
+        require(loaded.source_sha256 == "sha256:" + sha256_hex(compact), "short reads changed source hash");
+        ShortReadBuffer bom(std::string("\xef\xbb\xbf") + compact, chunk);
+        std::istream bom_input(&bom);
+        expect_throw([&] { RuntimePlanJsonReader::read(bom_input); }, "BOM");
+    }
     for (std::size_t padding : {0, 65535, 65536, 65537}) {
         const auto bytes = std::string(padding, ' ') + compact + std::string(padding, '\n');
         std::istringstream input(bytes);
