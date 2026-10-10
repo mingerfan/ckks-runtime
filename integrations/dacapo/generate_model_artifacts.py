@@ -190,6 +190,13 @@ def build_optimizer_command(args, traced: Path, spec: dict,
         f"--runtime-plan-boot-implementation={boot['implementation']}",
         f"--runtime-plan-inline-payload-max-bytes={args.inline_payload_max_bytes}",
     ]
+    if args.runtime_plan_memory:
+        command.append("--runtime-plan-memory")
+    if args.runtime_plan_memory_no_reuse:
+        command.append("--runtime-plan-memory-reuse=false")
+    if args.runtime_plan_memory_report:
+        command.extend(["--runtime-plan-memory-report",
+                        f"--runtime-plan-operator-spec-path={args.placement_operator_spec if args.device_counts else args.operator_spec}"])
     if spec["rescale_mode"] == "lazy":
         command.extend([
             "--runtime-plan-physical-level-operator-spec-path="
@@ -198,10 +205,11 @@ def build_optimizer_command(args, traced: Path, spec: dict,
             f"{args.lazy_rescale_level_factor}",
         ])
     if args.device_counts:
+        if not args.runtime_plan_memory_report:
+            command.append(f"--runtime-plan-operator-spec-path={args.placement_operator_spec}")
         command.extend([
             f"--runtime-plan-device-counts={args.device_counts}",
-            "--runtime-plan-operator-spec-path="
-            f"{args.placement_operator_spec}",
+
             "--runtime-plan-intra-rank-communication-cost="
             f"{args.intra_rank_communication_cost}",
             "--runtime-plan-inter-rank-communication-cost="
@@ -267,9 +275,17 @@ def main() -> None:
         "--inter-rank-communication-cost", type=int, default=10000,
         help="Fixed point-to-point cost between ranks",
     )
+    parser.add_argument("--runtime-plan-memory", action="store_true",
+                        help="Insert Release and supported input reuse")
+    parser.add_argument("--runtime-plan-memory-no-reuse", action="store_true",
+                        help="Plan only Release (requires --runtime-plan-memory)")
+    parser.add_argument("--runtime-plan-memory-report", action="store_true",
+                        help="Write compiler object memory estimates")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
+    if args.runtime_plan_memory_no_reuse and not args.runtime_plan_memory:
+        raise ValueError("--runtime-plan-memory-no-reuse requires --runtime-plan-memory")
     if args.waterline < 0:
         raise ValueError("--waterline must be nonnegative")
     if args.plan_id < 0:
@@ -308,6 +324,9 @@ def main() -> None:
     boot = select_boot_profile(spec, args.boot_profile)
     if args.device_counts:
         placement_spec, _ = read_operator_spec(args.placement_operator_spec)
+        if (args.runtime_plan_memory_report and
+                placement_spec["context"]["poly_degree"] != spec["context"]["poly_degree"]):
+            raise ValueError("memory report requires matching OperatorSpec and placement poly_degree")
         if placement_spec["spec_format_version"] != 2:
             raise ValueError("placement requires OperatorSpec V2")
         if args.communication_profile and not args.communication_profile.is_file():
@@ -349,6 +368,11 @@ def main() -> None:
     print(f"optimized MLIR: {output_dir / f'{args.model}.optimized.mlir'}")
     for path in runtime_plans:
         print(f"RuntimePlan: {path}")
+        if args.runtime_plan_memory_report:
+            report = Path(str(path).removesuffix(".runtime-plan.json") + ".memory.json")
+            if not report.is_file():
+                raise FileNotFoundError(f"memory report not found: {report}")
+            print(f"memory report: {report}")
         plan = json.loads(path.read_text(encoding="utf-8"))
         if "plaintext_bundle" in plan:
             bundle = Path(str(path).removesuffix(".runtime-plan.json") + ".bundle")

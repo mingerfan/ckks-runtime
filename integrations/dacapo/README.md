@@ -20,7 +20,7 @@ nix develop --command cmake --build --preset nix
 nix develop --command ctest --test-dir build/nix --output-on-failure
 ```
 
-`emit-runtime-plan` 输出 RuntimePlan V1，文件名是 `<prefix>.<func>.runtime-plan.json`。Dacapo 的 CKKS MLIR 使用纯 SSA result-style，不再生成 `dst` 和 `tensor.empty`。target、OperatorSpec 引用和 context 必须通过 Pass option 明确提供。Encode payload 默认以 4096 字节为界：不超过阈值的常量内联到 JSON，超过阈值的 float64 常量写入 `<prefix>.<func>.bundle/`；相同内容按 SHA-256 复用同一个 blob。
+`emit-runtime-plan` 默认输出 RuntimePlan V1；开启内存规划后输出 V2，文件名是 `<prefix>.<func>.runtime-plan.json`。Dacapo 的 CKKS MLIR 使用纯 SSA result-style，不再生成 `dst` 和 `tensor.empty`。target、OperatorSpec 引用和 context 必须通过 Pass option 明确提供。Encode payload 默认以 4096 字节为界：不超过阈值的常量内联到 JSON，超过阈值的 float64 常量写入 `<prefix>.<func>.bundle/`；相同内容按 SHA-256 复用同一个 blob。
 
 当 OperatorSpec 声明 `rescale_mode=lazy` 时，生成脚本会在 Earth→CKKS 之后、placement 之前自动加入 `materialize-ckks-physical-levels`。默认一个逻辑 level 展开为 4 个物理 RNS level，可用 `--lazy-rescale-level-factor` 显式调整。Pass 使用目标 spec 的 `levels.upper_bound` 作为物理起始 level，并检查每条 Rescale 的 scale 降幅是否等于被丢弃模数的 bit 数之和；因此 Poseidon GPU 的 Dacapo compiler profile 必须把 `rescalingFactor` 设为 120，目标 OperatorSpec 必须记录真实的 30-bit 模数链并允许一次 Rescale 至少下降 4 层。只改 JSON writer 或只把 profile 标成 lazy 都不够。
 
@@ -206,3 +206,36 @@ build/dacapo_plan_vec_diff \
   third_party/dacapo/review_artifacts/mlp/2x8/mlp.optimized._hecate_MLP.bundle \
   third_party/dacapo/review_artifacts/mlp/2x8/vec.diff.txt
 ```
+
+
+### 自动释放、原位计算和内存报告
+
+在模型生成命令中加入 `--runtime-plan-memory --runtime-plan-memory-report`，
+编译器会在设备分配和通信插入之后规划内存，再估算并导出。生成的 V2 计划
+包含 `Release` 和安全的 `reuse_input=0`。GPU 支持 AddCP、Rotate；CPU 支持
+Negate、Rotate。只有同处、类型相同、仅一次使用且非最终输出的内部计算结果
+可以被覆盖。GPU SubCP 通过手写计划调用，不新增 MLIR 数学算子。
+
+`--runtime-plan-memory-no-reuse` 只插 Release，用于分开比较释放和原位的收益。
+只加 `--runtime-plan-memory-report` 则分析原有 IR，仍导出 V1。
+`hecate-opt` 的对应开关为 `--runtime-plan-memory-reuse=false`。
+
+报告文件为 `<prefix>.<func>.memory.json`。同时规划和报告时，还会生成
+`.memory.before.json`，来自通信插入后、内存规划前的实际 IR。各 rank 的 Host
+和每张 GPU 分别报告峰值、对应阶段/指令、明文/密文分项、最大的五个对象，
+以及不同对象块的累计分配量。ValueId 和指令编号与导出的计划一致。
+
+已有 CKKS/Dist IR 可以直接运行：
+
+```text
+-p='builtin.module(func.func(plan-runtime-memory,estimate-runtime-memory{prefix=/tmp/model operator-spec=/path/to/operator-spec.json},emit-runtime-plan{...}))'
+```
+
+内存 Pass 不允许重复运行；其后只接只读估算和导出，不再优化或重排操作。
+估算器不修改 IR，也不会猜测额外的释放。公式使用实际 RNS 层级，Host 按
+8 字节、GPU 按 4 字节计算每个系数。外部输入按调用方始终持有计入。
+
+报告假设每条操作完成后才执行下一条。它只估算计划里的明文/密文，不包含
+密钥、参数表、Rotate/Boot 工作区、传输暂存、编码缓存及内存池保留空间。
+多卡峰值不能相加作为同时发生的总峰值，也不能据此保证并行运行一定不超显存。
+不同对象块的分配总量也不是整个进程的显存上限。
