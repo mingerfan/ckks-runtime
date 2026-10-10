@@ -2,6 +2,8 @@
 
 > **状态：V1 已冻结。** bundle 保存 Encode 前的小端 float64 slot 数组，不保存 CKKS 明文对象。
 
+新导出器默认使用[存储 V2 的单文件 pack](../v2/plaintext-bundle.md)。当前 reader 同时支持 V1 与 V2；需要旧文件布局时显式选择 `bundle-format=files`。
+
 目录结构：
 
 ```text

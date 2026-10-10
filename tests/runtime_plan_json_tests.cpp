@@ -2,11 +2,13 @@
 #include "runtime/json_utils.hpp"
 #include "runtime/operator_spec_reader.hpp"
 #include "runtime/plaintext_bundle.hpp"
+#include "testing/testing.hpp"
 #include "runtime/utils/sha256.hpp"
 #include "runtime/verifier.hpp"
 
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <cmath>
 #include <functional>
 #include <iostream>
@@ -502,6 +504,112 @@ void test_rank_local_bundle_loading() {
     std::filesystem::remove_all(temp);
 }
 
+void test_packed_bundle() {
+    using Json = json_utils::Json;
+    const auto source = source_dir / "docs/runtime-plan/v1/testdata/bundles/v005-demo";
+    const auto original = Json::parse(json_utils::read_file_bytes((source / "manifest.json").string()));
+    const auto temp = std::filesystem::temp_directory_path() / "ckks-runtime-packed-bundle-test";
+    std::filesystem::remove_all(temp);
+    std::filesystem::create_directory(temp);
+    Json manifest{{"bundle_format_version", 2}, {"bundle_id", original.at("bundle_id")},
+                  {"version", 1}, {"blobs", Json::array()}};
+    std::string packed;
+    std::vector<std::string> contents;
+    std::vector<std::vector<double>> expected;
+    PlaintextBundleRef old_ref{original.at("bundle_id"), 1,
+        json_utils::source_sha256(json_utils::read_file_bytes((source / "manifest.json").string()))};
+    auto legacy = PlaintextBundleLoader::open(source, old_ref, {}, 16384, false);
+    for (const auto &entry : original.at("blobs")) {
+        const auto content = entry.at("content").get<std::string>();
+        const auto bytes = json_utils::read_file_bytes((source / "data" / (content.substr(7) + ".bin")).string());
+        manifest["blobs"].push_back({{"content", content}, {"byte_length", bytes.size()}, {"offset", packed.size()}});
+        packed += bytes;
+        contents.push_back(content);
+        expected.push_back(legacy.read(content));
+    }
+    manifest["pack_byte_length"] = packed.size();
+    // Record order is independent of pack offset order and root version order.
+    std::reverse(manifest["blobs"].begin(), manifest["blobs"].end());
+    const auto write_pack = [&](const std::string &bytes) {
+        std::ofstream out(temp / "data.bin", std::ios::binary | std::ios::trunc);
+        out.write(bytes.data(), bytes.size());
+    };
+    PlaintextBundleRef reference{original.at("bundle_id"), 1, {}};
+    const auto write_manifest = [&](const Json &value) {
+        const auto bytes = value.dump();
+        std::ofstream out(temp / "manifest.json", std::ios::binary | std::ios::trunc);
+        out << bytes;
+        reference.manifest_sha256 = json_utils::source_sha256(bytes);
+    };
+    write_pack(packed);
+    write_manifest(manifest);
+    for (std::uint64_t budget : {std::uint64_t(0), std::uint64_t(packed.size())}) {
+        auto index = PlaintextBundleLoader::open(temp, reference, contents, 16384, false, {budget});
+        require(index.resident_bytes() == budget, "resident raw byte accounting is incorrect");
+        std::vector<std::future<void>> readers;
+        for (int thread = 0; thread < 4; ++thread)
+            readers.push_back(std::async(std::launch::async, [&, copy = index] {
+                for (int round = 0; round < 20; ++round)
+                    for (std::size_t i = 0; i < contents.size(); ++i)
+                        require(copy.read(contents[i]) == expected[i], "concurrent offset read changed values");
+            }));
+        for (auto &reader : readers) reader.get();
+        const auto loaded = PlaintextBundleLoader::load(temp, reference, contents, 16384, false, {budget});
+        require(loaded.slots_by_content.at(contents[0]) == expected[0], "eager pack load changed values");
+    }
+    expect_throw([&] { PlaintextBundleLoader::open(temp, reference, {}, 16384, false, {packed.size() - 1}); }, "resident byte budget");
+    expect_throw([&] { PlaintextBundleLoader::open(source, old_ref, {}, 16384, false, {packed.size()}); }, "requires packed");
+    for (int failure = 0; failure < 7; ++failure) {
+        auto bad = manifest;
+        if (failure == 0) bad["blobs"][0].erase("offset");
+        if (failure == 1) bad["blobs"][0]["offset"] = (1ULL << 53) - 1;
+        if (failure == 2) bad["blobs"][0]["offset"] = 1;
+        if (failure == 3) bad["blobs"][0]["offset"] = bad["blobs"][1]["offset"];
+        if (failure == 4) bad["pack_byte_length"] = packed.size() + 8;
+        if (failure == 5) bad["bundle_format_version"] = 1;
+        if (failure == 6) bad["bundle_format_version"] = 3;
+        write_manifest(bad);
+        expect_throw([&] { PlaintextBundleLoader::open(temp, reference, {}, 16384, false); });
+    }
+    write_manifest(manifest);
+    write_pack(packed.substr(0, packed.size() - 1));
+    expect_throw([&] { PlaintextBundleLoader::open(temp, reference, {}, 16384, false); }, "pack byte length mismatch");
+    write_pack(packed + "extra");
+    expect_throw([&] { PlaintextBundleLoader::open(temp, reference, {}, 16384, false); }, "pack byte length mismatch");
+    write_pack(packed);
+    auto resident = PlaintextBundleLoader::open(temp, reference, {}, 16384, false, {packed.size()});
+    std::filesystem::remove(temp / "data.bin");
+    require(resident.read(contents[0]) == expected[0], "resident access reopened the data file");
+    write_pack(packed);
+    auto corrupt = packed;
+    corrupt[0] ^= 1;
+    write_pack(corrupt);
+    auto index = PlaintextBundleLoader::open(temp, reference, {}, 16384, false);
+    expect_throw([&] { index.read(contents[0]); }, "content SHA-256 mismatch");
+    index = {};
+    write_pack(packed);
+    // Exercise V3 online Encode through RuntimeResources, including two runs
+    // with different load modes and accounting separate from decoded slots.
+    auto plan = RuntimePlanJsonReader::read_file(testdata("valid", "v005_bundle_reuse.json").string()).plan;
+    plan.format_version = 3;
+    plan.execution = std::move(plan.initialization);
+    plan.initialization.clear();
+    plan.execution.push_back({2, FenceOp{}});
+    plan.plaintext_bundle = reference;
+    const auto spec = load_spec(plan);
+    LoadedRuntimePlan loaded_plan{std::move(plan), "sha256:" + std::string(64, '0')};
+    for (std::uint64_t budget : {std::uint64_t(0), std::uint64_t(packed.size())}) {
+        auto cluster = std::make_shared<MockCluster>(MockClusterConfig{});
+        MockVecApi api(0, cluster);
+        SequentialRuntime<MockVecApi> runtime(0, 1, 1, api);
+        const auto result = runtime.run(loaded_plan, RuntimeResources{spec, temp, false, {budget}}, {});
+        require(result.timing.bundle_resident_bytes == budget, "runtime omitted resident pack bytes");
+        require(result.timing.encode_calls == 2 && result.timing.fence_calls == 1, "pack changed V3 scheduling");
+        require(result.values.size() == 2, "pack lost final outputs");
+    }
+    std::filesystem::remove_all(temp);
+}
+
 } // namespace
 
 int main() {
@@ -514,6 +622,7 @@ int main() {
         run_test("strict SAX container parsing", test_strict_sax_containers);
         run_test("Dacapo OperatorSpec V2 profiles", test_dacapo_operator_spec_v2_profiles);
         run_test("rank-local bundle loading", test_rank_local_bundle_loading);
+        run_test("packed bundle offsets, residency and V3 execution", test_packed_bundle);
         std::cout << "ALL " << tests_run << " JSON TEST GROUPS PASSED\n";
         return 0;
     } catch (const std::exception &error) {

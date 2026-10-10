@@ -69,6 +69,7 @@ struct RuntimeResources {
     const LoadedOperatorSpec &operator_spec;
     std::optional<std::filesystem::path> plaintext_bundle_dir;
     bool skip_artifact_digest_checks = false;
+    BundleReadOptions plaintext_bundle_options{};
 };
 
 template <class Value>
@@ -79,6 +80,7 @@ struct RuntimeTiming {
     std::size_t encode_calls = 0, bundle_read_calls = 0, fence_calls = 0;
     std::uint64_t encode_nanoseconds = 0, bundle_read_nanoseconds = 0;
     std::uint64_t bundle_read_bytes = 0, raw_peak_bytes = 0, fence_nanoseconds = 0;
+    std::uint64_t bundle_resident_bytes = 0, bundle_resident_load_nanoseconds = 0;
     std::size_t compute_calls = 0;
     std::size_t boot_calls = 0;
     std::uint64_t compute_including_boot_nanoseconds = 0;
@@ -464,14 +466,16 @@ private:
             bundle_index_ = PlaintextBundleLoader::open(*resources.plaintext_bundle_dir,
                 *plan_->plaintext_bundle, local_contents,
                 resources.operator_spec.spec.poly_degree / 2,
-                resources.skip_artifact_digest_checks);
+                resources.skip_artifact_digest_checks, resources.plaintext_bundle_options);
+            timing_.bundle_resident_bytes = bundle_index_->resident_bytes();
+            timing_.bundle_resident_load_nanoseconds = static_cast<std::uint64_t>(bundle_index_->resident_load_seconds() * 1e9);
             return;
         }
         auto bundle = PlaintextBundleLoader::load(*resources.plaintext_bundle_dir,
                                                    *plan_->plaintext_bundle,
                                                    local_contents,
                                                    resources.operator_spec.spec.poly_degree / 2,
-                                                   resources.skip_artifact_digest_checks);
+                                                   resources.skip_artifact_digest_checks, resources.plaintext_bundle_options);
         bundle_slots_ = std::move(bundle.slots_by_content);
     }
 

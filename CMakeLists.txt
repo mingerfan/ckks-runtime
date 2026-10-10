@@ -92,6 +92,9 @@ endif()
 
 if(CKKS_RUNTIME_BUILD_TESTS)
     enable_testing()
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(NAME pack_plaintext_bundle_tests
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/pack_plaintext_bundle_tests.py)
 
     add_executable(runtime_tests tests/runtime_tests.cpp)
     target_link_libraries(runtime_tests
@@ -103,7 +106,7 @@ if(CKKS_RUNTIME_BUILD_TESTS)
 
     add_executable(runtime_plan_json_tests tests/runtime_plan_json_tests.cpp)
     target_link_libraries(runtime_plan_json_tests
-        PRIVATE ckks_runtime_plan_json)
+        PRIVATE ckks_runtime_plan_json ckks_runtime_test_support)
     target_compile_definitions(runtime_plan_json_tests
         PRIVATE CKKS_RUNTIME_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     ckks_runtime_enable_warnings(runtime_plan_json_tests)
@@ -130,6 +133,9 @@ endif()
 
 if(CKKS_RUNTIME_BUILD_EXPERIMENTS)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(runtime_bundle_io_benchmark tools/runtime_bundle_io_benchmark.cpp)
+        target_link_libraries(runtime_bundle_io_benchmark PRIVATE ckks_runtime_core)
+        ckks_runtime_enable_warnings(runtime_bundle_io_benchmark)
         add_executable(runtime_plan_io_benchmark tools/runtime_plan_io_benchmark.cpp)
         target_link_libraries(runtime_plan_io_benchmark PRIVATE ckks_runtime_plan_json)
         ckks_runtime_enable_warnings(runtime_plan_io_benchmark)

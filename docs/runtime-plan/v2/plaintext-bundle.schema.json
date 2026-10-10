@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ckks-runtime/runtime-plan/v2/plaintext-bundle.schema.json",
+  "title": "Packed plaintext bundle storage V2 (independent of RuntimePlan version)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "bundle_format_version",
+    "bundle_id",
+    "version",
+    "blobs",
+    "pack_byte_length"
+  ],
+  "properties": {
+    "bundle_format_version": {
+      "const": 2
+    },
+    "bundle_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "blobs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "content",
+          "byte_length",
+          "offset"
+        ],
+        "properties": {
+          "content": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          },
+          "byte_length": {
+            "type": "integer",
+            "minimum": 8,
+            "maximum": 9007199254740991,
+            "multipleOf": 8
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "multipleOf": 8
+          }
+        }
+      }
+    },
+    "pack_byte_length": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991,
+      "multipleOf": 8
+    }
+  }
+}
