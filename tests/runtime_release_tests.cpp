@@ -327,6 +327,46 @@ void test_streaming(bool parallel, bool deferred, bool fail_encode = false) {
     }
 }
 
+void test_streaming_scale(bool parallel) {
+    auto built = split_plan();
+    auto &plan = built.plan;
+    built.operator_spec.spec.poly_degree = 16;
+    plan.format_version = 3;
+    plan.values = {value(1, ValueKind::Ciphertext, host())};
+    plan.initialization.clear(); plan.execution.clear();
+    constexpr ValueId count = 20000, batch_size = 32;
+    for (ValueId step = 0; step < count; ++step) {
+        Place source = step % 2 ? device(1) : host();
+        Place destination = step % 2 ? host() : device(1);
+        plan.values.push_back(value(step + 2, ValueKind::Ciphertext, destination));
+        plan.execution.push_back({0, transfer(step, step + 1, step + 2, source, destination)});
+        plan.execution.push_back({0, ReleaseOp{step + 1}});
+        if ((step + 1) % batch_size == 0) plan.execution.push_back({0, FenceOp{}});
+    }
+    plan.final_outputs = {count + 1};
+    renumber(plan);
+    TrackingApi api;
+    api.defer_outputs = true;
+    ValueId drains = 0;
+    api.on_drain = [&] {
+        if (drains < count / batch_size) {
+            const auto first = drains * batch_size + 2;
+            for (ValueId id = first; id < first + batch_size - 1; ++id)
+                require(api.expired(id), "scale test retained a completed batch output");
+        }
+        ++drains;
+    };
+    api.before_communication = [&](const CommAction &action) {
+        require(drains == action.id / batch_size, "scale test crossed Fence early");
+    };
+    auto input = api.observe(1, make_cipher(std::vector<double>(8, 2.0), "ctx", 16, 3, 1));
+    SequentialRuntime<TrackingApi> runtime(0, 1, 3, api,
+        parallel ? DeviceExecutionMode::PerDeviceWorkers : DeviceExecutionMode::Sequential);
+    auto result = runtime.run({plan, "sha256:test"}, {built.operator_spec, {}, false}, {{1, input}});
+    compare_values(*result.values.at(count + 1).value, *input);
+    require(drains == count / batch_size + 1, "scale test missed a Fence");
+}
+
 } // namespace
 
 int main() {
@@ -337,6 +377,9 @@ int main() {
                 test_streaming(parallel, deferred, true);
             }
         std::cout << "[PASS] V3 streaming, Fence reclamation, deferred outputs and CPU failure\n";
+        test_streaming_scale(false);
+        test_streaming_scale(true);
+        std::cout << "[PASS] 20000 transfers and 625 Fence boundaries in each execution mode\n";
         test_cross_phase_and_repeated_operands();
         std::cout << "[PASS] cross-phase counts, repeated operands and repeated runs\n";
         test_split_release(false);
@@ -348,7 +391,7 @@ int main() {
         std::cout << "[PASS] abandoned posted/pending outputs in both execution modes\n";
         test_mock_multirank_release();
         std::cout << "[PASS] Mock multi-device and multi-rank Release fanout\n";
-        std::cout << "ALL 6 RELEASE TEST GROUPS PASSED\n";
+        std::cout << "ALL 7 RELEASE TEST GROUPS PASSED\n";
         return 0;
     } catch (const std::exception &error) {
         std::cerr << "[FAIL] " << error.what() << '\n';
