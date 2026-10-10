@@ -116,6 +116,8 @@ void RuntimePlan::print(std::ostream &out) const {
                 out << ") @ " << to_string(op->place);
                 if (op->reuse_input) out << " reuse_input=" << *op->reuse_input;
                 out << '\n';
+            } else if (std::holds_alternative<FenceOp>(inst.body)) {
+                out << "Fence\n";
             } else if (const auto *release = std::get_if<ReleaseOp>(&inst.body)) {
                 out << "Release(%" << release->value << ")\n";
             } else {

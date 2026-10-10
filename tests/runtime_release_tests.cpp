@@ -26,6 +26,7 @@ public:
     std::function<void(const CommAction &)> before_communication;
     std::function<void()> on_collect, on_drain;
     bool defer_outputs = false;
+    std::function<void(ValueId)> before_encode;
 
     std::string name() const { return "TrackingApi"; }
     Value observe(ValueId id, VecValue value) {
@@ -39,6 +40,7 @@ public:
         return observed_.at(id).expired();
     }
     Value encode_plaintext(const ValueDesc &desc, const std::vector<double> &slots) {
+        if (before_encode) before_encode(desc.id);
         return observe(desc.id, inner->encode_plaintext(desc, slots));
     }
     Value compute(const ComputeOp &op, const std::vector<Value> &inputs) {
@@ -264,10 +266,77 @@ void test_mock_multirank_release() {
     }
 }
 
+void test_streaming(bool parallel, bool deferred, bool fail_encode = false) {
+    auto built = split_plan();
+    auto &plan = built.plan;
+    plan.format_version = 3;
+    plan.values = {value(1, ValueKind::Ciphertext, host()),
+                   value(2, ValueKind::Ciphertext, device(1))};
+    plan.initialization = {{0, transfer(100, 1, 2, host(), device(1))}};
+    plan.execution.clear();
+    ValueId input = 2;
+    for (int batch = 0; batch < 3; ++batch) {
+        ValueId weight = 10 + batch * 3, uploaded = weight + 1, output = weight + 2;
+        plan.values.push_back(value(weight, ValueKind::Plaintext, host()));
+        plan.values.push_back(value(uploaded, ValueKind::Plaintext, device(1)));
+        plan.values.push_back(value(output, ValueKind::Ciphertext, device(1)));
+        plan.execution.push_back({0, EncodeOp{InlineEncodePayload{{2, 3, 4, 5}}, weight}});
+        auto upload = transfer(200 + batch, weight, uploaded, host(), device(1));
+        upload.output_types = {ValueKind::Plaintext};
+        plan.execution.push_back({0, upload});
+        plan.execution.push_back({0, ReleaseOp{weight}});
+        plan.execution.push_back({0, ComputeOp{ComputeKind::AddCP, {input, uploaded}, output, device(1), {}}});
+        plan.execution.push_back({0, ReleaseOp{uploaded}});
+        plan.execution.push_back({0, ReleaseOp{input}});
+        plan.execution.push_back({0, FenceOp{}});
+        input = output;
+    }
+    plan.final_outputs = {input};
+    renumber(plan);
+    TrackingApi api;
+    api.defer_outputs = deferred;
+    int drains = 0;
+    api.on_drain = [&] {
+        if (drains < 3) {
+            require(api.expired(10 + drains * 3), "Fence retained host encoding");
+            require(api.expired(11 + drains * 3), "Fence retained uploaded weight");
+        }
+        ++drains;
+    };
+    api.before_encode = [&](ValueId id) {
+        if (id == 13 && fail_encode) throw std::runtime_error("injected Encode failure");
+        require(drains == int((id - 10) / 3), "Encode crossed unfinished Fence");
+    };
+    auto external = api.observe(1, make_cipher(slots({1, 2, 3, 4}), "ctx", 8192, 3, 1));
+    SequentialRuntime<TrackingApi> runtime(0, 1, 3, api,
+        parallel ? DeviceExecutionMode::PerDeviceWorkers : DeviceExecutionMode::Sequential);
+    try {
+        auto result = runtime.run({plan, "sha256:test"}, {built.operator_spec, {}, false}, {{1, external}});
+        require(!fail_encode, "expected Encode failure");
+        compare_values(*result.values.at(input).value, make_cipher(slots({7, 11, 15, 19}), "ctx", 8192, 3, 1));
+        require(drains == 4, "missing Fence or final drain");
+    } catch (const ClusterPanic &error) {
+        require(fail_encode && std::string(error.what()).find("injected Encode failure") != std::string::npos,
+                "wrong streaming failure");
+    }
+    for (int version : {1, 2}) {
+        plan.format_version = version;
+        try { PlanVerifier::verify(plan, built.operator_spec); }
+        catch (const std::exception &) { continue; }
+        throw std::runtime_error("old version accepted online Encode");
+    }
+}
+
 } // namespace
 
 int main() {
     try {
+        for (bool parallel : {false, true})
+            for (bool deferred : {false, true}) {
+                test_streaming(parallel, deferred);
+                test_streaming(parallel, deferred, true);
+            }
+        std::cout << "[PASS] V3 streaming, Fence reclamation, deferred outputs and CPU failure\n";
         test_cross_phase_and_repeated_operands();
         std::cout << "[PASS] cross-phase counts, repeated operands and repeated runs\n";
         test_split_release(false);

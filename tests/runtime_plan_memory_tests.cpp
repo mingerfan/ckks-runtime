@@ -117,7 +117,18 @@ void test_versions_and_strict_fields() {
     remove_release(plan, "1");
     remove_release(plan, "2");
     expect_throw([&] { read(plan); }, "reuse_input requires format version 2");
-    plan["format_version"] = 3;
+    auto v3 = fixture();
+    v3["format_version"] = 3;
+    v3["execution"].push_back({{"kind", "fence"}, {"ordinal", 0}});
+    renumber(v3);
+    auto valid = read(v3);
+    PlanVerifier::verify(valid.plan, load_spec(valid.plan));
+    v3["execution"].back()["output"] = "99";
+    expect_throw([&] { read(v3); }, "unknown field");
+    v3["execution"].back().erase("output");
+    v3["format_version"] = 2;
+    expect_throw([&] { read(v3); }, "Fence requires format version 3");
+    plan["format_version"] = 4;
     expect_throw([&] { read(plan); }, "unsupported format version");
     for (const Json &index : {Json(-1), Json(0.0), Json("0"), Json(true), Json(nullptr), Json(2147483648ULL)}) {
         auto invalid = fixture();

@@ -87,7 +87,9 @@ struct ReleaseOp {
     ValueId value = 0;
 };
 
-using InstructionBody = std::variant<EncodeOp, ComputeOp, CommAction, ReleaseOp>;
+struct FenceOp {};
+
+using InstructionBody = std::variant<EncodeOp, ComputeOp, CommAction, ReleaseOp, FenceOp>;
 
 struct Instruction {
     std::size_t ordinal = 0;

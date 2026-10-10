@@ -241,6 +241,11 @@ Instruction read_instruction(const Json &value, const std::string &path, std::ui
     if (!value.is_object() || !value.contains("kind")) fail(doc, path, "missing required field 'kind'");
     const std::string kind = read_string(value.at("kind"), doc, path + ".kind");
     if (kind == "encode") return read_encode(value, path);
+    if (kind == "fence") {
+        if (version < 3) fail(doc, path + ".kind", "Fence requires format version 3");
+        require_members(value, doc, path, {"ordinal", "kind"});
+        return {read_id(value.at("ordinal"), doc, path + ".ordinal"), FenceOp{}};
+    }
     if (kind == "compute") return read_compute(value, path, version);
     if (kind == "transfer") return read_comm(value, path, CommKind::Transfer);
     if (kind == "replicate") return read_comm(value, path, CommKind::Replicate);
@@ -268,7 +273,7 @@ RuntimePlan read_document(const Json &root) {
                     {"plaintext_bundle"});
     RuntimePlan plan;
     plan.format_version = static_cast<std::uint32_t>(read_nonnegative_int(root.at("format_version"), doc, "$.format_version"));
-    if (plan.format_version != 1 && plan.format_version != 2)
+    if (plan.format_version != 1 && plan.format_version != 2 && plan.format_version != 3)
         fail(doc, "$.format_version", "unsupported format version");
     plan.plan_id = read_id(root.at("plan_id"), doc, "$.plan_id");
     plan.target = read_target(root.at("target"), "$.target");

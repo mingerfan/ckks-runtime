@@ -152,6 +152,9 @@ public:
         uses_.clear();
         reset_parallel_execution_state();
         bundle_slots_.clear();
+        bundle_index_.reset();
+        descriptors_.clear();
+        for (const auto &value : plan_->values) descriptors_.emplace(value.id, &value);
         return_all_values_ = diff_mode == DiffMode::AllValuesAfterRun;
         timing_ = RuntimeTiming{};
         ThreadTrace::set_thread_name("rank-" + std::to_string(rank_) + "-main");
@@ -331,7 +334,8 @@ private:
     using ParallelTask = std::function<void()>;
 
     const ValueDesc &desc(ValueId id) const {
-        for (const auto &value : plan_->values) if (value.id == id) return value;
+        auto found = descriptors_.find(id);
+        if (found != descriptors_.end()) return *found->second;
         throw std::runtime_error("missing value descriptor for " + std::to_string(id));
     }
 
@@ -446,11 +450,19 @@ private:
         if (!resources.plaintext_bundle_dir)
             throw std::runtime_error("RuntimePlan requires a plaintext bundle directory");
         std::vector<std::string> local_contents;
-        for (const auto &instruction : plan_->initialization) {
+        for (const auto *phase : {&plan_->initialization, &plan_->execution})
+        for (const auto &instruction : *phase) {
             const auto *encode = std::get_if<EncodeOp>(&instruction.body);
             if (!encode || desc(encode->output).place.rank != rank_) continue;
             if (const auto *payload = std::get_if<BundleEncodePayload>(&encode->payload))
                 local_contents.push_back(payload->content);
+        }
+        if (plan_->format_version == 3) {
+            bundle_index_ = PlaintextBundleLoader::open(*resources.plaintext_bundle_dir,
+                *plan_->plaintext_bundle, local_contents,
+                resources.operator_spec.spec.poly_degree / 2,
+                resources.skip_artifact_digest_checks);
+            return;
         }
         auto bundle = PlaintextBundleLoader::load(*resources.plaintext_bundle_dir,
                                                    *plan_->plaintext_bundle,
@@ -480,26 +492,44 @@ private:
             if (const auto *encode = std::get_if<EncodeOp>(&instruction.body)) execute_encode(*encode);
             else if (const auto *op = std::get_if<ComputeOp>(&instruction.body)) execute_compute(*op);
             else if (const auto *action = std::get_if<CommAction>(&instruction.body)) execute_communication(*action);
+            else if (std::holds_alternative<FenceOp>(instruction.body)) execute_fence();
             else execute_release(std::get<ReleaseOp>(instruction.body).value,
                                  instruction.ordinal, false);
         }
         current_ = nullptr;
     }
 
-    void execute_encode(const EncodeOp &op) {
+    Value encode_value(const EncodeOp &op) {
         const auto &output_desc = desc(op.output);
-        if (output_desc.place.rank != rank_) return;
+        const auto start = std::chrono::steady_clock::now();
         std::vector<double> slots;
         if (const auto *inline_payload = std::get_if<InlineEncodePayload>(&op.payload))
             slots = inline_payload->values;
         else {
             const auto &content = std::get<BundleEncodePayload>(op.payload).content;
-            slots = bundle_slots_.at(content);
+            slots = bundle_index_ ? bundle_index_->read(content) : bundle_slots_.at(content);
         }
         for (double &value : slots) if (value == 0.0) value = 0.0;
         Value output = api_.encode_plaintext(output_desc, slots);
         api_.validate_value(output, output_desc);
-        store_.define_ready(op.output, output_desc.place, std::move(output));
+        trace_event("encode", op.output, 0, std::nullopt, "Encode",
+                    elapsed_nanoseconds(start, std::chrono::steady_clock::now()));
+        return output;
+    }
+
+    void execute_encode(const EncodeOp &op) {
+        const auto &output_desc = desc(op.output);
+        if (output_desc.place.rank != rank_) return;
+        store_.define_ready(op.output, output_desc.place, encode_value(op));
+    }
+
+    void execute_fence() {
+        const auto start = std::chrono::steady_clock::now();
+        finish_all_groups();
+        api_.drain();
+        trace_event("fence", 0, current_ ? current_->ordinal : 0,
+                    std::nullopt, "Fence",
+                    elapsed_nanoseconds(start, std::chrono::steady_clock::now()));
     }
 
     Value &ensure_ready(ValueId id, const Place &expected_place) {
@@ -1037,32 +1067,48 @@ private:
 
     void compile_parallel_phase(
         const std::vector<Instruction> &instructions,
-        std::vector<std::vector<ParallelTask>> &tasks) {
-        for (const auto &instruction : instructions) {
+        std::vector<std::vector<ParallelTask>> &tasks,
+        std::size_t begin, std::size_t end) {
+        for (std::size_t i = begin; i < end; ++i) {
+            const auto &instruction = instructions[i];
             if (const auto *op = std::get_if<ComputeOp>(&instruction.body)) {
                 if (op->place.rank != rank_) continue;
-                if (op->place.kind != PlaceKind::Device ||
-                    op->place.index < 0 || op->place.index >= local_devices_)
+                if (op->place.kind == PlaceKind::Host && plan_->format_version < 3)
+                    throw std::runtime_error("per-device worker Host compute requires V3");
+                if (op->place.kind == PlaceKind::Device &&
+                    (op->place.index < 0 || op->place.index >= local_devices_))
                     throw std::runtime_error(
                         "per-device worker execution requires Device compute operations");
                 auto output = define_parallel_value(
                     op->output, desc(op->output).place);
                 const std::size_t worker =
-                    static_cast<std::size_t>(op->place.index) % tasks.size();
+                    op->place.kind == PlaceKind::Host ? tasks.size() - 1 :
+                    static_cast<std::size_t>(op->place.index) % (tasks.size() - 1);
                 tasks[worker].push_back(
                     [this, op = *op, ordinal = instruction.ordinal, output] {
                         execute_parallel_compute(op, ordinal, output);
                     });
                 continue;
             }
-            if (std::holds_alternative<EncodeOp>(instruction.body))
-                throw std::runtime_error(
-                    "per-device worker execution does not support online Encode");
+            if (const auto *encode = std::get_if<EncodeOp>(&instruction.body)) {
+                if (desc(encode->output).place.rank != rank_) continue;
+                auto output = define_parallel_value(encode->output, desc(encode->output).place);
+                tasks.back().push_back([this, op = *encode, output] {
+                    auto encoded = encode_value(op);
+                    {
+                        ThreadTraceLockGuard lock(output->mutex, "runtime.parallel_value");
+                        if (!can_clear(output->uses)) output->value.emplace(std::move(encoded));
+                        output->defined = true;
+                    }
+                    output->condition.notify_all();
+                });
+                continue;
+            }
             if (const auto *release = std::get_if<ReleaseOp>(&instruction.body)) {
                 const auto &place = desc(release->value).place;
                 if (place.rank != rank_) continue;
                 const std::size_t worker = place.kind == PlaceKind::Device
-                    ? static_cast<std::size_t>(place.index) % tasks.size() : 0;
+                    ? static_cast<std::size_t>(place.index) % (tasks.size() - 1) : tasks.size() - 1;
                 tasks[worker].push_back([this, id = release->value, ordinal = instruction.ordinal] {
                     execute_release(id, ordinal, true);
                 });
@@ -1098,7 +1144,7 @@ private:
                     local, instruction.ordinal, false);
                 const int device = local_communication_worker(local);
                 const std::size_t worker =
-                    static_cast<std::size_t>(device) % tasks.size();
+                    static_cast<std::size_t>(device) % (tasks.size() - 1);
                 tasks[worker].push_back(
                     [this, local = std::move(local),
                      ordinal = instruction.ordinal, group] {
@@ -1119,11 +1165,29 @@ private:
             worker_count > static_cast<std::size_t>(local_devices_))
             throw std::runtime_error(
                 "device worker count must be between one and local device count");
-        std::vector<std::vector<ParallelTask>> tasks(
-            worker_count);
-        compile_parallel_phase(plan_->execution, tasks);
-        compile_parallel_phase(plan_->finalization, tasks);
+        for (const auto *phase : {&plan_->execution, &plan_->finalization}) {
+            std::size_t begin = 0;
+            for (std::size_t end = 0; end <= phase->size(); ++end) {
+                if (end != phase->size() && !std::holds_alternative<FenceOp>((*phase)[end].body)) continue;
+                std::vector<std::vector<ParallelTask>> tasks(worker_count + 1);
+                compile_parallel_phase(*phase, tasks, begin, end);
+                run_parallel_batch(tasks);
+                if (end != phase->size()) {
+                    api_.drain();
+                    trace_event("fence", 0, (*phase)[end].ordinal, std::nullopt, "Fence", 0);
+                }
+                begin = end + 1;
+            }
+        }
+        for (ValueId id : plan_->final_outputs) {
+            const auto &output_desc = desc(id);
+            if (output_desc.place.rank != rank_) continue;
+            Value output = resolve_parallel_value(id, output_desc.place, std::nullopt);
+            store_.define_ready(id, output_desc.place, std::move(output));
+        }
+    }
 
+    void run_parallel_batch(std::vector<std::vector<ParallelTask>> &tasks) {
         std::vector<std::thread> workers;
         workers.reserve(tasks.size());
         for (std::size_t device = 0; device < tasks.size(); ++device) {
@@ -1181,17 +1245,14 @@ private:
             if (!group->completed)
                 finish_parallel_group(group, std::nullopt);
 
-        for (ValueId id : plan_->final_outputs) {
-            const auto &output_desc = desc(id);
-            if (output_desc.place.rank != rank_) continue;
-            Value output = resolve_parallel_value(
-                id, output_desc.place, std::nullopt);
-            store_.define_ready(id, output_desc.place, std::move(output));
-        }
+        parallel_groups_.clear();
+        coordinator_groups_.clear();
     }
 
     void finish_all_groups() {
         for (std::size_t i = 0; i < groups_.size(); ++i) finish_group(i);
+        // finish_group replaces every Pending entry before indices are reused.
+        groups_.clear();
     }
 
     void synchronize_final_outputs() {
@@ -1235,6 +1296,8 @@ private:
                 out << " op=Encode output=" << encode->output;
             else if (const auto *op = std::get_if<ComputeOp>(&current_->body))
                 out << " op=" << to_string(op->kind) << " output=" << op->output << " place=" << to_string(op->place);
+            else if (std::holds_alternative<FenceOp>(current_->body))
+                out << " op=Fence";
             else if (const auto *release = std::get_if<ReleaseOp>(&current_->body))
                 out << " op=Release value_id=" << release->value;
             else {
@@ -1259,6 +1322,8 @@ private:
     std::vector<PendingGroup> groups_;
     std::unordered_map<ValueId, ValueUses> uses_;
     std::map<std::string, std::vector<double>> bundle_slots_;
+    std::optional<PlaintextBundleLoader> bundle_index_;
+    std::unordered_map<ValueId, const ValueDesc *> descriptors_;
     std::unordered_map<ValueId, std::shared_ptr<ParallelValue>> parallel_values_;
     std::vector<std::shared_ptr<ParallelGroup>> parallel_groups_;
     std::vector<std::shared_ptr<ParallelGroup>> coordinator_groups_;

@@ -63,34 +63,61 @@ std::vector<double> decode_slots(const std::string &bytes, const std::string &co
 
 } // namespace
 
-LoadedPlaintextBundle PlaintextBundleLoader::load(
-    const std::filesystem::path &directory,
-    const PlaintextBundleRef &reference,
-    const std::vector<std::string> &required_contents,
-    std::size_t slot_capacity,
+PlaintextBundleLoader PlaintextBundleLoader::open(
+    const std::filesystem::path &directory, const PlaintextBundleRef &reference,
+    const std::vector<std::string> &required_contents, std::size_t slot_capacity,
     bool skip_artifact_digest_checks) {
-    const std::string manifest_bytes = json_utils::read_file_bytes((directory / "manifest.json").string());
-    const std::string manifest_digest = json_utils::source_sha256(manifest_bytes);
-    if (!skip_artifact_digest_checks && manifest_digest != reference.manifest_sha256)
+    const auto bytes = json_utils::read_file_bytes((directory / "manifest.json").string());
+    PlaintextBundleLoader result;
+    result.directory_ = directory;
+    result.slot_capacity_ = slot_capacity;
+    result.manifest_digest_ = json_utils::source_sha256(bytes);
+    if (!skip_artifact_digest_checks && result.manifest_digest_ != reference.manifest_sha256)
         throw std::runtime_error("plaintext bundle manifest SHA-256 mismatch");
-    const auto entries = read_manifest(json_utils::parse(manifest_bytes, doc), reference);
-    std::unordered_map<std::string, std::uint64_t> lengths;
-    for (const auto &entry : entries) lengths.emplace(entry.content, entry.byte_length);
-
-    std::set<std::string> unique_required(required_contents.begin(), required_contents.end());
-    LoadedPlaintextBundle result;
-    result.manifest_source_sha256 = manifest_digest;
-    for (const std::string &content : unique_required) {
-        const auto length_it = lengths.find(content);
-        if (length_it == lengths.end()) throw std::runtime_error("bundle content is absent from manifest: " + content);
-        const std::string filename = content.substr(7) + ".bin";
-        const std::string bytes = json_utils::read_file_bytes((directory / "data" / filename).string());
-        if (bytes.size() != length_it->second) throw std::runtime_error("bundle blob byte length mismatch: " + content);
-        if (json_utils::source_sha256(bytes) != content) throw std::runtime_error("bundle blob content SHA-256 mismatch: " + content);
-        auto slots = decode_slots(bytes, content);
-        if (slots.size() > slot_capacity) throw std::runtime_error("bundle blob exceeds CKKS slot capacity: " + content);
-        result.slots_by_content.emplace(content, std::move(slots));
+    for (const auto &entry : read_manifest(json_utils::parse(bytes, doc), reference))
+        result.lengths_.emplace(entry.content, entry.byte_length);
+    for (const auto &content : required_contents) {
+        auto found = result.lengths_.find(content);
+        if (found == result.lengths_.end())
+            throw std::runtime_error("bundle content is absent from manifest: " + content);
+        if (found->second / 8 > slot_capacity)
+            throw std::runtime_error("bundle blob exceeds CKKS slot capacity: " + content);
     }
+    return result;
+}
+
+std::vector<double> PlaintextBundleLoader::read(const std::string &content) const {
+    auto found = lengths_.find(content);
+    if (found == lengths_.end())
+        throw std::runtime_error("bundle content is absent from manifest: " + content);
+    if (found->second / 8 > slot_capacity_)
+        throw std::runtime_error("bundle blob exceeds CKKS slot capacity: " + content);
+    const auto path = directory_ / "data" / (content.substr(7) + ".bin");
+    // Check before allocating: malformed files must not bypass the raw slot bound.
+    std::error_code error;
+    const auto length = std::filesystem::file_size(path, error);
+    if (error) throw std::runtime_error("cannot open file: " + path.string() + ": " + error.message());
+    if (length != found->second)
+        throw std::runtime_error("bundle blob byte length mismatch: " + content);
+    const auto bytes = json_utils::read_file_bytes(path.string());
+    if (bytes.size() != found->second)
+        throw std::runtime_error("bundle blob byte length mismatch: " + content);
+    if (json_utils::source_sha256(bytes) != content)
+        throw std::runtime_error("bundle blob content SHA-256 mismatch: " + content);
+    return decode_slots(bytes, content);
+}
+
+LoadedPlaintextBundle PlaintextBundleLoader::load(
+    const std::filesystem::path &directory, const PlaintextBundleRef &reference,
+    const std::vector<std::string> &required_contents, std::size_t slot_capacity,
+    bool skip_artifact_digest_checks) {
+    auto index = open(directory, reference, required_contents, slot_capacity,
+                      skip_artifact_digest_checks);
+    LoadedPlaintextBundle result;
+    result.manifest_source_sha256 = index.manifest_digest_;
+    for (const auto &content : required_contents)
+        if (!result.slots_by_content.count(content))
+            result.slots_by_content.emplace(content, index.read(content));
     return result;
 }
 

@@ -261,6 +261,8 @@ void test_rank_local_bundle_loading() {
 
     const auto blob_path = temp / "data" / (content.substr(7) + ".bin");
     std::filesystem::remove(blob_path);
+    auto index = PlaintextBundleLoader::open(temp, *loaded.plan.plaintext_bundle, {content}, 16384, false);
+    expect_throw([&] { index.read(content); }, "cannot open file");
     expect_throw([&] { PlaintextBundleLoader::load(temp, *loaded.plan.plaintext_bundle, {content}, 16384, false); }, "cannot open file");
     copy_fixture(bundle / "data" / (content.substr(7) + ".bin"), blob_path);
     {

@@ -170,7 +170,9 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                                       const LoadedOperatorSpec &loaded_spec,
                                       bool skip_artifact_digest_checks) {
     const auto &spec = loaded_spec.spec;
-    if (plan.format_version != 1 && plan.format_version != 2) fail("unsupported format version");
+    if (plan.format_version != 1 && plan.format_version != 2 && plan.format_version != 3) fail("unsupported format version");
+    if (plan.format_version == 3 && plan.target.world_size != 1)
+        fail("RuntimePlan V3 supports one rank only");
     if (spec.format_version != 1 && spec.format_version != 2)
         fail("unsupported OperatorSpec format version");
     if (plan.target.target_id.empty()) fail("target id is empty");
@@ -245,7 +247,9 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
         for (const auto &instruction : list) {
             if (instruction.ordinal != expected_ordinal++) fail("instruction ordinals must be contiguous and stable");
             if (const auto *encode = std::get_if<EncodeOp>(&instruction.body)) {
-                if (phase != Phase::Initialization) fail("Encode is only allowed in initialization");
+                if (phase != Phase::Initialization &&
+                    !(plan.format_version == 3 && phase == Phase::Execution))
+                    fail("Encode is only allowed in initialization (or V3 execution)");
                 const auto &output = lookup(descs, encode->output, "Encode output");
                 mentioned.insert(output.id);
                 if (output.kind != ValueKind::Plaintext || output.place.kind != PlaceKind::Host || output.components != 1)
@@ -362,6 +366,9 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                         fail("communication changes kind or CKKS metadata");
                     if (!defined.insert(output.id).second) fail("duplicate definition of communication output");
                 }
+            } else if (std::holds_alternative<FenceOp>(instruction.body)) {
+                if (plan.format_version < 3) fail("Fence requires format version 3");
+                if (phase != Phase::Execution) fail("Fence is only allowed in execution");
             } else if (const auto *release = std::get_if<ReleaseOp>(&instruction.body)) {
                 const std::string where = "instruction #" + std::to_string(instruction.ordinal) +
                                           " Release ValueId " + std::to_string(release->value);
