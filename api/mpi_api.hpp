@@ -55,6 +55,10 @@ public:
     std::string name() const { return "MpiVecApi"; }
     Value encode_plaintext(const ValueDesc &output_desc, const std::vector<double> &slots);
     Value compute(const ComputeOp &op, const std::vector<Value> &inputs);
+    bool supports_reuse(const ComputeOp &op) const { return VecExecutor::supports_reuse(op); }
+    Value compute_reuse(const ComputeOp &op, Value input, const std::vector<Value> &other_inputs) {
+        return executor_.compute_reuse(op, std::move(input), other_inputs);
+    }
     CommHandle communicate_async(const CommAction &action,
                                  const std::vector<Value> &local_inputs,
                                  const std::vector<ValueDesc> &output_descs);

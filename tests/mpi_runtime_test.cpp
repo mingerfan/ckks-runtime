@@ -31,6 +31,8 @@ int main(int argc, char **argv) {
     const bool inject_digest_mismatch = argc == 2 && std::strcmp(argv[1], "--digest-mismatch") == 0;
     const bool inject_skip_mismatch = argc == 2 && std::strcmp(argv[1], "--skip-mismatch") == 0;
     auto built = make_fanout_plan(std::vector<int>(static_cast<std::size_t>(world), 1));
+    const bool release = argc == 2 && std::strcmp(argv[1], "--release") == 0;
+    if (release) built.plan = with_releases(std::move(built.plan));
     if (inject_large_transfer_id)
         std::get<CommAction>(built.plan.initialization.at(1).body).id = std::numeric_limits<TransferId>::max();
     for (auto &desc : built.plan.values) desc.context = "ctx";
@@ -66,7 +68,7 @@ int main(int argc, char **argv) {
     }
     int global_ok = 0;
     MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-    if (rank == 0) std::printf("MPI runtime end-to-end (%d ranks): %s\n", world, global_ok ? "PASS" : "FAIL");
+    if (rank == 0) std::printf("MPI runtime end-to-end (%d ranks, Release=%d): %s\n", world, release, global_ok ? "PASS" : "FAIL");
     MPI_Finalize();
     return global_ok ? 0 : 1;
 }

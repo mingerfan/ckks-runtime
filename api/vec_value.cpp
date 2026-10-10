@@ -40,6 +40,16 @@ VecPayload VecValue::materialize() const {
 
 VecValue VecValue::deep_copy() const { return ready(materialize()); }
 
+void VecValue::mutate_slots(const std::function<void(std::vector<double> &)> &mutation) {
+    if (!state_) throw std::runtime_error("empty VecValue");
+    std::unique_lock<std::mutex> lock(state_->mutex);
+    state_->cv.wait(lock, [&] { return state_->ready || state_->error; });
+    if (state_->error) std::rethrow_exception(state_->error);
+    if (state_->payload.kind != ValueKind::Ciphertext)
+        throw std::runtime_error("reuse requires a ciphertext");
+    mutation(state_->payload.slots);
+}
+
 void VecValue::fulfill(VecPayload payload) const {
     if (!state_) throw std::runtime_error("empty VecValue");
     if (payload.kind != state_->expected_kind || !(payload.metadata == state_->expected_metadata))

@@ -31,6 +31,9 @@ public:
     VecExecutor &operator=(const VecExecutor &) = delete;
 
     VecValue compute(const ComputeOp &op, const std::vector<VecValue> &inputs);
+    static bool supports_reuse(const ComputeOp &op);
+    VecValue compute_reuse(const ComputeOp &op, VecValue input,
+                           const std::vector<VecValue> &other_inputs);
     void drain();
     void stop();
 

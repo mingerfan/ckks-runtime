@@ -117,6 +117,11 @@ if(CKKS_RUNTIME_BUILD_TESTS)
     ckks_runtime_enable_warnings(runtime_plan_memory_tests)
     add_test(NAME runtime_plan_memory_tests COMMAND runtime_plan_memory_tests)
 
+    add_executable(runtime_release_tests tests/runtime_release_tests.cpp)
+    target_link_libraries(runtime_release_tests PRIVATE ckks_runtime_test_support)
+    ckks_runtime_enable_warnings(runtime_release_tests)
+    add_test(NAME runtime_release_tests COMMAND runtime_release_tests)
+
     add_executable(thread_trace_tests tests/thread_trace_tests.cpp)
     target_link_libraries(thread_trace_tests PRIVATE ckks_runtime_core)
     ckks_runtime_enable_warnings(thread_trace_tests)
@@ -192,5 +197,11 @@ if(CKKS_RUNTIME_BUILD_MPI)
                 $<TARGET_FILE:mpi_runtime_test>
                 ${MPIEXEC_POSTFLAGS}
         )
+        foreach(ranks IN ITEMS 2 4)
+            add_test(NAME mpi_runtime_release_${ranks}
+                COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${ranks}
+                    ${MPIEXEC_PREFLAGS} $<TARGET_FILE:mpi_runtime_test>
+                    --release ${MPIEXEC_POSTFLAGS})
+        endforeach()
     endif()
 endif()

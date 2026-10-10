@@ -4,6 +4,7 @@
 #include "runtime/thread_trace.hpp"
 #include "runtime/verifier.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -49,6 +50,16 @@ struct UsesBackgroundCommunicationIssuer<
     Api, std::void_t<decltype(Api::background_communication_issuer)>>
     : std::bool_constant<Api::background_communication_issuer> {};
 
+template <class Api, class = void>
+struct HasComputeReuse : std::false_type {};
+
+template <class Api>
+struct HasComputeReuse<Api, std::void_t<
+    decltype(std::declval<Api &>().supports_reuse(std::declval<const ComputeOp &>())),
+    decltype(std::declval<Api &>().compute_reuse(std::declval<const ComputeOp &>(),
+        std::declval<typename Api::Value>(),
+        std::declval<const std::vector<typename Api::Value> &>()))>> : std::true_type {};
+
 } // namespace detail
 
 enum class DiffMode { FinalOnly, AllValuesAfterRun };
@@ -93,7 +104,8 @@ public:
     using Value = typename Api::Value;
     struct Ready { Place place; Value value; };
     struct Pending { Place place; std::size_t group; std::size_t local_slot; };
-    using Entry = std::variant<Ready, Pending>;
+    struct Released { Place place; };
+    using Entry = std::variant<Ready, Pending, Released>;
 
     void define_ready(ValueId id, Place place, Value value) {
         if (!entries_.emplace(id, Ready{place, std::move(value)}).second)
@@ -137,6 +149,7 @@ public:
         current_value_.reset();
         store_ = ValueStore<Api>{};
         groups_.clear();
+        uses_.clear();
         reset_parallel_execution_state();
         bundle_slots_.clear();
         return_all_values_ = diff_mode == DiffMode::AllValuesAfterRun;
@@ -154,6 +167,7 @@ public:
                 *plan_, resources.operator_spec, resources.skip_artifact_digest_checks);
             PlanVerifier::verify_runtime_target(*plan_, rank_, world_size_, local_devices_);
             check_memory_instruction_support(diff_mode);
+            count_uses();
             load_bundle(resources);
             api_.preflight(loaded_plan.source_sha256,
                            resources.skip_artifact_digest_checks,
@@ -195,8 +209,6 @@ public:
     }
 
 private:
-    // Release execution and compute_reuse are still pending (steps 3 and 4).
-    // Reject memory instructions before submitting API work.
     void check_memory_instruction_support(DiffMode mode) {
         const auto check_phase = [&](const std::vector<Instruction> &instructions) {
             for (const auto &instruction : instructions) {
@@ -206,8 +218,15 @@ private:
                 current_ = &instruction;
                 if (mode == DiffMode::AllValuesAfterRun)
                     throw std::runtime_error("AllValuesAfterRun is incompatible with Release/reuse_input");
-                throw std::runtime_error(release ? "Release execution is not implemented"
-                                                 : "reuse_input execution is not implemented");
+                if (op && op->reuse_input) {
+                    if constexpr (detail::HasComputeReuse<Api>::value) {
+                        if (!api_.supports_reuse(*op))
+                            throw std::runtime_error("Api does not support reuse_input for " + to_string(op->kind));
+                    } else {
+                        throw std::runtime_error("Api does not support reuse_input");
+                    }
+                }
+                current_ = nullptr;
             }
         };
         check_phase(plan_->initialization);
@@ -276,11 +295,17 @@ private:
 
     struct ParallelGroup;
 
+    struct ValueUses {
+        std::size_t remaining = 0;
+        bool release_requested = false;
+    };
+
     struct ParallelValue {
         Place place;
         std::mutex mutex;
         std::condition_variable condition;
         bool defined = false;
+        ValueUses uses;
         std::optional<Value> value;
         std::shared_ptr<ParallelGroup> group;
     };
@@ -308,6 +333,89 @@ private:
     const ValueDesc &desc(ValueId id) const {
         for (const auto &value : plan_->values) if (value.id == id) return value;
         throw std::runtime_error("missing value descriptor for " + std::to_string(id));
+    }
+
+    void count_uses() {
+        for (const auto &value : plan_->values)
+            if (value.place.rank == rank_) uses_.emplace(value.id, ValueUses{});
+        const auto count_phase = [&](const auto &instructions, bool parallel) {
+            for (const auto &instruction : instructions) {
+                if (const auto *op = std::get_if<ComputeOp>(&instruction.body)) {
+                    if (op->place.rank == rank_)
+                        for (ValueId id : op->inputs) ++uses_.at(id).remaining;
+                } else if (const auto *action = std::get_if<CommAction>(&instruction.body)) {
+                    std::size_t submissions = 1;
+                    if (parallel) {
+                        // Workers post one slice per local destination; the
+                        // communication issuer posts all remote destinations together.
+                        submissions = is_cross_rank_action(*action) ? 1 : 0;
+                        submissions += std::count_if(
+                            action->destinations.begin(), action->destinations.end(),
+                            [this](const Place &place) { return place.rank == rank_; });
+                    }
+                    for (std::size_t i = 0; i < action->inputs.size(); ++i)
+                        if (action->sources[i].rank == rank_)
+                            uses_.at(action->inputs[i]).remaining += submissions;
+                }
+            }
+        };
+        count_phase(plan_->initialization, false);
+        const bool parallel = device_execution_mode_ == DeviceExecutionMode::PerDeviceWorkers;
+        count_phase(plan_->execution, parallel);
+        count_phase(plan_->finalization, parallel);
+    }
+
+    bool can_clear(const ValueUses &uses) const {
+        return uses.release_requested && uses.remaining == 0;
+    }
+
+    void clear_sequential_value(ValueId id) {
+        if (!can_clear(uses_.at(id))) return;
+        auto &entry = store_.lookup(id);
+        if (const auto *ready = std::get_if<typename ValueStore<Api>::Ready>(&entry)) {
+            const auto place = ready->place;
+            entry = typename ValueStore<Api>::Released{place};
+        }
+        // Pending data is discarded when the communication result arrives.
+    }
+
+    void submitted_sequential_uses(const std::vector<ValueId> &ids) {
+        for (ValueId id : ids) {
+            auto &uses = uses_.at(id);
+            if (uses.remaining == 0)
+                throw std::runtime_error("submission count underflow for ValueId " + std::to_string(id));
+            --uses.remaining;
+            clear_sequential_value(id);
+        }
+    }
+
+    void execute_release(ValueId id, std::uint64_t ordinal, bool parallel) {
+        if (desc(id).place.rank != rank_) return;
+        if (parallel) {
+            auto value = parallel_value(id);
+            {
+                ThreadTraceLockGuard lock(value->mutex, "runtime.parallel_value");
+                value->uses.release_requested = true;
+                if (can_clear(value->uses)) value->value.reset();
+            }
+            value->condition.notify_all();
+        } else {
+            uses_.at(id).release_requested = true;
+            clear_sequential_value(id);
+        }
+        api_.collect_completed();
+        trace_event("release", id, ordinal, std::nullopt, "Release", 0);
+    }
+
+    void submitted_parallel_uses(const std::vector<ValueId> &ids) {
+        for (ValueId id : ids) {
+            auto value = parallel_value(id);
+            ThreadTraceLockGuard lock(value->mutex, "runtime.parallel_value");
+            if (value->uses.remaining == 0)
+                throw std::runtime_error("parallel submission count underflow for ValueId " + std::to_string(id));
+            --value->uses.remaining;
+            if (can_clear(value->uses)) value->value.reset();
+        }
     }
 
     std::vector<ValueDesc> communication_output_descs(
@@ -372,7 +480,8 @@ private:
             if (const auto *encode = std::get_if<EncodeOp>(&instruction.body)) execute_encode(*encode);
             else if (const auto *op = std::get_if<ComputeOp>(&instruction.body)) execute_compute(*op);
             else if (const auto *action = std::get_if<CommAction>(&instruction.body)) execute_communication(*action);
-            else throw std::runtime_error("Release execution is not implemented");
+            else execute_release(std::get<ReleaseOp>(instruction.body).value,
+                                 instruction.ordinal, false);
         }
         current_ = nullptr;
     }
@@ -395,6 +504,8 @@ private:
 
     Value &ensure_ready(ValueId id, const Place &expected_place) {
         auto &entry = store_.lookup(id);
+        if (std::holds_alternative<typename ValueStore<Api>::Released>(entry))
+            throw std::runtime_error("ValueId was released: " + std::to_string(id));
         if (auto *ready = std::get_if<typename ValueStore<Api>::Ready>(&entry)) {
             if (ready->place != expected_place) throw std::runtime_error("Ready value Place mismatch for " + std::to_string(id));
             return ready->value;
@@ -411,9 +522,16 @@ private:
         std::vector<Value> inputs;
         for (ValueId id : op.inputs) inputs.push_back(ensure_ready(id, op.place));
         const auto start = std::chrono::steady_clock::now();
-        Value output = api_.compute(op, inputs);
+        if (op.reuse_input) {
+            auto &entry = store_.lookup(op.inputs.front());
+            entry = typename ValueStore<Api>::Released{op.place};
+        }
+        Value output = compute_output(op, inputs);
+        const auto finish = std::chrono::steady_clock::now();
+        inputs.clear();
+        submitted_sequential_uses(op.inputs);
         const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - start);
+            finish - start);
         const auto elapsed_nanoseconds =
             static_cast<std::uint64_t>(elapsed.count());
         trace_event("compute", op.output, current_->ordinal, std::nullopt,
@@ -427,6 +545,17 @@ private:
         const auto &output_desc = desc(op.output);
         api_.validate_value(output, output_desc);
         store_.define_ready(op.output, op.place, std::move(output));
+    }
+
+    Value compute_output(const ComputeOp &op, std::vector<Value> &inputs) {
+        if (!op.reuse_input) return api_.compute(op, inputs);
+        if constexpr (detail::HasComputeReuse<Api>::value) {
+            Value reused = std::move(inputs.front());
+            inputs.erase(inputs.begin());
+            return api_.compute_reuse(op, std::move(reused), inputs);
+        } else {
+            throw std::runtime_error("Api does not support reuse_input");
+        }
     }
 
     void execute_communication(const CommAction &action) {
@@ -464,6 +593,11 @@ private:
             }
         }
         groups_.push_back(std::move(group));
+        local_inputs.clear();
+        std::vector<ValueId> local_ids;
+        for (std::size_t i = 0; i < action.inputs.size(); ++i)
+            if (action.sources[i].rank == rank_) local_ids.push_back(action.inputs[i]);
+        submitted_sequential_uses(local_ids);
     }
 
     void finish_group(std::size_t group_id) {
@@ -499,8 +633,13 @@ private:
             if (!output) throw std::runtime_error("Api wait omitted a pending communication output");
             const auto &expected_desc = desc(id);
             api_.validate_value(*output, expected_desc);
-            store_.lookup(id) = typename ValueStore<Api>::Ready{
-                expected_desc.place, std::move(*output)};
+            if (can_clear(uses_.at(id))) {
+                output.reset();
+                store_.lookup(id) = typename ValueStore<Api>::Released{expected_desc.place};
+            } else {
+                store_.lookup(id) = typename ValueStore<Api>::Ready{
+                    expected_desc.place, std::move(*output)};
+            }
         }
         group.completed = true;
     }
@@ -518,6 +657,7 @@ private:
         ValueId id, const Place &place) {
         auto value = std::make_shared<ParallelValue>();
         value->place = place;
+        value->uses = uses_.at(id);
         if (!parallel_values_.emplace(id, value).second)
             throw std::runtime_error(
                 "ValueId defined twice in parallel ValueStore: " +
@@ -536,6 +676,11 @@ private:
         for (const auto &item : store_.entries()) {
             const auto *ready =
                 std::get_if<typename ValueStore<Api>::Ready>(&item.second);
+            if (std::holds_alternative<typename ValueStore<Api>::Released>(item.second)) {
+                auto value = define_parallel_value(item.first, desc(item.first).place);
+                value->defined = true;
+                continue;
+            }
             if (ready == nullptr)
                 throw std::runtime_error(
                     "initialization left a pending value before parallel execution");
@@ -617,19 +762,18 @@ private:
                 if (!value->defined)
                     throw std::runtime_error(
                         "parallel communication output state is invalid");
-                if (value->value) {
+                if (!value->group) {
                     if (output)
                         throw std::runtime_error("Api delivered a parallel communication output twice");
-                    if (value->group)
-                        throw std::runtime_error(
-                            "posted communication output still owns a pending group");
                 } else {
                     if (!output)
                         throw std::runtime_error("Api wait omitted a pending parallel communication output");
                     if (value->group.get() != group.get())
                         throw std::runtime_error(
                             "pending communication output group is invalid");
-                    value->value.emplace(std::move(*output));
+                    if (!can_clear(value->uses))
+                        value->value.emplace(std::move(*output));
+                    output.reset();
                     value->group.reset();
                 }
             }
@@ -657,6 +801,8 @@ private:
                         "parallel value Place mismatch for " +
                         std::to_string(id));
                 if (value->value) return *value->value;
+                if (can_clear(value->uses))
+                    throw std::runtime_error("parallel ValueId was released: " + std::to_string(id));
                 group = value->group;
             }
             if (!group)
@@ -690,13 +836,22 @@ private:
         const auto start = std::chrono::steady_clock::now();
         const std::uint64_t trace_compute_start =
             ThreadTrace::enabled() ? ThreadTrace::timestamp_ns() : 0;
-        Value output = api_.compute(op, inputs);
+        if (op.reuse_input) {
+            const auto &old = parallel_values_.at(op.inputs.front());
+            ThreadTraceLockGuard lock(old->mutex, "runtime.parallel_value");
+            old->value.reset();
+            old->uses.release_requested = true;
+        }
+        Value output = compute_output(op, inputs);
+        const auto finish = std::chrono::steady_clock::now();
+        inputs.clear();
+        submitted_parallel_uses(op.inputs);
         if (ThreadTrace::enabled())
             ThreadTrace::record_duration(
                 "runtime.compute", output_value.get(), trace_compute_start,
                 ThreadTrace::timestamp_ns());
         const auto elapsed = elapsed_nanoseconds(
-            start, std::chrono::steady_clock::now());
+            start, finish);
         trace_event("compute", op.output, instruction_ordinal,
                     std::nullopt, to_string(op.kind), elapsed);
         {
@@ -715,7 +870,8 @@ private:
         {
             ThreadTraceLockGuard lock(
                 output_value->mutex, "runtime.parallel_value");
-            output_value->value.emplace(std::move(output));
+            if (!can_clear(output_value->uses))
+                output_value->value.emplace(std::move(output));
             output_value->defined = true;
         }
         output_value->condition.notify_all();
@@ -767,7 +923,9 @@ private:
                 if (output) {
                     const auto &expected_desc = desc(local_output.id);
                     api_.validate_value(*output, expected_desc);
-                    value->value.emplace(std::move(*output));
+                    if (!can_clear(value->uses))
+                        value->value.emplace(std::move(*output));
+                    output.reset();
                 } else {
                     value->group = group;
                 }
@@ -775,6 +933,8 @@ private:
             }
             value->condition.notify_all();
         }
+        local_inputs.clear();
+        submitted_parallel_uses(group->local_input_ids);
     }
 
     bool is_cross_rank_action(const CommAction &action) const {
@@ -898,8 +1058,16 @@ private:
             if (std::holds_alternative<EncodeOp>(instruction.body))
                 throw std::runtime_error(
                     "per-device worker execution does not support online Encode");
-            if (std::holds_alternative<ReleaseOp>(instruction.body))
-                throw std::runtime_error("Release execution is not implemented");
+            if (const auto *release = std::get_if<ReleaseOp>(&instruction.body)) {
+                const auto &place = desc(release->value).place;
+                if (place.rank != rank_) continue;
+                const std::size_t worker = place.kind == PlaceKind::Device
+                    ? static_cast<std::size_t>(place.index) % tasks.size() : 0;
+                tasks[worker].push_back([this, id = release->value, ordinal = instruction.ordinal] {
+                    execute_release(id, ordinal, true);
+                });
+                continue;
+            }
 
             const auto action = std::get<CommAction>(instruction.body);
             const bool has_cross_rank_destination =
@@ -1089,6 +1257,7 @@ private:
     std::optional<ValueId> current_value_;
     ValueStore<Api> store_;
     std::vector<PendingGroup> groups_;
+    std::unordered_map<ValueId, ValueUses> uses_;
     std::map<std::string, std::vector<double>> bundle_slots_;
     std::unordered_map<ValueId, std::shared_ptr<ParallelValue>> parallel_values_;
     std::vector<std::shared_ptr<ParallelGroup>> parallel_groups_;

@@ -108,7 +108,7 @@ MockVecApi::Value MockVecApi::encode_plaintext(const ValueDesc &output_desc,
                       output_desc.scale_log2, output_desc.ntt);
 }
 
-MockVecApi::Value MockVecApi::compute(const ComputeOp &op, const std::vector<Value> &inputs) {
+void MockVecApi::record_compute(const ComputeOp &op) {
     {
         std::lock_guard<std::mutex> lock(stats_mutex_);
         ++stats_.compute_calls;
@@ -121,7 +121,17 @@ MockVecApi::Value MockVecApi::compute(const ComputeOp &op, const std::vector<Val
                 op.place.index, std::this_thread::get_id());
     }
     if (fail_compute_ && *fail_compute_ == op.kind) throw std::runtime_error("injected compute failure");
+}
+
+MockVecApi::Value MockVecApi::compute(const ComputeOp &op, const std::vector<Value> &inputs) {
+    record_compute(op);
     return executor_.compute(op, inputs);
+}
+
+MockVecApi::Value MockVecApi::compute_reuse(const ComputeOp &op, Value input,
+                                           const std::vector<Value> &other_inputs) {
+    record_compute(op);
+    return executor_.compute_reuse(op, std::move(input), other_inputs);
 }
 
 MockVecApi::CommHandle MockVecApi::communicate_async(

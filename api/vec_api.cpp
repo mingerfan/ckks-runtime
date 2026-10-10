@@ -83,6 +83,40 @@ VecValue VecExecutor::compute(const ComputeOp &op, const std::vector<VecValue> &
     return output;
 }
 
+bool VecExecutor::supports_reuse(const ComputeOp &op) {
+    return op.place.kind == PlaceKind::Host
+        ? (op.kind == ComputeKind::Negate || op.kind == ComputeKind::Rotate)
+        : (op.kind == ComputeKind::AddCP || op.kind == ComputeKind::SubCP || op.kind == ComputeKind::Rotate);
+}
+
+VecValue VecExecutor::compute_reuse(const ComputeOp &op, VecValue input,
+                                    const std::vector<VecValue> &other_inputs) {
+    if (!supports_reuse(op) || op.reuse_input != 0 ||
+        other_inputs.size() != ((op.kind == ComputeKind::AddCP || op.kind == ComputeKind::SubCP) ? 1U : 0U))
+        throw std::runtime_error("unsupported VecExecutor reuse");
+    std::vector<double> plain;
+    if (!other_inputs.empty()) {
+        const auto payload = other_inputs.front().materialize();
+        if (payload.kind != ValueKind::Plaintext) throw std::runtime_error("reuse AddCP/SubCP requires plaintext");
+        plain = payload.slots;
+    }
+    input.mutate_slots([&](auto &slots) {
+        if (op.kind == ComputeKind::Rotate) {
+            const auto size = static_cast<long long>(slots.size());
+            const auto steps = std::get<RotateAttrs>(op.attrs).steps;
+            const auto shift = ((static_cast<long long>(steps) % size) + size) % size;
+            std::rotate(slots.begin(), slots.begin() + shift, slots.end());
+        } else if (op.kind == ComputeKind::Negate) {
+            for (double &slot : slots) slot = -slot;
+        } else {
+            if (slots.size() != plain.size()) throw std::runtime_error("reuse slot count mismatch");
+            for (std::size_t i = 0; i < slots.size(); ++i)
+                slots[i] += (op.kind == ComputeKind::AddCP ? plain[i] : -plain[i]);
+        }
+    });
+    return input;
+}
+
 void VecExecutor::drain() {
     std::vector<std::future<void>> completions;
     {

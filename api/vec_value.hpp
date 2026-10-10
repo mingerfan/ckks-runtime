@@ -4,6 +4,7 @@
 
 #include <condition_variable>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -39,6 +40,7 @@ public:
     VecMetadata metadata() const;
     VecPayload materialize() const;
     VecValue deep_copy() const;
+    void mutate_slots(const std::function<void(std::vector<double> &)> &mutation);
     void fulfill(VecPayload payload) const;
     void fail(std::exception_ptr error) const;
     const void *identity() const;

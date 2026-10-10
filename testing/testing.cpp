@@ -58,6 +58,44 @@ LoadedOperatorSpec make_test_operator_spec() {
 
 } // namespace
 
+RuntimePlan with_releases(RuntimePlan plan) {
+    plan.format_version = 2;
+    std::unordered_map<ValueId, std::size_t> last;
+    for (ValueId id : plan.external_inputs) last[id] = 0;
+    std::size_t index = 0;
+    for (const auto *phase : {&plan.initialization, &plan.execution, &plan.finalization})
+        for (const auto &instruction : *phase) {
+            if (const auto *op = std::get_if<ComputeOp>(&instruction.body)) {
+                last[op->output] = index;
+                for (ValueId id : op->inputs) last[id] = index;
+            } else if (const auto *action = std::get_if<CommAction>(&instruction.body)) {
+                for (ValueId id : action->inputs) last[id] = index;
+                for (ValueId id : action->outputs) last[id] = index;
+            } else if (const auto *encode = std::get_if<EncodeOp>(&instruction.body)) {
+                last[encode->output] = index;
+            } else {
+                throw std::runtime_error("with_releases expects a plan without Release");
+            }
+            ++index;
+        }
+    for (ValueId id : plan.final_outputs) last.erase(id);
+    index = 0;
+    std::size_t ordinal = 0;
+    for (auto *phase : {&plan.initialization, &plan.execution, &plan.finalization}) {
+        std::vector<Instruction> result;
+        for (auto &instruction : *phase) {
+            instruction.ordinal = ordinal++;
+            result.push_back(std::move(instruction));
+            for (const auto &value : plan.values)
+                if (last.count(value.id) && last.at(value.id) == index)
+                    result.push_back({ordinal++, ReleaseOp{value.id}});
+            ++index;
+        }
+        *phase = std::move(result);
+    }
+    return plan;
+}
+
 BuiltPlan make_fanout_plan(const std::vector<int> &device_counts) {
     if (device_counts.empty()) throw std::runtime_error("fanout plan requires at least one rank");
     std::vector<Place> devices;

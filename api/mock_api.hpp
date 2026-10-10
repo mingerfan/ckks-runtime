@@ -101,6 +101,8 @@ public:
     std::string name() const { return "MockVecApi"; }
     Value encode_plaintext(const ValueDesc &output_desc, const std::vector<double> &slots);
     Value compute(const ComputeOp &op, const std::vector<Value> &inputs);
+    bool supports_reuse(const ComputeOp &op) const { return VecExecutor::supports_reuse(op); }
+    Value compute_reuse(const ComputeOp &op, Value input, const std::vector<Value> &other_inputs);
     CommHandle communicate_async(const CommAction &action,
                                  const std::vector<Value> &local_inputs,
                                  const std::vector<ValueDesc> &output_descs);
@@ -119,6 +121,7 @@ public:
     MockStats stats() const;
 
 private:
+    void record_compute(const ComputeOp &op);
     std::vector<std::optional<Value>> take_outputs(CommHandle &handle) const;
     int rank_;
     std::shared_ptr<MockCluster> cluster_;

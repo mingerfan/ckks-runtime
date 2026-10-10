@@ -265,18 +265,100 @@ void test_memory_execution_rejected_before_api_work() {
             }
             const auto loaded = read(document);
             const auto spec = load_spec(loaded.plan);
-            for (const auto diff_mode : {DiffMode::FinalOnly, DiffMode::AllValuesAfterRun}) {
+            for (const auto diff_mode : {DiffMode::AllValuesAfterRun}) {
                 auto cluster = std::make_shared<MockCluster>(MockClusterConfig{});
                 MockVecApi api(0, cluster);
                 SequentialRuntime<MockVecApi> runtime(0, 1, 1, api, mode);
-                const std::string reason = diff_mode == DiffMode::AllValuesAfterRun
-                    ? "AllValuesAfterRun is incompatible"
-                    : reuse_only ? "reuse_input execution is not implemented" : "Release execution is not implemented";
+                const std::string reason = "AllValuesAfterRun is incompatible";
                 // Empty bindings prove the whole-plan check precedes input/API work.
                 expect_throw([&] { runtime.run(loaded, RuntimeResources{spec, {}, false}, {}, diff_mode); }, reason);
                 const auto stats = api.stats();
                 require(stats.compute_calls == 0 && stats.communicate_calls == 0, "rejected plan submitted API work");
             }
+        }
+    }
+}
+
+void test_reuse_execution() {
+    class ObservedApi : public MockVecApi {
+    public:
+        using MockVecApi::MockVecApi;
+        std::size_t reuses = 0;
+        const void *allocation = nullptr;
+        Value compute_reuse(const ComputeOp &op, Value input, const std::vector<Value> &others) {
+            if (!allocation) allocation = input.identity();
+            require(input.identity() == allocation, "reuse chain changed allocation");
+            auto output = MockVecApi::compute_reuse(op, std::move(input), others);
+            require(output.identity() == allocation, "reuse produced a new allocation");
+            ++reuses;
+            return output;
+        }
+    };
+    for (const char *name : {"cpu_reuse_chain.json", "gpu_reuse_chain.json"}) {
+        const auto loaded = read(fixture(name));
+        const auto spec = load_spec(loaded.plan);
+        const auto input = make_cipher(std::vector<double>(spec.spec.poly_degree / 2, 1.0),
+                                      "ctx-main", spec.spec.poly_degree, 5, 40);
+        auto baseline = fixture(name);
+        for (const char *phase : {"initialization", "execution", "finalization"})
+            for (auto &instruction : baseline[phase]) instruction.erase("reuse_input");
+        MockVecApi ordinary(0, std::make_shared<MockCluster>(MockClusterConfig{}));
+        SequentialRuntime<MockVecApi> base_runtime(0, 1, 1, ordinary);
+        const auto expected = base_runtime.run(read(baseline), RuntimeResources{spec, {}, false}, {{1, input}});
+        for (auto mode : {DeviceExecutionMode::Sequential, DeviceExecutionMode::PerDeviceWorkers}) {
+            if (mode == DeviceExecutionMode::PerDeviceWorkers && name == std::string("cpu_reuse_chain.json")) continue;
+            VecExecConfig config; config.mode = VecExecMode::Async; config.max_delay_ms = 3;
+            for (int iteration = 0; iteration < 3; ++iteration) {
+                ObservedApi api(0, std::make_shared<MockCluster>(MockClusterConfig{}), config);
+                SequentialRuntime<ObservedApi> runtime(0, 1, 1, api, mode);
+                const auto actual = runtime.run(loaded, RuntimeResources{spec, {}, false}, {{1, input}});
+                require(actual.values.at(6).value.materialize().slots == expected.values.at(6).value.materialize().slots,
+                        "reuse changed numerical results");
+                require(input.materialize().slots.front() == 1.0, "reuse changed caller input");
+                require(api.reuses == 3, "reuse calls were not dispatched");
+            }
+        }
+    }
+    class UnsupportedApi : public MockVecApi {
+    public:
+        using MockVecApi::MockVecApi;
+        bool supports_reuse(const ComputeOp &) const { return false; }
+    };
+    const auto loaded = read(fixture());
+    const auto spec = load_spec(loaded.plan);
+    UnsupportedApi api(0, std::make_shared<MockCluster>(MockClusterConfig{}));
+    SequentialRuntime<UnsupportedApi> runtime(0, 1, 1, api);
+    expect_throw([&] { runtime.run(loaded, RuntimeResources{spec, {}, false}, {}); }, "Api does not support reuse_input");
+    require(api.stats().compute_calls == 0, "unsupported reuse submitted work");
+}
+
+void test_release_only_v2_execution() {
+    for (const char *name : {"cpu_reuse_chain.json", "gpu_reuse_chain.json"}) {
+        auto document = fixture(name);
+        for (const char *phase : {"initialization", "execution", "finalization"})
+            for (auto &instruction : document[phase]) instruction.erase("reuse_input");
+        const auto loaded = read(document);
+        const auto spec = load_spec(loaded.plan);
+        const auto input = make_cipher(std::vector<double>(spec.spec.poly_degree / 2, 1.0),
+                                      "ctx-main", spec.spec.poly_degree, 5, 40);
+        auto baseline_document = document;
+        for (const char *phase : {"initialization", "execution", "finalization"}) {
+            auto &instructions = baseline_document[phase];
+            instructions.erase(std::remove_if(instructions.begin(), instructions.end(),
+                [](const Json &instruction) { return instruction["kind"] == "release"; }), instructions.end());
+        }
+        renumber(baseline_document);
+        const auto run = [&](const LoadedRuntimePlan &plan, DeviceExecutionMode mode) {
+            MockVecApi api(0, std::make_shared<MockCluster>(MockClusterConfig{}));
+            SequentialRuntime<MockVecApi> runtime(0, 1, 1, api, mode);
+            return runtime.run(plan, RuntimeResources{spec, {}, false}, {{1, input}});
+        };
+        const auto baseline = run(read(baseline_document), DeviceExecutionMode::Sequential);
+        for (auto mode : {DeviceExecutionMode::Sequential, DeviceExecutionMode::PerDeviceWorkers}) {
+            if (mode == DeviceExecutionMode::PerDeviceWorkers && name == std::string("cpu_reuse_chain.json")) continue;
+            const auto artifact = run(loaded, mode);
+            require(artifact.values.at(6).value.materialize().slots == baseline.values.at(6).value.materialize().slots,
+                    "Release-only V2 fixture changed the numerical result");
         }
     }
 }
@@ -292,6 +374,8 @@ int main() {
         run_test("operand uses across phases and communication", test_uses_across_phases_and_communication);
         run_test("ordinary V1/V2 compatibility", test_v1_v2_without_memory_instructions);
         run_test("memory execution rejected before API work", test_memory_execution_rejected_before_api_work);
+        run_test("Release-only CPU/GPU V2 plans execute", test_release_only_v2_execution);
+        run_test("reuse chains preserve allocation and caller input", test_reuse_execution);
         std::cout << "ALL " << tests_run << " MEMORY TEST GROUPS PASSED\n";
         return 0;
     } catch (const std::exception &error) {

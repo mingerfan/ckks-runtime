@@ -24,6 +24,8 @@ struct BuiltPlan {
 };
 
 BuiltPlan make_fanout_plan(const std::vector<int> &device_counts);
+// Test variant: release every non-final value after its last logical use.
+RuntimePlan with_releases(RuntimePlan plan);
 
 class SequentialReferenceExecutor {
 public:
