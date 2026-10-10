@@ -5,7 +5,6 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
-#include <set>
 #include <unordered_map>
 
 namespace fhegpu {
@@ -14,12 +13,7 @@ namespace {
 using namespace json_utils;
 constexpr const char *doc = "plaintext bundle manifest";
 
-struct BlobEntry {
-    std::string content;
-    std::uint64_t byte_length = 0;
-};
-
-std::vector<BlobEntry> read_manifest(const Json &root, const PlaintextBundleRef &reference) {
+void read_manifest_metadata(const Json &root, const PlaintextBundleRef &reference) {
     require_members(root, doc, "$", {"bundle_format_version", "bundle_id", "version", "blobs"});
     if (read_nonnegative_int(root.at("bundle_format_version"), doc, "$.bundle_format_version") != 1)
         fail(doc, "$.bundle_format_version", "unsupported format version");
@@ -27,23 +21,7 @@ std::vector<BlobEntry> read_manifest(const Json &root, const PlaintextBundleRef 
         fail(doc, "$.bundle_id", "does not match RuntimePlan reference");
     if (read_positive_int(root.at("version"), doc, "$.version") != reference.version)
         fail(doc, "$.version", "does not match RuntimePlan reference");
-    const auto &blobs = root.at("blobs");
-    if (!blobs.is_array()) fail(doc, "$.blobs", "expected array");
-    std::set<std::string> seen;
-    std::vector<BlobEntry> result;
-    result.reserve(blobs.size());
-    for (std::size_t i = 0; i < blobs.size(); ++i) {
-        const std::string path = item_path("$.blobs", i);
-        require_members(blobs[i], doc, path, {"content", "byte_length"});
-        BlobEntry entry;
-        entry.content = read_sha256(blobs[i].at("content"), doc, path + ".content");
-        entry.byte_length = read_safe_uint(blobs[i].at("byte_length"), doc, path + ".byte_length",
-                                           8, (1ULL << 53) - 1);
-        if (entry.byte_length % 8 != 0) fail(doc, path + ".byte_length", "must be a multiple of 8");
-        if (!seen.insert(entry.content).second) fail(doc, path + ".content", "duplicate content");
-        result.push_back(std::move(entry));
-    }
-    return result;
+    if (!root.at("blobs").is_array()) fail(doc, "$.blobs", "expected array");
 }
 
 std::vector<double> decode_slots(const std::string &bytes, const std::string &content) {
@@ -68,15 +46,32 @@ PlaintextBundleLoader PlaintextBundleLoader::open(
     const std::filesystem::path &directory, const PlaintextBundleRef &reference,
     const std::vector<std::string> &required_contents, std::size_t slot_capacity,
     bool skip_artifact_digest_checks) {
-    const auto bytes = json_utils::read_file_bytes((directory / "manifest.json").string());
+    const auto path = (directory / "manifest.json").string();
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw std::runtime_error("cannot open file: " + path);
     PlaintextBundleLoader result;
     result.directory_ = directory;
     result.slot_capacity_ = slot_capacity;
-    result.manifest_digest_ = json_utils::source_sha256(bytes);
+    StrictJsonSax sax(path, {"blobs"}, [&](const std::string &, std::size_t index, Json &&entry) {
+        try {
+            require_members(entry, doc, "$", {"content", "byte_length"});
+            auto content = read_sha256(entry.at("content"), doc, "$.content");
+            const auto length = read_safe_uint(entry.at("byte_length"), doc, "$.byte_length", 8, (1ULL << 53) - 1);
+            if (length % 8 != 0) fail(doc, "$.byte_length", "must be a multiple of 8");
+            if (!result.lengths_.emplace(std::move(content), length).second)
+                fail(doc, "$.content", "duplicate content");
+        } catch (const std::runtime_error &error) {
+            throw std::runtime_error(path + " at " + item_path("$.blobs", index) + ": " + error.what());
+        }
+    });
+    HashingInputBuffer buffer(input, path);
+    std::istream parser_input(&buffer);
+    Json::sax_parse(parser_input, &sax);
+    try { read_manifest_metadata(sax.take_result(), reference); }
+    catch (const std::runtime_error &error) { throw std::runtime_error(path + ": " + error.what()); }
+    result.manifest_digest_ = buffer.source_sha256();
     if (!skip_artifact_digest_checks && result.manifest_digest_ != reference.manifest_sha256)
-        throw std::runtime_error("plaintext bundle manifest SHA-256 mismatch");
-    for (const auto &entry : read_manifest(json_utils::parse(bytes, doc), reference))
-        result.lengths_.emplace(entry.content, entry.byte_length);
+        throw std::runtime_error("plaintext bundle manifest SHA-256 mismatch: " + path);
     for (const auto &content : required_contents) {
         auto found = result.lengths_.find(content);
         if (found == result.lengths_.end())

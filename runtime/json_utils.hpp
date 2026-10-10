@@ -1,13 +1,17 @@
 #pragma once
 
 #include "runtime/utils/sha256.hpp"
+#include "runtime/utils/json_read_stats.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
+#include <functional>
+#include <array>
 #include <initializer_list>
 #include <iterator>
 #include <limits>
@@ -139,7 +143,13 @@ inline std::string read_sha256(const Json &value, const std::string &document,
 // parent array at every object_end, even when the callback discards nothing.
 class StrictJsonSax : public nlohmann::json_sax<Json> {
 public:
-    explicit StrictJsonSax(const std::string &document) : document_(document) {}
+    using RecordHandler = std::function<void(const std::string &, std::size_t, Json &&)>;
+    explicit StrictJsonSax(const std::string &document,
+                           std::initializer_list<const char *> streamed_arrays = {},
+                           RecordHandler record = {})
+        : document_(document), record_(std::move(record)) {
+        for (const auto *name : streamed_arrays) streamed_arrays_.emplace_back(name);
+    }
 
     bool null() override { return value(nullptr); }
     bool boolean(bool v) override { return value(v); }
@@ -149,11 +159,15 @@ public:
     bool string(std::string &v) override { return value(std::move(v)); }
     bool binary(Json::binary_t &v) override { return value(std::move(v)); }
     bool start_object(std::size_t) override {
-        frames_.push_back({Json::object(), {}});
+        frames_.push_back({Json::object(), {}, {}, 0});
         return true;
     }
     bool start_array(std::size_t) override {
-        frames_.push_back({Json::array(), {}});
+        std::string field;
+        if (frames_.size() == 1 && frames_.front().container.is_object())
+            for (const auto &name : streamed_arrays_)
+                if (frames_.front().key == name) { field = name; break; }
+        frames_.push_back({Json::array(), {}, std::move(field), 0});
         return true;
     }
     bool key(std::string &v) override {
@@ -172,12 +186,18 @@ public:
     Json take_result() { return std::move(result_); }
 
 private:
-    struct Frame { Json container; std::string key; };
+    struct Frame {
+        Json container;
+        std::string key;
+        std::string streamed_field;
+        std::size_t records;
+    };
     bool value(Json v) {
         if (frames_.empty()) result_ = std::move(v);
         else {
             auto &frame = frames_.back();
-            if (frame.container.is_array()) frame.container.push_back(std::move(v));
+            if (!frame.streamed_field.empty()) record_(frame.streamed_field, frame.records++, std::move(v));
+            else if (frame.container.is_array()) frame.container.push_back(std::move(v));
             else frame.container.emplace(std::move(frame.key), std::move(v));
         }
         return true;
@@ -188,8 +208,50 @@ private:
         return value(std::move(v));
     }
     std::string document_;
+    std::vector<std::string> streamed_arrays_;
+    RecordHandler record_;
     std::vector<Frame> frames_;
     Json result_;
+};
+
+// Hash each source byte once when it enters the bounded parser buffer. Strict
+// SAX parsing consumes the entire document, including trailing whitespace.
+class HashingInputBuffer : public std::streambuf {
+public:
+    HashingInputBuffer(std::istream &input, const std::string &document, JsonReadStats *stats = nullptr)
+        : input_(input), document_(document), stats_(stats) {}
+    std::string source_sha256() const { return "sha256:" + hash_.hex_digest(); }
+private:
+    int_type underflow() override {
+        const auto read_start = stats_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        try { input_.read(buffer_.data(), static_cast<std::streamsize>(buffer_.size())); }
+        catch (const std::ios_base::failure &) {
+            if (input_.bad() || !input_.eof()) throw;
+        }
+        if (stats_) stats_->read_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - read_start).count();
+        const auto count = input_.gcount();
+        if (input_.bad() || (input_.fail() && !input_.eof()))
+            throw std::runtime_error("failed to read file: " + document_);
+        if (count == 0) return traits_type::eof();
+        if (first_ && count >= 3 && static_cast<unsigned char>(buffer_[0]) == 0xef &&
+            static_cast<unsigned char>(buffer_[1]) == 0xbb && static_cast<unsigned char>(buffer_[2]) == 0xbf)
+            fail(document_, "$", "UTF-8 BOM is not allowed");
+        first_ = false;
+        const auto hash_start = stats_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        hash_.update(std::string_view(buffer_.data(), static_cast<std::size_t>(count)));
+        if (stats_) {
+            stats_->hash_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - hash_start).count();
+            stats_->source_bytes += static_cast<std::uint64_t>(count);
+        }
+        setg(buffer_.data(), buffer_.data(), buffer_.data() + count);
+        return traits_type::to_int_type(*gptr());
+    }
+    std::istream &input_;
+    std::string document_;
+    std::array<char, 64 * 1024> buffer_{};
+    Sha256 hash_;
+    JsonReadStats *stats_;
+    bool first_ = true;
 };
 
 inline Json parse(std::string_view text, const std::string &document) {

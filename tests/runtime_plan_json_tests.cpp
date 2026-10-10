@@ -12,6 +12,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <sstream>
 #include <vector>
 
 using namespace fhegpu;
@@ -52,15 +53,152 @@ LoadedOperatorSpec load_spec(const RuntimePlan &plan) {
     return OperatorSpecReader::read_file((source_dir / "docs/operator-spec/v1/profiles" / filename).string());
 }
 
+json_utils::Json place_json(const Place &place) {
+    json_utils::Json result{{"kind", place.kind == PlaceKind::Host ? "host" : "device"}, {"rank", place.rank}};
+    if (place.kind == PlaceKind::Device) result["index"] = place.index;
+    return result;
+}
+
+void compare_records(const RuntimePlan &plan, const json_utils::Json &source) {
+    using Json = json_utils::Json;
+    require(std::to_string(plan.plan_id) == source.at("plan_id").get<std::string>(), "plan ID differs");
+    require(plan.format_version == source.at("format_version"), "format version differs");
+    const auto &target = plan.target;
+    require(Json{{"target_id", target.target_id}, {"capability_version", target.capability_version},
+                 {"world_size", target.world_size}, {"device_counts", target.device_counts},
+                 {"operator_spec", {{"id", target.operator_spec.id}, {"version", target.operator_spec.version},
+                                    {"source_sha256", target.operator_spec.source_sha256}}}} == source.at("target"),
+            "target differs");
+    require(plan.plaintext_bundle.has_value() == source.contains("plaintext_bundle"), "bundle reference presence differs");
+    if (plan.plaintext_bundle) {
+        const auto &bundle = *plan.plaintext_bundle;
+        require(Json{{"id", bundle.id}, {"version", bundle.version}, {"manifest_sha256", bundle.manifest_sha256}} == source.at("plaintext_bundle"),
+                "bundle reference differs");
+    }
+    Json values = Json::array();
+    for (const auto &value : plan.values)
+        values.push_back({{"id", std::to_string(value.id)}, {"kind", (value.kind == ValueKind::Plaintext ? "plaintext" : "ciphertext")},
+                          {"place", place_json(value.place)}, {"context", value.context}, {"level", value.level},
+                          {"scale_log2", value.scale_log2}, {"ntt", value.ntt}, {"components", value.components}});
+    require(values == source.at("values"), "value descriptions differ");
+    const auto ids_json = [](const std::vector<ValueId> &ids) {
+        Json result = Json::array();
+        for (auto id : ids) result.push_back(std::to_string(id));
+        return result;
+    };
+    require(ids_json(plan.external_inputs) == source.at("external_inputs"), "external inputs differ");
+    require(ids_json(plan.final_outputs) == source.at("final_outputs"), "final outputs differ");
+    const char *compute_names[] = {"add_cc", "add_cp", "sub_cc", "sub_cp", "mul_cc", "mul_cp", "negate", "rotate", "rescale", "mod_switch", "relinearize", "boot"};
+    const char *hint_names[] = {"auto", "point_to_point", "broadcast", "tree", "ring", "host_staged"};
+    const auto check_phase = [&](const char *name, const std::vector<Instruction> &instructions) {
+        Json records = Json::array();
+        for (const auto &instruction : instructions) {
+            Json record{{"ordinal", instruction.ordinal}};
+            if (const auto *encode = std::get_if<EncodeOp>(&instruction.body)) {
+                record["kind"] = "encode";
+                record["output"] = std::to_string(encode->output);
+                if (const auto *payload = std::get_if<InlineEncodePayload>(&encode->payload))
+                    record["payload"] = {{"kind", "inline"}, {"values", payload->values}};
+                else record["payload"] = {{"kind", "bundle"}, {"content", std::get<BundleEncodePayload>(encode->payload).content}};
+            } else if (const auto *compute = std::get_if<ComputeOp>(&instruction.body)) {
+                record.update({{"kind", "compute"}, {"op", compute_names[static_cast<std::size_t>(compute->kind)]}, {"inputs", ids_json(compute->inputs)},
+                               {"output", std::to_string(compute->output)}, {"place", place_json(compute->place)}});
+                if (compute->reuse_input) record["reuse_input"] = *compute->reuse_input;
+                if (const auto *attr = std::get_if<RotateAttrs>(&compute->attrs)) record["attrs"] = {{"steps", attr->steps}};
+                if (const auto *attr = std::get_if<RescaleAttrs>(&compute->attrs))
+                    record["attrs"] = {{"target_level", attr->target_level}, {"target_scale_log2", attr->target_scale_log2}};
+                if (const auto *attr = std::get_if<ModSwitchAttrs>(&compute->attrs)) record["attrs"] = {{"target_level", attr->target_level}};
+                if (const auto *attr = std::get_if<BootAttrs>(&compute->attrs))
+                    record["attrs"] = {{"target_level", attr->target_level}, {"target_scale_log2", attr->target_scale_log2},
+                                       {"target_components", attr->target_components}, {"operator_profile", attr->operator_profile},
+                                       {"implementation", to_string(attr->implementation)}};
+            } else if (const auto *comm = std::get_if<CommAction>(&instruction.body)) {
+                Json sources = Json::array(), destinations = Json::array(), kinds = Json::array();
+                for (const auto &place : comm->sources) sources.push_back(place_json(place));
+                for (const auto &place : comm->destinations) destinations.push_back(place_json(place));
+                for (const auto &kind : comm->output_types) kinds.push_back((kind == ValueKind::Plaintext ? "plaintext" : "ciphertext"));
+                record.update({{"kind", (comm->kind == CommKind::Transfer ? "transfer" : "replicate")}, {"transfer_id", std::to_string(comm->id)}, {"hint", hint_names[static_cast<std::size_t>(comm->hint)]},
+                               {"inputs", ids_json(comm->inputs)}, {"outputs", ids_json(comm->outputs)},
+                               {"sources", sources}, {"destinations", destinations}, {"output_kinds", kinds}});
+            } else if (const auto *release = std::get_if<ReleaseOp>(&instruction.body))
+                record.update({{"kind", "release"}, {"value", std::to_string(release->value)}});
+            else record["kind"] = "fence";
+            records.push_back(std::move(record));
+        }
+        require(records == source.at(name), std::string(name) + " records differ");
+    };
+    check_phase("initialization", plan.initialization);
+    check_phase("execution", plan.execution);
+    check_phase("finalization", plan.finalization);
+}
+
 void test_sha256_and_raw_bytes() {
     require(sha256_hex("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "empty SHA-256 failed");
     require(sha256_hex("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "abc SHA-256 failed");
+    require(sha256_hex(std::string(1000000, 'a')) == "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
+            "million-a SHA-256 failed");
+    for (std::size_t length : {0, 1, 55, 56, 63, 64, 65, 127, 128, 65535, 65536, 65537}) {
+        const std::string bytes(length, 'x');
+        for (std::size_t block : {1, 7, 63, 64, 65, 65536}) {
+            Sha256 hash;
+            for (std::size_t offset = 0; offset < bytes.size(); offset += block)
+                hash.update(std::string_view(bytes).substr(offset, block));
+            require(hash.hex_digest() == sha256_hex(bytes), "incremental SHA-256 block boundary failed");
+            require(hash.hex_digest() == hash.hex_digest(), "SHA-256 snapshot is not repeatable");
+            hash.update("tail");
+            require(hash.hex_digest() == sha256_hex(bytes + "tail"), "SHA-256 snapshot changed update state");
+        }
+    }
     const auto path = testdata("valid", "v001_inline_encode_host_compute.json");
     std::ifstream input(path, std::ios::binary);
     const std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     const auto original = RuntimePlanJsonReader::read_text(bytes);
     const auto spaced = RuntimePlanJsonReader::read_text(bytes + "\n");
     require(original.source_sha256 != spaced.source_sha256, "raw-byte whitespace change did not change SHA-256");
+}
+
+void test_streaming_plan_boundaries() {
+    auto root = json_utils::Json::parse(json_utils::read_file_bytes(testdata("valid", "v001_inline_encode_host_compute.json").string()));
+    // Preserve nontrivial root order, with the version and descriptors last.
+    nlohmann::ordered_json ordered;
+    for (const char *name : {"execution", "final_outputs", "initialization", "target", "finalization",
+                             "external_inputs", "plan_id", "values", "format_version"})
+        ordered[name] = root.at(name);
+    const auto compact = ordered.dump();
+    for (std::size_t padding : {0, 65535, 65536, 65537}) {
+        const auto bytes = std::string(padding, ' ') + compact + std::string(padding, '\n');
+        std::istringstream input(bytes);
+        input.exceptions(std::ios::badbit | std::ios::failbit);
+        const auto loaded = RuntimePlanJsonReader::read(input);
+        compare_records(loaded.plan, root);
+        require(loaded.source_sha256 == "sha256:" + sha256_hex(bytes), "stream parser omitted or repeated source bytes");
+        require(loaded.plan.external_inputs.size() == root.at("external_inputs").size(), "input IDs were lost");
+        require(loaded.plan.final_outputs.size() == root.at("final_outputs").size(), "output IDs were lost");
+        PlanVerifier::verify(loaded.plan, load_spec(loaded.plan));
+    }
+    for (const auto &bytes : {compact.substr(0, compact.size() - 1), compact + " garbage", std::string("\xef\xbb\xbf") + compact})
+        expect_throw([&] { RuntimePlanJsonReader::read_text(bytes); });
+    for (const auto &id : {"01", "-1", "18446744073709551616"}) {
+        root["values"][0]["id"] = id;
+        expect_throw([&] { RuntimePlanJsonReader::read_text(root.dump()); });
+    }
+    root = json_utils::Json::parse(compact);
+    root.erase("target");
+    expect_throw([&] { RuntimePlanJsonReader::read_text(root.dump()); }, "missing required field 'target'");
+    root = json_utils::Json::parse(compact);
+    root["values"] = json_utils::Json::object();
+    expect_throw([&] { RuntimePlanJsonReader::read_text(root.dump()); }, "expected array");
+    // Version-independent reading must not accidentally admit new operations
+    // when format_version appears after execution.
+    ordered["execution"] = {{{"ordinal", 0}, {"kind", "fence"}}};
+    ordered["format_version"] = 2;
+    expect_throw([&] { RuntimePlanJsonReader::read_text(ordered.dump()); }, "Fence requires format version 3");
+    ordered["format_version"] = 3;
+    require(std::holds_alternative<FenceOp>(RuntimePlanJsonReader::read_text(ordered.dump()).plan.execution[0].body),
+            "V3 Fence was lost");
+    std::istringstream failed(compact);
+    failed.setstate(std::ios::badbit);
+    expect_throw([&] { RuntimePlanJsonReader::read(failed); }, "failed to read");
 }
 
 void test_valid_samples() {
@@ -74,6 +212,7 @@ void test_valid_samples() {
     };
     for (const auto &name : names) {
         const auto loaded = RuntimePlanJsonReader::read_file(testdata("valid", name).string());
+        compare_records(loaded.plan, json_utils::Json::parse(json_utils::read_file_bytes(testdata("valid", name).string())));
         const auto spec = load_spec(loaded.plan);
         const auto requirements = PlanVerifier::verify(loaded.plan, spec);
         require(!requirements.capabilities.empty(), name + " did not derive capabilities");
@@ -312,6 +451,34 @@ void test_rank_local_bundle_loading() {
     auto wrong_id = *bad_ref_plan.plan.plaintext_bundle;
     wrong_id.id = "wrong-bundle";
     expect_throw([&] { PlaintextBundleLoader::load(temp, wrong_id, {content}, 16384, true); }, "does not match RuntimePlan reference");
+    auto reference = *loaded.plan.plaintext_bundle;
+    auto manifest_root = json_utils::Json::parse(manifest_text);
+    const auto write_manifest = [&](const std::string &bytes) {
+        std::ofstream output(temp / "manifest.json", std::ios::binary | std::ios::trunc);
+        output << bytes;
+        output.close();
+        reference.manifest_sha256 = "sha256:" + sha256_hex(bytes);
+    };
+    nlohmann::ordered_json reordered;
+    for (const char *field : {"blobs", "version", "bundle_id", "bundle_format_version"})
+        reordered[field] = manifest_root.at(field);
+    write_manifest(reordered.dump() + std::string(65537, '\n'));
+    require(PlaintextBundleLoader::open(temp, reference, {content}, 16384, false).read(content).size() == 4,
+            "manifest order or buffer boundary changed bundle contents");
+    auto duplicate = manifest_root;
+    duplicate["blobs"].push_back(duplicate["blobs"][0]);
+    write_manifest(duplicate.dump());
+    expect_throw([&] { PlaintextBundleLoader::open(temp, reference, {}, 16384, false); }, "duplicate content");
+    write_manifest("{\"blobs\":[{\"content\":\"" + content + "\",\"\\u0063ontent\":\"" + content + "\",\"byte_length\":32}]}");
+    expect_throw([&] { PlaintextBundleLoader::open(temp, reference, {}, 16384, false); }, "duplicate object key");
+    auto invalid = manifest_root;
+    invalid["blobs"][0]["byte_length"] = 9;
+    write_manifest(invalid.dump());
+    expect_throw([&] { PlaintextBundleLoader::open(temp, reference, {}, 16384, false); }, "multiple of 8");
+    write_manifest(manifest_text + " garbage");
+    expect_throw([&] { PlaintextBundleLoader::open(temp, reference, {}, 16384, false); }, "byte");
+    write_manifest(manifest_text.substr(0, manifest_text.size() / 2));
+    expect_throw([&] { PlaintextBundleLoader::open(temp, reference, {}, 16384, false); }, "byte");
     std::filesystem::remove_all(temp);
 }
 
@@ -320,6 +487,7 @@ void test_rank_local_bundle_loading() {
 int main() {
     try {
         run_test("SHA-256 covers raw file bytes", test_sha256_and_raw_bytes);
+        run_test("streaming plan order and buffer boundaries", test_streaming_plan_boundaries);
         run_test("valid RuntimePlan V1 samples", test_valid_samples);
         run_test("invalid RuntimePlan V1 samples", test_invalid_samples);
         run_test("strict JSON and OperatorSpec constraints", test_strict_json_and_operator_spec);

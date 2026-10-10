@@ -1,6 +1,7 @@
 #include "runtime/utils/sha256.hpp"
 
 #include <array>
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -92,27 +93,43 @@ void transform(std::array<std::uint32_t, 8> &state, const unsigned char *block) 
 
 } // namespace
 
-std::string sha256_hex(std::string_view bytes) {
-    if (bytes.size() > std::numeric_limits<std::uint64_t>::max() / 8U)
+void Sha256::update(std::string_view bytes) {
+    if (bytes.empty()) return;
+    if (bytes.size() > std::numeric_limits<std::uint64_t>::max() / 8U - bytes_)
         throw std::length_error("SHA-256 input is too large");
-
-    std::array<std::uint32_t, 8> state = {
-        0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
-        0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U,
-    };
-
+    bytes_ += bytes.size();
     const auto *data = reinterpret_cast<const unsigned char *>(bytes.data());
-    const std::size_t full_blocks = bytes.size() / 64;
-    for (std::size_t index = 0; index < full_blocks; ++index)
-        transform(state, data + index * 64);
+    std::size_t remaining = bytes.size();
+    if (buffered_) {
+        const auto count = std::min(remaining, buffer_.size() - buffered_);
+        if (count) std::memcpy(buffer_.data() + buffered_, data, count);
+        buffered_ += count;
+        data += count;
+        remaining -= count;
+        if (buffered_ == buffer_.size()) {
+            transform(state_, buffer_.data());
+            buffered_ = 0;
+        }
+    }
+    while (remaining >= buffer_.size()) {
+        transform(state_, data);
+        data += buffer_.size();
+        remaining -= buffer_.size();
+    }
+    if (remaining) {
+        std::memcpy(buffer_.data(), data, remaining);
+        buffered_ = remaining;
+    }
+}
 
-    const std::size_t remainder = bytes.size() % 64;
+std::string Sha256::hex_digest() const {
+    auto state = state_;
     std::array<unsigned char, 128> tail{};
-    if (remainder != 0) std::memcpy(tail.data(), data + full_blocks * 64, remainder);
-    tail[remainder] = 0x80;
+    if (buffered_) std::memcpy(tail.data(), buffer_.data(), buffered_);
+    tail[buffered_] = 0x80;
 
-    const std::size_t tail_size = remainder < 56 ? 64 : 128;
-    const std::uint64_t bit_length = static_cast<std::uint64_t>(bytes.size()) * 8U;
+    const std::size_t tail_size = buffered_ < 56 ? 64 : 128;
+    const std::uint64_t bit_length = bytes_ * 8U;
     for (std::size_t index = 0; index < 8; ++index)
         tail[tail_size - 1 - index] = static_cast<unsigned char>(bit_length >> (index * 8U));
     transform(state, tail.data());
@@ -126,6 +143,12 @@ std::string sha256_hex(std::string_view bytes) {
             result.push_back(hex[(word >> static_cast<unsigned int>(shift)) & 0x0fU]);
     }
     return result;
+}
+
+std::string sha256_hex(std::string_view bytes) {
+    Sha256 hash;
+    hash.update(bytes);
+    return hash.hex_digest();
 }
 
 } // namespace fhegpu

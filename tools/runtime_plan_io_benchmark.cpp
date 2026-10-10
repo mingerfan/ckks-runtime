@@ -46,13 +46,22 @@ int main(int argc, char **argv) {
             bytes = {};
             report["destroy_seconds"] = seconds(start);
         } else {
-            auto loaded = RuntimePlanJsonReader::read_file(argv[2]);
+            JsonReadStats stats;
+            auto loaded = RuntimePlanJsonReader::read_file(argv[2], &stats);
             report["load_seconds"] = seconds(start);
+            report["read_seconds"] = stats.read_seconds;
+            report["hash_seconds"] = stats.hash_seconds;
+            report["parse_build_seconds"] = stats.parse_build_seconds;
+            report["source_bytes"] = stats.source_bytes;
             report["source_sha256"] = loaded.source_sha256;
             report["values"] = loaded.plan.values.size();
             report["initialization"] = loaded.plan.initialization.size();
             report["execution"] = loaded.plan.execution.size();
             report["finalization"] = loaded.plan.finalization.size();
+            report["typed_array_bytes"] = loaded.plan.values.size() * sizeof(ValueDesc) +
+                (loaded.plan.initialization.size() + loaded.plan.execution.size() + loaded.plan.finalization.size()) * sizeof(Instruction);
+            report["typed_array_capacity_bytes"] = loaded.plan.values.capacity() * sizeof(ValueDesc) +
+                (loaded.plan.initialization.capacity() + loaded.plan.execution.capacity() + loaded.plan.finalization.capacity()) * sizeof(Instruction);
             report["metadata_peak_rss_bytes"] = peak_rss_bytes();
             if (argc == 4) {
                 auto spec = OperatorSpecReader::read_file(argv[3]);
