@@ -139,9 +139,9 @@ template <bool Reading> class Archive {
         std::uint64_t size = values.size();
         number(size);
         if constexpr (Reading) {
-            // This experiment bounds individual typed arrays to 2 GiB and
+            // This experiment bounds individual typed arrays to 8 GiB and
             // rejects impossible counts before allocating them.
-            if (size > remaining / minimum_bytes || size > (2ULL << 30) / sizeof(T))
+            if (size > remaining / minimum_bytes || size > (8ULL << 30) / sizeof(T))
                 throw std::runtime_error("invalid binary array length");
             values.resize(static_cast<std::size_t>(size));
         }

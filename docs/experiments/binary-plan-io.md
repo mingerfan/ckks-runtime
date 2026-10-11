@@ -21,7 +21,7 @@
 
 plan 的重复 context、bundle content 和 Boot profile 共用字符串表。操作码和 variant 类型使用当前模型定义的顺序，严格受实验版本限制。描述符和指令不再保存重复字段名，也不再将整数 ID 转成十进制文本。根元数据保留小型 JSON 以复用已有约束；它不是主要体积或时间来源。
 
-读取按预先知道的数量分配 typed 数组和 manifest 哈希表，再直接填入成员。仍校验 magic/version、计数、短读、尾部字节、枚举、布尔值、字符串编号、有限浮点和 manifest 覆盖范围。实验限制每个 typed 数组最多 2 GiB、每个字符串最多 1 MiB。完整不可信输入的协议审计、稳定操作码分配、节目录、外部摘要绑定和可配置总内存预算尚未完成，不能作为发布格式。
+读取按预先知道的数量分配 typed 数组和 manifest 哈希表，再直接填入成员。仍校验 magic/version、计数、短读、尾部字节、枚举、布尔值、字符串编号、有限浮点和 manifest 覆盖范围。实验限制每个 typed 数组最多 8 GiB、每个字符串最多 1 MiB；原先的 2 GiB 单数组限制不足以容纳完整 Qwen 的 execution 数组，因此提高上限，格式字节没有变化。完整不可信输入的协议审计、稳定操作码分配、节目录、外部摘要绑定和可配置总内存预算尚未完成，不能作为发布格式。
 
 ## 构建与运行
 
@@ -33,6 +33,7 @@ cmake --build build-binary --target runtime_binary_io_experiment -j4
 build-binary/runtime_binary_io_experiment self-test . OPTIONAL_SMALL_V3_PLAN
 
 build-binary/runtime_binary_io_experiment convert-plan PLAN.json PLAN.bin
+build-binary/runtime_binary_io_experiment convert-plan-check PLAN.json PLAN.bin OPERATOR_SPEC.json
 build-binary/runtime_binary_io_experiment plan-json PLAN.json OPERATOR_SPEC.json
 build-binary/runtime_binary_io_experiment plan-binary PLAN.bin OPERATOR_SPEC.json
 
@@ -42,6 +43,8 @@ build-binary/runtime_binary_io_experiment manifest-binary manifest.bin
 ```
 
 转换命令只处理计划/manifest 元数据，不访问权重 blob。plan 转换先用严格 JSON reader 构建 typed plan，再写二进制。manifest 转换逐条比较读回的内容标识、offset、长度和根元数据。工具是实验入口，输出路径应使用独立目录；没有生产导出器的 staging 发布功能。
+
+`convert-plan-check` 在一次完整 JSON 加载中记录基线，可选执行 PlanVerifier，随后写二进制、读回现有 RuntimePlan，逐字段比较根元数据、每个描述符、分阶段指令顺序、各操作属性和全部输入输出。inline double 按位比较，不额外计算内容哈希或构造完整 JSON DOM。读回比较时保留原始 typed plan，因此该阶段 RSS 包含两份计划；独立运行 `plan-binary` 得到可比较的单计划加载内存和 Verifier 时间。完整实验用外部进程 32 GiB 地址空间限制及 900 秒超时，JSON 只加载一次。
 
 加载时间包含文件读取、同一 SHA-256 实现的原始元数据摘要、解析和 typed 构建。`verify_seconds` 单独运行同一 PlanVerifier。manifest 两种加载方式均建立相同 key/value 类型的索引并检查完整范围；二进制的数量信息允许提前 reserve。没有读取或校验权重载荷。
 

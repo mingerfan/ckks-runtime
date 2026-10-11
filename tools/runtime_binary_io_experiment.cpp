@@ -8,6 +8,7 @@
 #include <iostream>
 #include <sstream>
 #include <sys/resource.h>
+#include <tuple>
 
 using namespace fhegpu;
 namespace expio = fhegpu::binary_io_experiment;
@@ -107,6 +108,79 @@ static Json projection(const RuntimePlan &p) {
     return root;
 }
 
+// Compare every typed field without constructing another multi-GB JSON DOM
+// or computing a content hash. Small fixtures also check this against projection.
+static bool attrs_equal(const ComputeAttrs &a, const ComputeAttrs &b) {
+    if (a.index() != b.index())
+        return false;
+    switch (a.index()) {
+    case 0: return true;
+    case 1: return std::get<RotateAttrs>(a).steps == std::get<RotateAttrs>(b).steps;
+    case 2: {
+        const auto &x = std::get<RescaleAttrs>(a), &y = std::get<RescaleAttrs>(b);
+        return std::tie(x.target_level, x.target_scale_log2) == std::tie(y.target_level, y.target_scale_log2);
+    }
+    case 3: return std::get<ModSwitchAttrs>(a).target_level == std::get<ModSwitchAttrs>(b).target_level;
+    case 4: {
+        const auto &x = std::get<BootAttrs>(a), &y = std::get<BootAttrs>(b);
+        return std::tie(x.target_level, x.target_scale_log2, x.target_components, x.operator_profile, x.implementation) ==
+               std::tie(y.target_level, y.target_scale_log2, y.target_components, y.operator_profile, y.implementation);
+    }
+    default: throw std::runtime_error("unknown comparison attrs");
+    }
+}
+static bool instruction_equal(const Instruction &a, const Instruction &b) {
+    if (a.ordinal != b.ordinal || a.body.index() != b.body.index())
+        return false;
+    switch (a.body.index()) {
+    case 0: {
+        const auto &x = std::get<EncodeOp>(a.body), &y = std::get<EncodeOp>(b.body);
+        if (x.output != y.output || x.payload.index() != y.payload.index())
+            return false;
+        if (const auto *v = std::get_if<InlineEncodePayload>(&x.payload)) {
+            const auto &other = std::get<InlineEncodePayload>(y.payload).values;
+            return v->values.size() == other.size() &&
+                   (other.empty() || std::memcmp(v->values.data(), other.data(), other.size() * sizeof(double)) == 0);
+        }
+        return std::get<BundleEncodePayload>(x.payload).content == std::get<BundleEncodePayload>(y.payload).content;
+    }
+    case 1: {
+        const auto &x = std::get<ComputeOp>(a.body), &y = std::get<ComputeOp>(b.body);
+        return std::tie(x.kind, x.inputs, x.output, x.place, x.reuse_input) ==
+                   std::tie(y.kind, y.inputs, y.output, y.place, y.reuse_input) && attrs_equal(x.attrs, y.attrs);
+    }
+    case 2: {
+        const auto &x = std::get<CommAction>(a.body), &y = std::get<CommAction>(b.body);
+        return std::tie(x.id, x.kind, x.hint, x.inputs, x.outputs, x.sources, x.destinations, x.output_types) ==
+               std::tie(y.id, y.kind, y.hint, y.inputs, y.outputs, y.sources, y.destinations, y.output_types);
+    }
+    case 3: return std::get<ReleaseOp>(a.body).value == std::get<ReleaseOp>(b.body).value;
+    case 4: return true;
+    default: throw std::runtime_error("unknown comparison instruction");
+    }
+}
+static void compare_plans(const RuntimePlan &a, const RuntimePlan &b) {
+    if (expio::metadata(a) != expio::metadata(b) || a.external_inputs != b.external_inputs ||
+        a.final_outputs != b.final_outputs || a.values.size() != b.values.size())
+        throw std::runtime_error("roundtrip metadata/inputs/outputs/value count mismatch");
+    for (std::size_t i = 0; i < a.values.size(); ++i) {
+        const auto &x = a.values[i], &y = b.values[i];
+        if (std::tie(x.id, x.kind, x.place, x.context, x.level, x.scale_log2, x.ntt, x.components) !=
+            std::tie(y.id, y.kind, y.place, y.context, y.level, y.scale_log2, y.ntt, y.components))
+            throw std::runtime_error("roundtrip value mismatch at " + std::to_string(i));
+    }
+    const std::vector<Instruction> *left[] = {&a.initialization, &a.execution, &a.finalization};
+    const std::vector<Instruction> *right[] = {&b.initialization, &b.execution, &b.finalization};
+    for (int phase = 0; phase < 3; ++phase) {
+        if (left[phase]->size() != right[phase]->size())
+            throw std::runtime_error("roundtrip phase size mismatch");
+        for (std::size_t i = 0; i < left[phase]->size(); ++i)
+            if (!instruction_equal((*left[phase])[i], (*right[phase])[i]))
+                throw std::runtime_error("roundtrip instruction mismatch in phase " + std::to_string(phase) +
+                                         " at " + std::to_string(i));
+    }
+}
+
 static RuntimePlan load_binary_plan(const std::string &path, JsonReadStats &stats) {
     const auto start = Clock::now();
     std::ifstream in(path, std::ios::binary);
@@ -167,8 +241,16 @@ static void self_test(const std::filesystem::path &source, const std::filesystem
         const auto bytes = out.str();
         std::istringstream in(bytes, std::ios::binary);
         const auto decoded = expio::read_plan(in, bytes.size());
+        compare_plans(loaded.plan, decoded);
         if (projection(decoded) != original)
             throw std::runtime_error("binary roundtrip differs");
+        auto changed = decoded;
+        changed.plan_id ^= 1;
+        bool mismatch_rejected = false;
+        try { compare_plans(loaded.plan, changed); }
+        catch (const std::exception &) { mismatch_rejected = true; }
+        if (!mismatch_rejected)
+            throw std::runtime_error("plan comparison accepted changed metadata");
         for (const auto &bad :
              {bytes.substr(0, bytes.size() - 1), bytes + "extra", std::string("badmagic") + bytes.substr(8)}) {
             bool rejected = false;
@@ -190,7 +272,8 @@ int main(int argc, char **argv) {
     try {
         if (argc < 3)
             throw std::runtime_error(
-                "usage: runtime_binary_io_experiment self-test SOURCE | convert-plan JSON BINARY | convert-manifest "
+                "usage: runtime_binary_io_experiment self-test SOURCE | convert-plan JSON BINARY | "
+                "convert-plan-check JSON BINARY [SPEC] | convert-manifest "
                 "JSON BINARY | plan-json|plan-binary FILE [SPEC] | manifest-json|manifest-binary FILE");
         const std::string mode = argv[1], path = argv[2];
         if (mode == "self-test" && (argc == 3 || argc == 4)) {
@@ -199,7 +282,45 @@ int main(int argc, char **argv) {
         }
         JsonReadStats stats;
         const auto start = Clock::now();
-        if (mode == "convert-plan" && argc == 4) {
+        if (mode == "convert-plan-check" && (argc == 4 || argc == 5)) {
+            std::cerr << "loading source JSON\n";
+            auto loaded = RuntimePlanJsonReader::read_file(path, &stats);
+            auto baseline = metrics(path, stats, seconds(start));
+            baseline.update({{"mode", "plan-json"}, {"source_sha256", loaded.source_sha256},
+                             {"values", loaded.plan.values.size()},
+                             {"instructions", loaded.plan.initialization.size() + loaded.plan.execution.size() +
+                                                  loaded.plan.finalization.size()}});
+            std::cerr << baseline.dump() << '\n';
+            if (argc == 5) {
+                auto spec = OperatorSpecReader::read_file(argv[4]);
+                const auto verify_start = Clock::now();
+                const auto requirements = PlanVerifier::verify(loaded.plan, spec);
+                baseline.update({{"verify_seconds", seconds(verify_start)},
+                                 {"capabilities", requirements.capabilities.size()},
+                                 {"keys", requirements.keys.size()}, {"verify_peak_rss_bytes", rss()}});
+                std::cerr << "source PlanVerifier passed\n";
+            }
+            const auto emit_start = Clock::now();
+            std::ofstream out(argv[3], std::ios::binary);
+            if (!out)
+                throw std::runtime_error("cannot open output");
+            expio::write_plan(out, loaded.plan);
+            out.close();
+            if (!out)
+                throw std::runtime_error("failed binary close");
+            const auto emit_seconds = seconds(emit_start);
+            std::cerr << "binary written; decoding for field comparison\n";
+            JsonReadStats binary_stats;
+            const auto decode_start = Clock::now();
+            auto decoded = load_binary_plan(argv[3], binary_stats);
+            auto readback = metrics(argv[3], binary_stats, seconds(decode_start));
+            readback["rss_includes_retained_json_plan"] = true;
+            const auto compare_start = Clock::now();
+            compare_plans(loaded.plan, decoded);
+            std::cout << Json{{"json_baseline", baseline}, {"binary_readback", readback},
+                             {"binary_emit_seconds", emit_seconds}, {"field_compare_seconds", seconds(compare_start)},
+                             {"all_fields_equal", true}, {"blob_payloads_read", 0}}.dump() << '\n';
+        } else if (mode == "convert-plan" && argc == 4) {
             auto loaded = RuntimePlanJsonReader::read_file(path, &stats);
             const auto load_seconds = seconds(start);
             const auto emit_start = Clock::now();
