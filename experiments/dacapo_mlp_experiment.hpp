@@ -1,7 +1,7 @@
 #pragma once
 
 #include "api/vec_value.hpp"
-#include "runtime/json_plan_reader.hpp"
+#include "runtime/plan_reader.hpp"
 #include "runtime/operator_spec_reader.hpp"
 #include "runtime/plaintext_bundle.hpp"
 #include "runtime/runtime.hpp"
@@ -107,7 +107,7 @@ inline Context load_context(const std::filesystem::path &plan_path,
                             const std::filesystem::path &operator_spec_path,
                             std::filesystem::path bundle_dir) {
     Context context;
-    context.loaded_plan = RuntimePlanJsonReader::read_file(plan_path.string());
+    context.loaded_plan = RuntimePlanReader::read_file(plan_path.string());
     context.operator_spec = OperatorSpecReader::read_file(operator_spec_path.string());
     context.bundle_dir = std::move(bundle_dir);
     if (context.loaded_plan.plan.external_inputs.size() != 1)

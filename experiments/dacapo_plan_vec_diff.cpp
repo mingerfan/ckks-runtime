@@ -1,4 +1,4 @@
-#include "runtime/json_plan_reader.hpp"
+#include "runtime/plan_reader.hpp"
 #include "runtime/operator_spec_reader.hpp"
 #include "runtime/utils/sha256.hpp"
 #include "testing/testing.hpp"
@@ -520,9 +520,9 @@ int main(int argc, char **argv) {
 
     try {
         const LoadedRuntimePlan reference =
-            RuntimePlanJsonReader::read_file(argv[1]);
+            RuntimePlanReader::read_file(argv[1]);
         const LoadedRuntimePlan distributed =
-            RuntimePlanJsonReader::read_file(argv[2]);
+            RuntimePlanReader::read_file(argv[2]);
         const LoadedOperatorSpec operator_spec =
             OperatorSpecReader::read_file(argv[3]);
         PlanAlignment alignment(reference.plan, distributed.plan);

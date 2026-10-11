@@ -63,3 +63,5 @@ PlanVerifier 现在把每个值的定义、使用次数、计算来源、最终�
 实验 plan 保留原来指向 JSON manifest 的引用；二进制 manifest 单独测量，不是已经绑定到生产 runtime 的新 bundle 入口。若正式采用，需要先明确存储格式与摘要绑定，再同时接入 DaCapo 和 runtime，提供显式兼容入口和诊断导出。现有 pack、内容 ID 与 Encode/Fence 语义可以继续复用。
 
 二进制改善元数据加载和文件体积；同一 typed plan 上的 Verifier、索引、任务构建、CKKS Encode、GPU 计算仍需各自测量。不能将加载阶段的倍率外推为完整推理加速。
+
+The measured codec is now available through the production compiler and `RuntimePlanReader`, with distinct `CKKSPL01`/`CKKSMF01` magic. See [binary container V1](../runtime-plan/binary-v1.md). Historical experiment files retain their original magic and CLI.

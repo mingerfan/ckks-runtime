@@ -45,6 +45,7 @@ private:
     std::shared_ptr<PackedData> packed_;
     std::size_t slot_capacity_ = 0;
     std::string manifest_digest_;
+    bool verify_blob_digest_ = true;
 };
 
 } // namespace fhegpu

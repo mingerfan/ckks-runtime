@@ -1,5 +1,6 @@
 #include "runtime/plaintext_bundle.hpp"
 #include "runtime/json_utils.hpp"
+#include "runtime/binary_manifest_codec.hpp"
 
 #include <algorithm>
 #include <array>
@@ -61,37 +62,54 @@ PlaintextBundleLoader PlaintextBundleLoader::open(
     const std::filesystem::path &directory, const PlaintextBundleRef &reference,
     const std::vector<std::string> &required_contents, std::size_t slot_capacity,
     bool skip_artifact_digest_checks, BundleReadOptions options) {
-    const auto path = (directory / "manifest.json").string();
+    const bool binary = reference.manifest_format == "binary";
+    if (!binary && reference.manifest_format != "json") throw std::runtime_error("unknown manifest format");
+    const auto path = (directory / (binary ? "manifest.bin" : "manifest.json")).string();
     std::ifstream input(path, std::ios::binary);
     if (!input) throw std::runtime_error("cannot open file: " + path);
     PlaintextBundleLoader result;
     result.directory_ = directory;
     result.slot_capacity_ = slot_capacity;
     constexpr auto no_offset = std::numeric_limits<std::uint64_t>::max();
-    StrictJsonSax sax(path, {"blobs"}, [&](const std::string &, std::size_t index, Json &&entry) {
-        try {
-            require_members(entry, doc, "$", {"content", "byte_length"}, {"offset"});
-            auto content = read_sha256(entry.at("content"), doc, "$.content");
-            const auto length = read_safe_uint(entry.at("byte_length"), doc, "$.byte_length", 8, (1ULL << 53) - 1);
-            if (length % 8 != 0) fail(doc, "$.byte_length", "must be a multiple of 8");
-            const auto offset = entry.contains("offset")
-                ? read_safe_uint(entry.at("offset"), doc, "$.offset", 0, (1ULL << 53) - 1) : no_offset;
-            if (!result.entries_.emplace(std::move(content), Entry{length, offset}).second)
-                fail(doc, "$.content", "duplicate content");
-        } catch (const std::runtime_error &error) {
-            throw std::runtime_error(path + " at " + item_path("$.blobs", index) + ": " + error.what());
-        }
-    });
-    HashingInputBuffer buffer(input, path);
-    std::istream parser_input(&buffer);
-    Json::sax_parse(parser_input, &sax);
-    auto root = sax.take_result();
+    Json root;
     int format;
-    try { format = read_manifest_metadata(root, reference); }
-    catch (const std::runtime_error &error) { throw std::runtime_error(path + ": " + error.what()); }
-    result.manifest_digest_ = buffer.source_sha256();
-    if (!skip_artifact_digest_checks && result.manifest_digest_ != reference.manifest_sha256)
-        throw std::runtime_error("plaintext bundle manifest SHA-256 mismatch: " + path);
+    if (binary) {
+        const auto size = std::filesystem::file_size(path);
+        if (size > (8ULL << 30)) throw std::runtime_error("binary manifest exceeds 8 GiB limit");
+        binary_io::Archive<true> archive(input, size);
+        binary_io::Manifest manifest;
+        binary_io::manifest_records(archive, manifest);
+        root = std::move(manifest.metadata);
+        result.entries_.reserve(manifest.entries.size());
+        for (auto &[content, entry] : manifest.entries)
+            result.entries_.emplace(std::move(content), Entry{entry.length, entry.offset});
+        format = read_manifest_metadata(root, reference);
+        result.verify_blob_digest_ = false;
+    } else {
+        StrictJsonSax sax(path, {"blobs"}, [&](const std::string &, std::size_t index, Json &&entry) {
+            try {
+                require_members(entry, doc, "$", {"content", "byte_length"}, {"offset"});
+                auto content = read_sha256(entry.at("content"), doc, "$.content");
+                const auto length = read_safe_uint(entry.at("byte_length"), doc, "$.byte_length", 8, (1ULL << 53) - 1);
+                if (length % 8 != 0) fail(doc, "$.byte_length", "must be a multiple of 8");
+                const auto offset = entry.contains("offset")
+                    ? read_safe_uint(entry.at("offset"), doc, "$.offset", 0, (1ULL << 53) - 1) : no_offset;
+                if (!result.entries_.emplace(std::move(content), Entry{length, offset}).second)
+                    fail(doc, "$.content", "duplicate content");
+            } catch (const std::runtime_error &error) {
+                throw std::runtime_error(path + " at " + item_path("$.blobs", index) + ": " + error.what());
+            }
+        });
+        HashingInputBuffer buffer(input, path);
+        std::istream parser_input(&buffer);
+        Json::sax_parse(parser_input, &sax);
+        root = sax.take_result();
+        try { format = read_manifest_metadata(root, reference); }
+        catch (const std::runtime_error &error) { throw std::runtime_error(path + ": " + error.what()); }
+        result.manifest_digest_ = buffer.source_sha256();
+        if (!skip_artifact_digest_checks && result.manifest_digest_ != reference.manifest_sha256)
+            throw std::runtime_error("plaintext bundle manifest SHA-256 mismatch: " + path);
+    }
     for (const auto &content : required_contents) {
         auto found = result.entries_.find(content);
         if (found == result.entries_.end())
@@ -198,7 +216,7 @@ std::vector<double> PlaintextBundleLoader::read(const std::string &content) cons
         }
         bytes = storage;
     }
-    if (json_utils::source_sha256(bytes) != content)
+    if (verify_blob_digest_ && json_utils::source_sha256(bytes) != content)
         throw std::runtime_error("bundle blob content SHA-256 mismatch: " + content);
     return decode_slots(bytes, content);
 }

@@ -81,6 +81,13 @@ OperatorSpecRef read_operator_spec(const Json &value, const std::string &path) {
 }
 
 PlaintextBundleRef read_bundle_ref(const Json &value, const std::string &path) {
+    if (value.contains("manifest_format")) {
+        require_members(value, doc, path, {"id", "version", "manifest_format"});
+        if (read_string(value.at("manifest_format"), doc, path + ".manifest_format") != "binary")
+            fail(doc, path, "manifest_format must be binary");
+        return {read_string(value.at("id"), doc, path + ".id"),
+                read_positive_int(value.at("version"), doc, path + ".version"), "", "binary"};
+    }
     require_members(value, doc, path, {"id", "version", "manifest_sha256"});
     return {read_string(value.at("id"), doc, path + ".id"),
             read_positive_int(value.at("version"), doc, path + ".version"),

@@ -1,4 +1,4 @@
-#include "runtime/json_plan_reader.hpp"
+#include "runtime/plan_reader.hpp"
 #include "runtime/json_utils.hpp"
 #include "runtime/operator_spec_reader.hpp"
 #include "runtime/plaintext_bundle.hpp"
@@ -62,8 +62,8 @@ int main(int argc, char **argv) {
                                          {"peak_rss_bytes", peak_rss_bytes()}, {"summary", left}}.dump() << '\n';
             return 0;
         }
-        if (argc < 3 || argc > 5 || (mode != "--dom" && mode != "--plan"))
-            throw std::runtime_error("usage: runtime_plan_io_benchmark --dom FILE | --plan FILE [OPERATOR_SPEC [BUNDLE_DIR]] | --compare-plans OLD NEW | --compare-manifests OLD NEW");
+        if (argc < 3 || argc > 7 || (mode != "--dom" && mode != "--plan"))
+            throw std::runtime_error("usage: runtime_plan_io_benchmark --dom FILE | --plan FILE [OPERATOR_SPEC [BUNDLE_DIR [THREADS [RESIDENT_BYTES]]]] | --compare-plans OLD NEW | --compare-manifests OLD NEW");
         json_utils::Json report{{"file", argv[2]}, {"bytes", std::filesystem::file_size(argv[2])},
                                {"instruction_size", sizeof(Instruction)}, {"value_desc_size", sizeof(ValueDesc)}};
         auto start = Clock::now();
@@ -83,9 +83,14 @@ int main(int argc, char **argv) {
             bytes = {};
             report["destroy_seconds"] = seconds(start);
         } else {
-            JsonReadStats stats;
-            auto loaded = RuntimePlanJsonReader::read_file(argv[2], &stats);
+            PlanReadStats stats;
+            const unsigned threads = argc >= 6 ? static_cast<unsigned>(std::stoul(argv[5])) : 0;
+            auto loaded = RuntimePlanReader::read_file(argv[2], {threads}, &stats);
             report["load_seconds"] = seconds(start);
+            report["binary"] = stats.binary;
+            report["threads"] = stats.threads;
+            report["scan_allocate_seconds"] = stats.scan_allocate_seconds;
+            report["decode_seconds"] = stats.decode_seconds;
             report["read_seconds"] = stats.read_seconds;
             report["hash_seconds"] = stats.hash_seconds;
             report["parse_build_seconds"] = stats.parse_build_seconds;
@@ -106,15 +111,21 @@ int main(int argc, char **argv) {
                 auto requirements = PlanVerifier::verify(loaded.plan, spec);
                 report["verify_seconds"] = seconds(start);
                 report["capabilities"] = requirements.capabilities.size();
+                report["keys"] = requirements.keys.size();
                 report["verify_peak_rss_bytes"] = peak_rss_bytes();
-                if (argc == 5) {
+                if (argc >= 5) {
                     if (!loaded.plan.plaintext_bundle) throw std::runtime_error("plan has no plaintext bundle reference");
                     start = Clock::now();
-                    auto bundle = PlaintextBundleLoader::open(argv[4], *loaded.plan.plaintext_bundle, {}, spec.spec.poly_degree / 2, false);
+                    const std::uint64_t resident_budget = argc == 7 ? std::stoull(argv[6]) : 0;
+                    auto bundle = PlaintextBundleLoader::open(argv[4], *loaded.plan.plaintext_bundle, {}, spec.spec.poly_degree / 2, false, {resident_budget});
+                    report["bundle_resident_bytes"] = bundle.resident_bytes();
+                    report["bundle_resident_load_seconds"] = bundle.resident_load_seconds();
                     report["bundle_index_seconds"] = seconds(start);
                     report["bundle_index_peak_rss_bytes"] = peak_rss_bytes();
                 }
             }
+            report["total_load_verify_index_seconds"] = report.at("load_seconds").get<double>() +
+                report.value("verify_seconds", 0.0) + report.value("bundle_index_seconds", 0.0);
             report["peak_rss_bytes"] = peak_rss_bytes();
             start = Clock::now();
             loaded = {};

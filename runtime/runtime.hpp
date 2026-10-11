@@ -177,7 +177,8 @@ public:
             check_memory_instruction_support(diff_mode);
             count_uses();
             load_bundle(resources);
-            api_.preflight(loaded_plan.source_sha256,
+            api_.preflight(loaded_plan.preflight_identity.empty() ? loaded_plan.source_sha256
+                                                                : loaded_plan.preflight_identity,
                            resources.skip_artifact_digest_checks,
                            plan_->target, resources.operator_spec.spec, requirements);
             bind_inputs(local_inputs);

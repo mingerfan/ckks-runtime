@@ -49,6 +49,7 @@ ckks_runtime_enable_warnings(ckks_runtime_core)
 
 add_library(ckks_runtime_plan_json STATIC
     runtime/json_plan_reader.cpp
+    runtime/plan_reader.cpp
     runtime/operator_spec_reader.cpp
 )
 add_library(ckks_runtime::plan_json ALIAS ckks_runtime_plan_json)

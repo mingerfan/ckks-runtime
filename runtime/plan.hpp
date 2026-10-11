@@ -117,6 +117,7 @@ struct PlaintextBundleRef {
     std::string id;
     int version = 0;
     std::string manifest_sha256;
+    std::string manifest_format = "json";
 };
 
 struct KeyRequirement {
@@ -160,6 +161,9 @@ struct RuntimePlan {
 struct LoadedRuntimePlan {
     RuntimePlan plan;
     std::string source_sha256;
+    // Binary loading does not hash the full file. MPI compares small metadata
+    // identities instead; this does not certify instruction byte equality.
+    std::string preflight_identity{};
 };
 
 std::string to_string(ValueKind kind);

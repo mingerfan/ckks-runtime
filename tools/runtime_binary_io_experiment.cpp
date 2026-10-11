@@ -1,6 +1,7 @@
 #include "experiments/binary_io_codec.hpp"
 #include "experiments/binary_io_parallel.hpp"
 #include "runtime/operator_spec_reader.hpp"
+#include "runtime/plan_reader.hpp"
 #include "runtime/verifier.hpp"
 
 #include <chrono>
@@ -273,6 +274,9 @@ static void self_test(const std::filesystem::path &source, const std::filesystem
         compare_plans(loaded.plan, decoded);
         for (unsigned threads : {1U, 4U})
             compare_plans(loaded.plan, expio::read_plan_parallel(bytes, threads));
+        auto production_bytes = bytes;
+        production_bytes.replace(0, 8, "CKKSPL01");
+        compare_plans(loaded.plan, binary_io::read_plan_parallel(production_bytes, 4));
         if (projection(decoded) != original)
             throw std::runtime_error("binary roundtrip differs");
         auto changed = decoded;
@@ -340,7 +344,37 @@ int main(int argc, char **argv) {
         }
         JsonReadStats stats;
         const auto start = Clock::now();
-        if (mode == "compare-binary-readers" && argc == 4) {
+        if ((mode == "promote-plan" || mode == "convert-production-plan") && argc == 4) {
+            if (std::filesystem::exists(argv[3])) throw std::runtime_error("output already exists");
+            auto p = mode == "promote-plan" ? load_binary_plan(path, stats) : RuntimePlanReader::read_file(path).plan;
+            if (p.plaintext_bundle) { p.plaintext_bundle->manifest_format = "binary"; p.plaintext_bundle->manifest_sha256.clear(); }
+            std::ofstream out(argv[3], std::ios::binary);
+            binary_io::write_plan(out, p); out.close();
+            if (!out) throw std::runtime_error("failed to close binary output");
+            std::cout << Json{{"seconds", seconds(start)}, {"bytes", std::filesystem::file_size(argv[3])},
+                             {"hash_seconds", 0}, {"blob_payloads_read", 0}}.dump() << '\n';
+        } else if (mode == "promote-manifest" && argc == 4) {
+            if (std::filesystem::exists(argv[3])) throw std::runtime_error("output already exists");
+            auto manifest = load_manifest(path, false, stats);
+            std::ofstream out(argv[3], std::ios::binary);
+            binary_io::Archive<false> archive(out);
+            binary_io::manifest_records(archive, manifest); out.close();
+            if (!out) throw std::runtime_error("failed to close binary manifest");
+            std::cout << Json{{"seconds", seconds(start)}, {"bytes", std::filesystem::file_size(argv[3])},
+                             {"entries", manifest.entries.size()}, {"hash_seconds", 0}, {"blob_payloads_read", 0}}.dump() << '\n';
+        } else if ((mode == "compare-production-plan" || mode == "compare-production-json") && argc == 4) {
+            auto baseline = mode == "compare-production-plan" ? load_binary_plan(path, stats) : RuntimePlanReader::read_file(path).plan;
+            auto production = RuntimePlanReader::read_file(argv[3], {4});
+            if (baseline.plaintext_bundle) {
+                baseline.plaintext_bundle->manifest_format = "binary";
+                baseline.plaintext_bundle->manifest_sha256.clear();
+            }
+            compare_plans(baseline, production.plan);
+            std::cout << Json{{"all_fields_equal", true}, {"bundle_reference_format_changed", true}, {"source_hashing", mode == "compare-production-json"},
+                             {"values", baseline.values.size()},
+                             {"instructions", baseline.initialization.size() + baseline.execution.size() + baseline.finalization.size()},
+                             {"seconds", seconds(start)}, {"hash_seconds", 0}, {"blob_payloads_read", 0}, {"peak_rss_bytes", rss()}}.dump() << '\n';
+        } else if (mode == "compare-binary-readers" && argc == 4) {
             auto baseline = load_binary_plan(path, stats);
             JsonReadStats parallel_stats;
             double scan = 0, decode = 0;

@@ -1,4 +1,7 @@
 #include "runtime/json_plan_reader.hpp"
+#include "runtime/plan_reader.hpp"
+#include "runtime/binary_plan_codec.hpp"
+#include "runtime/binary_manifest_codec.hpp"
 #include "runtime/json_utils.hpp"
 #include "runtime/operator_spec_reader.hpp"
 #include "runtime/plaintext_bundle.hpp"
@@ -607,6 +610,65 @@ void test_packed_bundle() {
         require(result.timing.encode_calls == 2 && result.timing.fence_calls == 1, "pack changed V3 scheduling");
         require(result.values.size() == 2, "pack lost final outputs");
     }
+    // Production binary plan + manifest: verify the same V3 execution results,
+    // both thread counts and storage modes, without payload digest scans.
+    std::istringstream manifest_stream(manifest.dump());
+    auto binary_manifest = binary_io::read_json_manifest(manifest_stream);
+    std::ofstream manifest_output(temp / "manifest.bin", std::ios::binary);
+    binary_io::Archive<false> manifest_archive(manifest_output);
+    binary_io::manifest_records(manifest_archive, binary_manifest);
+    manifest_output.close();
+    loaded_plan.plan.plaintext_bundle->manifest_format = "binary";
+    loaded_plan.plan.plaintext_bundle->manifest_sha256.clear();
+    std::ofstream plan_output(temp / "plan.bin", std::ios::binary);
+    binary_io::write_plan(plan_output, loaded_plan.plan);
+    plan_output.close();
+    for (unsigned threads : {1U, 4U}) {
+        PlanReadStats stats;
+        auto binary_plan = RuntimePlanReader::read_file((temp / "plan.bin").string(), {threads}, &stats);
+        require(stats.binary && stats.threads == threads && stats.hash_seconds == 0,
+                "binary plan reader used the wrong path");
+        require(binary_plan.source_sha256.empty() && !binary_plan.preflight_identity.empty(),
+                "binary reader reported a whole-file source digest");
+        for (std::uint64_t budget : {std::uint64_t(0), std::uint64_t(packed.size())}) {
+            auto cluster = std::make_shared<MockCluster>(MockClusterConfig{});
+            MockVecApi api(0, cluster);
+            SequentialRuntime<MockVecApi> runtime(0, 1, 1, api);
+            const auto result = runtime.run(binary_plan, RuntimeResources{spec, temp, false, {budget}}, {});
+            require(result.timing.encode_calls == 2 && result.timing.fence_calls == 1 && result.values.size() == 2,
+                    "binary format changed V3 execution");
+            auto padded = expected[0];
+            padded.resize(spec.spec.poly_degree / 2, 0.0);
+            for (const auto &value : result.values)
+                require(value.second.value.materialize().slots == padded, "binary format changed output slots");
+        }
+    }
+    expect_throw([&] { RuntimePlanReader::read_file((temp / "plan.bin").string(), {65}); }, "threads");
+    const auto binary_bytes = json_utils::read_file_bytes((temp / "plan.bin").string());
+    for (const auto &bad : {binary_bytes.substr(0, binary_bytes.size() - 1), binary_bytes + "extra",
+                           std::string("badmagic") + binary_bytes.substr(8)}) {
+        std::ofstream out(temp / "bad.bin", std::ios::binary); out << bad; out.close();
+        expect_throw([&] { RuntimePlanReader::read_file((temp / "bad.bin").string(), {4}); });
+    }
+    auto unsupported = binary_bytes;
+    unsupported[8] = 2;
+    std::ofstream unsupported_out(temp / "unsupported.bin", std::ios::binary);
+    unsupported_out << unsupported; unsupported_out.close();
+    expect_throw([&] { RuntimePlanReader::read_file((temp / "unsupported.bin").string()); }, "version");
+    const auto manifest_bytes = json_utils::read_file_bytes((temp / "manifest.bin").string());
+    auto binary_ref = *loaded_plan.plan.plaintext_bundle;
+    auto wrong_ref = binary_ref; wrong_ref.id += "changed";
+    expect_throw([&] { PlaintextBundleLoader::open(temp, wrong_ref, {}, 16384, false); }, "does not match");
+    for (const auto &bad : {manifest_bytes.substr(0, manifest_bytes.size() - 1), manifest_bytes + "extra",
+                           std::string("badmagic") + manifest_bytes.substr(8)}) {
+        std::ofstream out(temp / "manifest.bin", std::ios::binary); out << bad; out.close();
+        expect_throw([&] { PlaintextBundleLoader::open(temp, binary_ref, {}, 16384, false); });
+    }
+    // Out-of-bounds ranges are rejected even with all digest scans disabled.
+    auto bad = manifest_bytes;
+    std::fill(bad.end() - 16, bad.end() - 8, static_cast<char>(255));
+    std::ofstream out(temp / "manifest.bin", std::ios::binary); out << bad; out.close();
+    expect_throw([&] { PlaintextBundleLoader::open(temp, binary_ref, {}, 16384, false); }, "range");
     std::filesystem::remove_all(temp);
 }
 

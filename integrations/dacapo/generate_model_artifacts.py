@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import struct
 import os
 import shlex
 import subprocess
@@ -180,6 +181,7 @@ def build_optimizer_command(args, traced: Path, spec: dict,
         "--mlir-print-local-scope",
         "--mlir-disable-threading",
         f"--runtime-plan-id={args.plan_id}",
+        f"--runtime-plan-format={args.plan_format}",
         f"--runtime-plan-target-id={spec['target_id']}",
         "--runtime-plan-capability-version=1",
         f"--runtime-plan-operator-spec-id={spec['spec_id']}",
@@ -253,6 +255,8 @@ def main() -> None:
     parser.add_argument("--boot-placement", choices=("optimized", "greedy", "depth-dp"),
                         default="optimized",
                         help="Use greedy for lazy refresh or depth-dp for fast depth-boundary planning")
+    parser.add_argument("--plan-format", choices=("binary", "json"), default="binary",
+                        help="binary for execution; json for readable instructions")
     parser.add_argument("--plan-id", type=int, default=1)
     parser.add_argument("--inline-payload-max-bytes", type=int, default=4096)
     parser.add_argument(
@@ -363,23 +367,35 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     subprocess.run(command, cwd=DACAPO, check=True)
 
+    suffix = ".runtime-plan.bin" if args.plan_format == "binary" else ".runtime-plan.json"
     runtime_plans = sorted(output_dir.glob(
-        f"{args.model}.optimized.*.runtime-plan.json"
+        f"{args.model}.optimized.*{suffix}"
     ))
     if not runtime_plans:
-        raise FileNotFoundError("hecate-opt did not generate a RuntimePlan JSON file")
+        raise FileNotFoundError("hecate-opt did not generate a RuntimePlan file")
     print(f"traced MLIR: {traced}")
     print(f"optimized MLIR: {output_dir / f'{args.model}.optimized.mlir'}")
     for path in runtime_plans:
         print(f"RuntimePlan: {path}")
         if args.runtime_plan_memory_report:
-            report = Path(str(path).removesuffix(".runtime-plan.json") + ".memory.json")
+            report = Path(str(path).removesuffix(suffix) + ".memory.json")
             if not report.is_file():
                 raise FileNotFoundError(f"memory report not found: {report}")
             print(f"memory report: {report}")
-        plan = json.loads(path.read_text(encoding="utf-8"))
+        if args.plan_format == "json":
+            plan = json.loads(path.read_text(encoding="utf-8"))
+        else:
+            # Only read the small metadata header; never load millions of records here.
+            with path.open("rb") as stream:
+                header = stream.read(16)
+                if len(header) != 16 or header[:8] != b"CKKSPL01":
+                    raise ValueError(f"invalid binary plan header: {path}")
+                version, length = struct.unpack("<II", header[8:])
+                if version != 1 or length > 1024 * 1024:
+                    raise ValueError(f"unsupported binary plan header: {path}")
+                plan = json.loads(stream.read(length))
         if "plaintext_bundle" in plan:
-            bundle = Path(str(path).removesuffix(".runtime-plan.json") + ".bundle")
+            bundle = Path(str(path).removesuffix(suffix) + ".bundle")
             if not bundle.is_dir():
                 raise FileNotFoundError(f"RuntimePlan bundle directory not found: {bundle}")
             print(f"plaintext bundle: {bundle}")
