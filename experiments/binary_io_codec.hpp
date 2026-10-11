@@ -53,21 +53,36 @@ struct Strings {
 
 template <bool Reading> class Archive {
     using Stream = std::conditional_t<Reading, std::istream, std::ostream>;
-    Stream &stream;
+    Stream *stream;
     std::uint64_t remaining;
+    const char *cursor_ = nullptr;
+    const Strings *shared_strings_ = nullptr;
 
   public:
     Strings strings;
-    explicit Archive(Stream &stream, std::uint64_t size = 0) : stream(stream), remaining(size) {}
+    explicit Archive(Stream &stream, std::uint64_t size = 0) : stream(&stream), remaining(size) {}
+    explicit Archive(std::string_view bytes, const Strings *strings = nullptr)
+        : stream(nullptr), remaining(bytes.size()), cursor_(bytes.data()), shared_strings_(strings) {
+        static_assert(Reading, "memory cursor is read-only");
+    }
+    const char *cursor() const { return cursor_; }
+    std::uint64_t available() const { return remaining; }
+    void skip(std::uint64_t size) {
+        static_assert(Reading, "skip is read-only");
+        if (!cursor_ || size > remaining) throw std::runtime_error("truncated binary record");
+        cursor_ += size;
+        remaining -= size;
+    }
     void bytes(char *data, std::size_t size) {
         if constexpr (Reading) {
             if (size > remaining)
                 throw std::runtime_error("truncated binary record");
-            stream.read(data, size);
+            if (cursor_) { std::memcpy(data, cursor_, size); cursor_ += size; }
+            else stream->read(data, size);
             remaining -= size;
         } else
-            stream.write(data, size);
-        if (!stream)
+            stream->write(data, size);
+        if (stream && !*stream)
             throw std::runtime_error("binary I/O failed");
     }
     template <class T> void number(T &value) {
@@ -130,10 +145,11 @@ template <bool Reading> class Archive {
         if constexpr (!Reading)
             index = strings.indices.at(value);
         number(index);
-        if (index >= strings.values.size())
+        const auto &table = shared_strings_ ? *shared_strings_ : strings;
+        if (index >= table.values.size())
             throw std::runtime_error("invalid binary string reference");
         if constexpr (Reading)
-            value = strings.values[index];
+            value = table.values[index];
     }
     template <class T, class Visit> void sequence(std::vector<T> &values, std::size_t minimum_bytes, Visit visit) {
         std::uint64_t size = values.size();
@@ -166,9 +182,9 @@ template <bool Reading> class Archive {
     }
     void finish() {
         if constexpr (Reading) {
-            if (remaining || stream.peek() != std::char_traits<char>::eof())
+            if (remaining || (stream && stream->peek() != std::char_traits<char>::eof()))
                 throw std::runtime_error("trailing binary bytes");
-        } else if (!stream)
+        } else if (!*stream)
             throw std::runtime_error("binary write failed");
     }
 };
@@ -320,8 +336,7 @@ template <bool R> void instruction(Archive<R> &a, Instruction &i, std::uint32_t 
     }
 }
 
-template <bool R> void plan_records(Archive<R> &a, RuntimePlan &p) {
-    a.sequence(p.values, 35, [&](ValueDesc &v) {
+template <bool R> void value_record(Archive<R> &a, ValueDesc &v) {
         a.number(v.id);
         a.enumeration(v.kind, 1);
         place(a, v.place);
@@ -332,7 +347,10 @@ template <bool R> void plan_records(Archive<R> &a, RuntimePlan &p) {
         a.number(v.components);
         if (v.level < 0 || v.scale_log2 < 0 || v.components < 1)
             throw std::runtime_error("invalid binary value metadata");
-    });
+}
+
+template <bool R> void plan_records(Archive<R> &a, RuntimePlan &p) {
+    a.sequence(p.values, 35, [&](ValueDesc &v) { value_record(a, v); });
     a.sequence(p.external_inputs, 8, [&](ValueId &v) { a.number(v); });
     for (auto *phase : {&p.initialization, &p.execution, &p.finalization})
         a.sequence(*phase, 9, [&](Instruction &i) { instruction(a, i, p.format_version); });

@@ -218,9 +218,13 @@ private:
 // SAX parsing consumes the entire document, including trailing whitespace.
 class HashingInputBuffer : public std::streambuf {
 public:
-    HashingInputBuffer(std::istream &input, const std::string &document, JsonReadStats *stats = nullptr)
-        : input_(input), document_(document), stats_(stats) {}
-    std::string source_sha256() const { return "sha256:" + hash_.hex_digest(); }
+    HashingInputBuffer(std::istream &input, const std::string &document, JsonReadStats *stats = nullptr,
+                       bool hash_source = true)
+        : input_(input), document_(document), stats_(stats), hash_source_(hash_source) {}
+    std::string source_sha256() const {
+        if (!hash_source_) throw std::runtime_error("source hashing is disabled");
+        return "sha256:" + hash_.hex_digest();
+    }
 private:
     int_type underflow() override {
         const auto read_start = stats_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -245,12 +249,12 @@ private:
             static_cast<unsigned char>(buffer_[1]) == 0xbb && static_cast<unsigned char>(buffer_[2]) == 0xbf)
             fail(document_, "$", "UTF-8 BOM is not allowed");
         first_ = false;
-        const auto hash_start = stats_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        hash_.update(std::string_view(buffer_.data(), static_cast<std::size_t>(count)));
-        if (stats_) {
-            stats_->hash_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - hash_start).count();
-            stats_->source_bytes += static_cast<std::uint64_t>(count);
+        if (hash_source_) {
+            const auto hash_start = stats_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            hash_.update(std::string_view(buffer_.data(), static_cast<std::size_t>(count)));
+            if (stats_) stats_->hash_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - hash_start).count();
         }
+        if (stats_) stats_->source_bytes += static_cast<std::uint64_t>(count);
         setg(buffer_.data(), buffer_.data(), buffer_.data() + count);
         return traits_type::to_int_type(*gptr());
     }
@@ -259,6 +263,7 @@ private:
     std::array<char, 64 * 1024> buffer_{};
     Sha256 hash_;
     JsonReadStats *stats_;
+    bool hash_source_;
     bool first_ = true;
 };
 

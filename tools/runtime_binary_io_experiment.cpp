@@ -1,4 +1,5 @@
 #include "experiments/binary_io_codec.hpp"
+#include "experiments/binary_io_parallel.hpp"
 #include "runtime/operator_spec_reader.hpp"
 #include "runtime/verifier.hpp"
 
@@ -6,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <sys/resource.h>
 #include <tuple>
@@ -186,19 +188,47 @@ static RuntimePlan load_binary_plan(const std::string &path, JsonReadStats &stat
     std::ifstream in(path, std::ios::binary);
     if (!in)
         throw std::runtime_error("cannot open binary plan");
-    json_utils::HashingInputBuffer buffer(in, path, &stats);
+    json_utils::HashingInputBuffer buffer(in, path, &stats, false);
     std::istream parser(&buffer);
     auto result = expio::read_plan(parser, std::filesystem::file_size(path));
-    buffer.source_sha256();
     stats.parse_build_seconds = seconds(start) - stats.read_seconds - stats.hash_seconds;
     return result;
+}
+static RuntimePlan load_parallel_plan(const std::string &path, JsonReadStats &stats, unsigned threads,
+                                     double &scan_seconds, double &decode_seconds) {
+    const auto start = Clock::now();
+    const auto size = std::filesystem::file_size(path);
+    if (size > (8ULL << 30)) throw std::runtime_error("binary file exceeds 8 GiB experiment limit");
+    std::unique_ptr<char[]> bytes(new char[static_cast<std::size_t>(size)]);
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot open binary plan");
+    for (std::size_t offset = 0; offset < size;) {
+        const auto count = std::min<std::size_t>(8 << 20, size - offset);
+        in.read(bytes.get() + offset, static_cast<std::streamsize>(count));
+        if (!in) throw std::runtime_error("truncated binary file");
+        offset += count;
+    }
+    if (in.peek() != std::char_traits<char>::eof() || in.bad()) throw std::runtime_error("binary file size changed");
+    stats.read_seconds = seconds(start);
+    stats.source_bytes = size;
+    auto p = expio::read_plan_parallel({bytes.get(), static_cast<std::size_t>(size)}, threads, &scan_seconds, &decode_seconds);
+    stats.parse_build_seconds = seconds(start) - stats.read_seconds;
+    return p;
+}
+static unsigned read_threads(const char *text) {
+    unsigned count = 0;
+    const auto *end = text + std::strlen(text);
+    const auto parsed = std::from_chars(text, end, count);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || count == 0 || count > 64)
+        throw std::runtime_error("threads must be between 1 and 64");
+    return count;
 }
 static expio::Manifest load_manifest(const std::string &path, bool binary, JsonReadStats &stats) {
     const auto start = Clock::now();
     std::ifstream in(path, std::ios::binary);
     if (!in)
         throw std::runtime_error("cannot open manifest");
-    json_utils::HashingInputBuffer buffer(in, path, &stats);
+    json_utils::HashingInputBuffer buffer(in, path, &stats, false);
     std::istream parser(&buffer);
     expio::Manifest m;
     if (binary) {
@@ -206,7 +236,6 @@ static expio::Manifest load_manifest(const std::string &path, bool binary, JsonR
         expio::manifest_records(a, m);
     } else
         m = expio::read_json_manifest(parser);
-    buffer.source_sha256();
     stats.parse_build_seconds = seconds(start) - stats.read_seconds - stats.hash_seconds;
     return m;
 }
@@ -242,6 +271,8 @@ static void self_test(const std::filesystem::path &source, const std::filesystem
         std::istringstream in(bytes, std::ios::binary);
         const auto decoded = expio::read_plan(in, bytes.size());
         compare_plans(loaded.plan, decoded);
+        for (unsigned threads : {1U, 4U})
+            compare_plans(loaded.plan, expio::read_plan_parallel(bytes, threads));
         if (projection(decoded) != original)
             throw std::runtime_error("binary roundtrip differs");
         auto changed = decoded;
@@ -262,6 +293,33 @@ static void self_test(const std::filesystem::path &source, const std::filesystem
             }
             if (!rejected)
                 throw std::runtime_error("damaged binary plan accepted");
+            rejected = false;
+            try { expio::read_plan_parallel(bad, 4); }
+            catch (const std::exception &) { rejected = true; }
+            if (!rejected) throw std::runtime_error("damaged parallel binary plan accepted");
+        }
+        // Corrupt a descriptor enum and the first instruction tag so errors
+        // exercise both worker validation and the boundary scanner.
+        expio::Archive<true> cursor(bytes);
+        cursor.magic("PLNEXP01");
+        std::string root;
+        cursor.text(root);
+        cursor.sequence(cursor.strings.values, 4, [&](std::string &s) { cursor.text(s); });
+        std::uint64_t count = 0;
+        cursor.number(count);
+        const auto value_offset = static_cast<std::size_t>(cursor.cursor() - bytes.data());
+        cursor.skip(count * 35);
+        expio::skip_sequence(cursor, 8);
+        cursor.number(count);
+        if (!count) cursor.number(count); // empty initialization -> execution
+        const auto instruction_offset = static_cast<std::size_t>(cursor.cursor() - bytes.data());
+        for (auto offset : {value_offset + 8, instruction_offset + 8}) {
+            auto bad = bytes;
+            bad.at(offset) = static_cast<char>(255);
+            bool rejected = false;
+            try { expio::read_plan_parallel(bad, 4); }
+            catch (const std::exception &) { rejected = true; }
+            if (!rejected) throw std::runtime_error("invalid parallel enum/tag accepted");
         }
         ++cases;
     }
@@ -282,7 +340,19 @@ int main(int argc, char **argv) {
         }
         JsonReadStats stats;
         const auto start = Clock::now();
-        if (mode == "convert-plan-check" && (argc == 4 || argc == 5)) {
+        if (mode == "compare-binary-readers" && argc == 4) {
+            auto baseline = load_binary_plan(path, stats);
+            JsonReadStats parallel_stats;
+            double scan = 0, decode = 0;
+            auto parallel = load_parallel_plan(path, parallel_stats, read_threads(argv[3]), scan, decode);
+            const auto compare_start = Clock::now();
+            compare_plans(baseline, parallel);
+            std::cout << Json{{"all_fields_equal", true}, {"threads", read_threads(argv[3])},
+                             {"values", baseline.values.size()},
+                             {"instructions", baseline.initialization.size() + baseline.execution.size() + baseline.finalization.size()},
+                             {"compare_seconds", seconds(compare_start)}, {"hash_seconds", 0},
+                             {"blob_payloads_read", 0}, {"peak_rss_bytes", rss()}}.dump() << '\n';
+        } else if (mode == "convert-plan-check" && (argc == 4 || argc == 5)) {
             std::cerr << "loading source JSON\n";
             auto loaded = RuntimePlanJsonReader::read_file(path, &stats);
             auto baseline = metrics(path, stats, seconds(start));
@@ -367,9 +437,13 @@ int main(int argc, char **argv) {
                               {"blob_payloads_read", 0}}
                              .dump()
                       << '\n';
-        } else if ((mode == "plan-json" || mode == "plan-binary") && (argc == 3 || argc == 4)) {
+        } else if (((mode == "plan-json" || mode == "plan-binary") && (argc == 3 || argc == 4)) ||
+                   (mode == "plan-binary-parallel" && argc == 5)) {
+            const unsigned threads = mode == "plan-binary-parallel" ? read_threads(argv[4]) : 1;
+            double scan = 0, decode = 0;
             auto p = mode == "plan-json" ? RuntimePlanJsonReader::read_file(path, &stats).plan
-                                         : load_binary_plan(path, stats);
+                     : mode == "plan-binary" ? load_binary_plan(path, stats)
+                     : load_parallel_plan(path, stats, threads, scan, decode);
             auto r = metrics(path, stats, seconds(start));
             r.update({{"mode", mode},
                       {"values", p.values.size()},
@@ -378,7 +452,10 @@ int main(int argc, char **argv) {
                        p.values.capacity() * sizeof(ValueDesc) +
                            (p.initialization.capacity() + p.execution.capacity() + p.finalization.capacity()) *
                                sizeof(Instruction)}});
-            if (argc == 4) {
+            if (mode != "plan-json") r["source_hashing"] = false;
+            r["threads"] = threads;
+            if (mode == "plan-binary-parallel") r.update({{"scan_allocate_seconds", scan}, {"decode_seconds", decode}});
+            if (argc >= 4) {
                 auto spec = OperatorSpecReader::read_file(argv[3]);
                 const auto verify_start = Clock::now();
                 const auto requirements = PlanVerifier::verify(p, spec);
