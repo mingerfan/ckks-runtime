@@ -1,6 +1,7 @@
 #include "runtime/verifier.hpp"
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <map>
 #include <set>
@@ -16,7 +17,33 @@ namespace {
     throw std::runtime_error("plan verification failed: " + message);
 }
 
-using DescMap = std::unordered_map<ValueId, const ValueDesc *>;
+class DescMap {
+    const std::vector<ValueDesc> &values_;
+    bool dense_ = true;
+    std::unordered_map<ValueId, std::size_t> indices_;
+public:
+    explicit DescMap(const std::vector<ValueDesc> &values) : values_(values) {
+        for (std::size_t i = 0; i < values.size(); ++i)
+            if (values[i].id != i) { dense_ = false; break; }
+        if (!dense_) {
+            indices_.reserve(values.size());
+            for (std::size_t i = 0; i < values.size(); ++i)
+                if (!indices_.emplace(values[i].id, i).second)
+                    fail("duplicate ValueId " + std::to_string(values[i].id));
+        }
+    }
+    std::size_t find(ValueId id) const {
+        if (dense_) return id < values_.size() ? static_cast<std::size_t>(id) : values_.size();
+        const auto found = indices_.find(id);
+        return found == indices_.end() ? values_.size() : found->second;
+    }
+    std::size_t index(ValueId id, std::string_view where) const {
+        const auto i = find(id);
+        if (i == values_.size()) fail(std::string(where) + " has no ValueDesc: " + std::to_string(id));
+        return i;
+    }
+    const ValueDesc &lookup(ValueId id, std::string_view where) const { return values_[index(id, where)]; }
+};
 
 void check_place(const RuntimePlan &plan, const Place &place) {
     if (place.rank < 0 || place.rank >= plan.target.world_size)
@@ -32,9 +59,7 @@ void check_place(const RuntimePlan &plan, const Place &place) {
 }
 
 const ValueDesc &lookup(const DescMap &descs, ValueId id, std::string_view where) {
-    const auto found = descs.find(id);
-    if (found == descs.end()) fail(std::string(where) + " has no ValueDesc: " + std::to_string(id));
-    return *found->second;
+    return descs.lookup(id, where);
 }
 
 bool same_metadata(const ValueDesc &a, const ValueDesc &b) {
@@ -42,40 +67,41 @@ bool same_metadata(const ValueDesc &a, const ValueDesc &b) {
            a.scale_log2 == b.scale_log2 && a.ntt == b.ntt && a.components == b.components;
 }
 
-void require_same_base(const ValueDesc &input, const ValueDesc &output, const std::string &op) {
+void require_same_base(const ValueDesc &input, const ValueDesc &output, ComputeKind op) {
     if (input.context != output.context || input.ntt != output.ntt)
-        fail(op + " changes context or NTT state");
+        fail(to_string(op) + " changes context or NTT state");
 }
 
-std::vector<ValueKind> expected_inputs(ComputeKind kind) {
+struct InputKinds { std::array<ValueKind, 2> kinds; std::size_t count; };
+InputKinds expected_inputs(ComputeKind kind) {
     using V = ValueKind;
     switch (kind) {
     case ComputeKind::AddCC: case ComputeKind::SubCC: case ComputeKind::MulCC:
-        return {V::Ciphertext, V::Ciphertext};
+        return {{V::Ciphertext, V::Ciphertext}, 2};
     case ComputeKind::AddCP: case ComputeKind::SubCP: case ComputeKind::MulCP:
-        return {V::Ciphertext, V::Plaintext};
+        return {{V::Ciphertext, V::Plaintext}, 2};
     case ComputeKind::Negate: case ComputeKind::Rotate: case ComputeKind::Rescale:
     case ComputeKind::ModSwitch: case ComputeKind::Relinearize: case ComputeKind::Boot:
-        return {V::Ciphertext};
+        return {{V::Ciphertext, V::Ciphertext}, 1};
     }
     fail("unknown compute operation");
 }
 
 void verify_compute_metadata(const ComputeOp &op, const DescMap &descs) {
     const auto types = expected_inputs(op.kind);
-    if (op.inputs.size() != types.size()) fail(to_string(op.kind) + " has wrong input count");
-    std::vector<const ValueDesc *> inputs;
+    if (op.inputs.size() != types.count) fail(to_string(op.kind) + " has wrong input count");
+    std::array<const ValueDesc *, 2> inputs{};
     for (std::size_t i = 0; i < op.inputs.size(); ++i) {
         const auto &input = lookup(descs, op.inputs[i], "compute input");
-        if (input.kind != types[i]) fail(to_string(op.kind) + " has wrong input kind");
+        if (input.kind != types.kinds[i]) fail(to_string(op.kind) + " has wrong input kind");
         if (input.place != op.place) fail("implicit cross-Place compute operand " + std::to_string(input.id));
-        inputs.push_back(&input);
+        inputs[i] = &input;
     }
     const auto &output = lookup(descs, op.output, "compute output");
     if (output.kind != ValueKind::Ciphertext) fail("compute output must be ciphertext");
     if (output.place != op.place) fail("compute output Place mismatch");
-    require_same_base(*inputs[0], output, to_string(op.kind));
-    if (inputs.size() == 2) {
+    require_same_base(*inputs[0], output, op.kind);
+    if (types.count == 2) {
         if (inputs[0]->context != inputs[1]->context || inputs[0]->ntt != inputs[1]->ntt ||
             inputs[0]->level != inputs[1]->level)
             fail(to_string(op.kind) + " inputs have incompatible metadata");
@@ -187,59 +213,84 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
         fail("OperatorSpec source SHA-256 mismatch");
     if (plan.target.target_id != spec.target_id) fail("target_id does not match OperatorSpec");
 
-    DescMap descs;
+    const DescMap descs(plan.values);
+    std::vector<long long> modulus_budgets;
+    modulus_budgets.reserve(spec.rns_moduli_log2.size());
+    long long modulus_budget = 0;
+    for (int bits : spec.rns_moduli_log2) {
+        modulus_budget += bits;
+        modulus_budgets.push_back(modulus_budget);
+    }
     for (const auto &value : plan.values) {
         check_place(plan, value.place);
-        if (!descs.emplace(value.id, &value).second) fail("duplicate ValueId " + std::to_string(value.id));
         if (value.context != spec.context_id) fail("value context does not match OperatorSpec");
         if (value.level < spec.level_lower_bound || value.level > spec.level_upper_bound)
             fail("value level is outside OperatorSpec range");
-        long long modulus_budget = 0;
-        for (int level = 0; level <= value.level; ++level) modulus_budget += spec.rns_moduli_log2.at(static_cast<std::size_t>(level));
-        if (value.scale_log2 >= modulus_budget) fail("value scale exceeds modulus budget");
+        if (value.scale_log2 >= modulus_budgets.at(static_cast<std::size_t>(value.level)))
+            fail("value scale exceeds modulus budget");
         if (value.kind == ValueKind::Plaintext && value.components != 1)
             fail("plaintext components must be one");
         if (value.kind == ValueKind::Ciphertext && value.components < 2)
             fail("ciphertext components must be at least two");
     }
 
-    std::unordered_set<ValueId> defined;
-    std::unordered_set<ValueId> mentioned;
+    enum Flag : unsigned char { Defined = 1, Mentioned = 2, Computed = 4, Returned = 8,
+                               Released = 16, Overwritten = 32, Final = 64 };
+    struct State { std::size_t uses = 0, unavailable_ordinal = 0; unsigned char flags = 0; };
+    std::vector<State> states(plan.values.size());
+    std::size_t mentioned_count = 0;
+    const auto state = [&](ValueId id, std::string_view where) -> State & { return states[descs.index(id, where)]; };
+    const auto mention = [&](State &s) {
+        if (!(s.flags & Mentioned)) { s.flags |= Mentioned; ++mentioned_count; }
+    };
     for (ValueId id : plan.external_inputs) {
         const auto &value = lookup(descs, id, "external input");
-        mentioned.insert(id);
+        auto &s = state(id, "external input");
+        mention(s);
         if (value.place.kind != PlaceKind::Host) fail("external input must be placed on Host (IO-2)");
-        if (!defined.insert(id).second) fail("duplicate external input " + std::to_string(id));
+        if (s.flags & Defined) fail("duplicate external input " + std::to_string(id));
+        s.flags |= Defined;
     }
 
     // Count operand occurrences over all phases; Release is not a data use.
-    std::unordered_map<ValueId, std::size_t> uses;
+    std::size_t transfer_count = 0;
     const auto count_uses = [&](const std::vector<Instruction> &list) {
         for (const auto &instruction : list) {
+            const auto count = [&](ValueId id) {
+                const auto index = descs.find(id);
+                if (index == states.size())
+                    fail("instruction #" + std::to_string(instruction.ordinal) + " ValueId " + std::to_string(id) +
+                         " is undefined or used before definition (use-before-definition)");
+                ++states[index].uses;
+            };
             if (const auto *op = std::get_if<ComputeOp>(&instruction.body)) {
-                for (ValueId id : op->inputs) ++uses[id];
+                for (ValueId id : op->inputs) count(id);
             } else if (const auto *action = std::get_if<CommAction>(&instruction.body)) {
-                for (ValueId id : action->inputs) ++uses[id];
+                ++transfer_count;
+                for (ValueId id : action->inputs) count(id);
             }
         }
     };
     count_uses(plan.initialization);
     count_uses(plan.execution);
     count_uses(plan.finalization);
-    const std::unordered_set<ValueId> returned(plan.final_outputs.begin(), plan.final_outputs.end());
-    std::unordered_set<ValueId> computed;
-    std::unordered_map<ValueId, std::string> unavailable;
+    for (ValueId id : plan.final_outputs) state(id, "final output").flags |= Returned;
     const auto check_available = [&](ValueId id, const Instruction &instruction) {
-        const std::string where = "instruction #" + std::to_string(instruction.ordinal) +
-                                  " ValueId " + std::to_string(id);
-        if (!defined.count(id)) fail(where + " is undefined or used before definition (use-before-definition)");
-        const auto found = unavailable.find(id);
-        if (found != unavailable.end()) fail(where + " was already " + found->second);
+        const auto index = descs.find(id);
+        if (index == states.size() || !(states[index].flags & Defined))
+            fail("instruction #" + std::to_string(instruction.ordinal) + " ValueId " + std::to_string(id) +
+                 " is undefined or used before definition (use-before-definition)");
+        const auto &s = states[index];
+        if (s.flags & (Released | Overwritten))
+            fail("instruction #" + std::to_string(instruction.ordinal) + " ValueId " + std::to_string(id) +
+                 " was already " + (s.flags & Released ? "released" : "overwritten by reuse") +
+                 " at instruction #" + std::to_string(s.unavailable_ordinal));
     };
 
     std::set<RequiredCapability> capabilities;
     std::set<KeyRequirement> keys;
     std::unordered_set<TransferId> transfers;
+    transfers.reserve(transfer_count);
     bool has_bundle_encode = false;
     std::size_t expected_ordinal = 0;
 
@@ -251,10 +302,12 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                     !(plan.format_version == 3 && phase == Phase::Execution))
                     fail("Encode is only allowed in initialization (or V3 execution)");
                 const auto &output = lookup(descs, encode->output, "Encode output");
-                mentioned.insert(output.id);
+                auto &s = state(output.id, "Encode output");
+                mention(s);
                 if (output.kind != ValueKind::Plaintext || output.place.kind != PlaceKind::Host || output.components != 1)
                     fail("Encode output must be Host plaintext");
-                if (!defined.insert(output.id).second) fail("duplicate definition of ValueId " + std::to_string(output.id));
+                if (s.flags & Defined) fail("duplicate definition of ValueId " + std::to_string(output.id));
+                s.flags |= Defined;
                 capabilities.insert(RequiredCapability::Encode);
                 if (const auto *inline_payload = std::get_if<InlineEncodePayload>(&encode->payload)) {
                     if (inline_payload->values.empty()) fail("inline Encode payload is empty");
@@ -269,11 +322,13 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                     fail("instruction #" + std::to_string(instruction.ordinal) + " reuse_input requires format version 2");
                 check_place(plan, op->place);
                 for (ValueId id : op->inputs) {
-                    mentioned.insert(id);
+                    mention(state(id, "compute input"));
                     check_available(id, instruction);
                 }
-                mentioned.insert(op->output);
-                if (!defined.insert(op->output).second) fail("duplicate definition of ValueId " + std::to_string(op->output));
+                auto &output_state = state(op->output, "compute output");
+                mention(output_state);
+                if (output_state.flags & Defined) fail("duplicate definition of ValueId " + std::to_string(op->output));
+                output_state.flags |= Defined;
                 if (op->reuse_input) {
                     if (op->inputs.empty())
                         fail("instruction #" + std::to_string(instruction.ordinal) + " reuse_input requires input 0");
@@ -287,19 +342,21 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                         ? (op->kind == ComputeKind::Negate || op->kind == ComputeKind::Rotate)
                         : (op->kind == ComputeKind::AddCP || op->kind == ComputeKind::SubCP || op->kind == ComputeKind::Rotate);
                     if (!supported) reuse_error(to_string(op->kind) + " does not support reuse on " + to_string(op->place));
-                    if (!computed.count(input)) reuse_error("input must be produced by a computation, not an external input or communication");
-                    if (returned.count(input)) reuse_error("final output cannot be overwritten");
-                    if (uses.at(input) != 1)
+                    auto &input_state = state(input, "reuse input");
+                    if (!(input_state.flags & Computed)) reuse_error("input must be produced by a computation, not an external input or communication");
+                    if (input_state.flags & Returned) reuse_error("final output cannot be overwritten");
+                    if (input_state.uses != 1)
                         reuse_error("input must have exactly one use across all phases, including communication (" +
-                                    std::to_string(uses.at(input)) + " uses)");
+                                    std::to_string(input_state.uses) + " uses)");
                     const auto &input_desc = lookup(descs, input, "reuse input");
                     const auto &output_desc = lookup(descs, op->output, "reuse output");
                     if (input_desc.place != output_desc.place || !same_metadata(input_desc, output_desc))
                         reuse_error("input and output metadata must match");
-                    unavailable.emplace(input, "overwritten by reuse at instruction #" + std::to_string(instruction.ordinal));
+                    input_state.flags |= Overwritten;
+                    input_state.unavailable_ordinal = instruction.ordinal;
                 }
                 verify_compute_metadata(*op, descs);
-                computed.insert(op->output);
+                output_state.flags |= Computed;
                 const auto support = spec.operators.find(op->kind);
                 if (support == spec.operators.end() || !support->second.supported)
                     fail(to_string(op->kind) + " is unsupported by OperatorSpec");
@@ -344,7 +401,7 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                 }
                 if (action->inputs.size() != 1 || action->sources.size() != 1)
                     fail(to_string(action->kind) + " requires one input and source");
-                mentioned.insert(action->inputs[0]);
+                mention(state(action->inputs[0], "communication source"));
                 check_available(action->inputs[0], instruction);
                 const auto &source = lookup(descs, action->inputs[0], "communication source");
                 check_place(plan, action->sources[0]);
@@ -358,26 +415,30 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                 for (std::size_t i = 0; i < count; ++i) {
                     check_place(plan, action->destinations[i]);
                     if (action->destinations[i] == source.place) fail("communication destination equals source Place");
-                    if (!destinations.insert(action->destinations[i]).second) fail("duplicate communication destination");
+                    if (count > 1 && !destinations.insert(action->destinations[i]).second) fail("duplicate communication destination");
                     const auto &output = lookup(descs, action->outputs[i], "communication output");
-                    mentioned.insert(output.id);
+                    auto &s = state(output.id, "communication output");
+                    mention(s);
                     if (output.place != action->destinations[i]) fail("communication output/destination mapping mismatch");
                     if (action->output_types[i] != source.kind || !same_metadata(source, output))
                         fail("communication changes kind or CKKS metadata");
-                    if (!defined.insert(output.id).second) fail("duplicate definition of communication output");
+                    if (s.flags & Defined) fail("duplicate definition of communication output");
+                    s.flags |= Defined;
                 }
             } else if (std::holds_alternative<FenceOp>(instruction.body)) {
                 if (plan.format_version < 3) fail("Fence requires format version 3");
                 if (phase != Phase::Execution) fail("Fence is only allowed in execution");
             } else if (const auto *release = std::get_if<ReleaseOp>(&instruction.body)) {
-                const std::string where = "instruction #" + std::to_string(instruction.ordinal) +
-                                          " Release ValueId " + std::to_string(release->value);
-                if (plan.format_version == 1) fail(where + " requires format version 2");
-                lookup(descs, release->value, where);
-                mentioned.insert(release->value);
+                const auto where = [&] { return "instruction #" + std::to_string(instruction.ordinal) +
+                                                " Release ValueId " + std::to_string(release->value); };
+                if (plan.format_version == 1) fail(where() + " requires format version 2");
+                if (descs.find(release->value) == states.size()) lookup(descs, release->value, where());
+                auto &s = state(release->value, "Release");
+                mention(s);
                 check_available(release->value, instruction);
-                if (returned.count(release->value)) fail(where + " is a final output and cannot be released");
-                unavailable.emplace(release->value, "released at instruction #" + std::to_string(instruction.ordinal));
+                if (s.flags & Returned) fail(where() + " is a final output and cannot be released");
+                s.flags |= Released;
+                s.unavailable_ordinal = instruction.ordinal;
             } else {
                 fail("unknown instruction body");
             }
@@ -390,15 +451,15 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
     if (has_bundle_encode != plan.plaintext_bundle.has_value())
         fail("plaintext_bundle must be present exactly when bundle Encode is used");
     if (plan.final_outputs.empty()) fail("final_outputs must not be empty");
-    std::unordered_set<ValueId> final_ids;
     for (ValueId id : plan.final_outputs) {
         lookup(descs, id, "final output");
-        mentioned.insert(id);
-        if (!defined.count(id)) fail("final output is undefined");
-        if (!final_ids.insert(id).second) fail("duplicate final output");
+        auto &s = state(id, "final output");
+        mention(s);
+        if (!(s.flags & Defined)) fail("final output is undefined");
+        if (s.flags & Final) fail("duplicate final output");
+        s.flags |= Final;
     }
-    if (mentioned.size() != descs.size()) fail("values contains an unused ValueDesc");
-    for (const auto &entry : descs) if (!mentioned.count(entry.first)) fail("values contains an unused ValueDesc");
+    if (mentioned_count != states.size()) fail("values contains an unused ValueDesc");
 
     PlanRequirements result;
     result.capabilities.assign(capabilities.begin(), capabilities.end());

@@ -10,8 +10,10 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 using namespace fhegpu;
 
@@ -374,6 +376,43 @@ void test_release_only_v2_execution() {
     }
 }
 
+void test_verifier_id_indexing() {
+    const auto loaded = read(fixture("gpu_reuse_chain.json"));
+    const auto spec = load_spec(loaded.plan);
+    const auto expected = PlanVerifier::verify(loaded.plan, spec);
+    const auto remap = [&](bool sparse) {
+        auto plan = loaded.plan;
+        std::unordered_map<ValueId, ValueId> ids;
+        for (std::size_t i = 0; i < plan.values.size(); ++i)
+            ids.emplace(plan.values[i].id, sparse ? std::numeric_limits<ValueId>::max() - i * 19 : i);
+        const auto list = [&](std::vector<ValueId> &values) { for (auto &id : values) id = ids.at(id); };
+        for (auto &value : plan.values) value.id = ids.at(value.id);
+        list(plan.external_inputs);
+        list(plan.final_outputs);
+        for (auto *phase : {&plan.initialization, &plan.execution, &plan.finalization})
+            for (auto &i : *phase) {
+                if (auto *v = std::get_if<EncodeOp>(&i.body)) v->output = ids.at(v->output);
+                else if (auto *v = std::get_if<ComputeOp>(&i.body)) { list(v->inputs); v->output = ids.at(v->output); }
+                else if (auto *v = std::get_if<CommAction>(&i.body)) { list(v->inputs); list(v->outputs); }
+                else if (auto *v = std::get_if<ReleaseOp>(&i.body)) v->value = ids.at(v->value);
+            }
+        return plan;
+    };
+    for (bool sparse : {false, true}) {
+        auto plan = remap(sparse);
+        const auto check = [&] {
+            const auto actual = PlanVerifier::verify(plan, spec);
+            require(actual.capabilities == expected.capabilities && actual.keys == expected.keys,
+                    "ValueId indexing changed requirements");
+        };
+        check();
+        std::reverse(plan.values.begin(), plan.values.end());
+        check();
+        plan.values.push_back(plan.values.front());
+        expect_throw([&] { PlanVerifier::verify(plan, spec); }, "duplicate ValueId");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -387,6 +426,7 @@ int main() {
         run_test("memory execution rejected before API work", test_memory_execution_rejected_before_api_work);
         run_test("Release-only CPU/GPU V2 plans execute", test_release_only_v2_execution);
         run_test("reuse chains preserve allocation and caller input", test_reuse_execution);
+        run_test("dense, sparse uint64 and reordered ValueId indexing", test_verifier_id_indexing);
         std::cout << "ALL " << tests_run << " MEMORY TEST GROUPS PASSED\n";
         return 0;
     } catch (const std::exception &error) {
