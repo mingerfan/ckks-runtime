@@ -133,6 +133,13 @@ endif()
 
 if(CKKS_RUNTIME_BUILD_EXPERIMENTS)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(runtime_binary_io_experiment tools/runtime_binary_io_experiment.cpp)
+        target_link_libraries(runtime_binary_io_experiment PRIVATE ckks_runtime_plan_json)
+        ckks_runtime_enable_warnings(runtime_binary_io_experiment)
+        if(CKKS_RUNTIME_BUILD_TESTS)
+            add_test(NAME runtime_binary_io_experiment_tests
+                COMMAND runtime_binary_io_experiment self-test ${CMAKE_CURRENT_SOURCE_DIR})
+        endif()
         add_executable(runtime_bundle_io_benchmark tools/runtime_bundle_io_benchmark.cpp)
         target_link_libraries(runtime_bundle_io_benchmark PRIVATE ckks_runtime_core)
         ckks_runtime_enable_warnings(runtime_bundle_io_benchmark)
