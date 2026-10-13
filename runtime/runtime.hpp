@@ -71,6 +71,8 @@ template<class Api,class=void>struct HasWaterlineValidation:std::false_type{};
 template<class Api>struct HasWaterlineValidation<Api,std::void_t<decltype(std::declval<Api &>().validate_waterline_resources(std::declval<const RuntimePlan &>()))>>:std::true_type{};
 template<class Api,class=void>struct HasWaterlineAllocatorCapacity:std::false_type{};
 template<class Api>struct HasWaterlineAllocatorCapacity<Api,std::void_t<decltype(std::declval<Api &>().waterline_allocator_capacity())>>:std::true_type{};
+template<class Api,class=void>struct HasWaterlineFixedResources:std::false_type{};
+template<class Api>struct HasWaterlineFixedResources<Api,std::void_t<decltype(std::declval<Api &>().waterline_fixed_resources())>>:std::true_type{};
 template<class Api> struct HasWaterlineApi<Api, std::void_t<
     decltype(std::declval<Api &>().prepare_resources(std::declval<const ValueDesc &>(), PrepareBackend::Cpu)),
     decltype(std::declval<Api &>().value_resources(std::declval<const ValueDesc &>())),
@@ -1247,6 +1249,10 @@ private:
             if (plan_->waterline) {
                 waterline_ = std::make_unique<WaterlineLedger>(*plan_->waterline,waterline_allocator_capacity_);
                 waterline_storage_.clear(); waterline_remaining_.clear(); waterline_released_.clear();
+                // Reusable Host/pinned preparation buffers stay charged across
+                // Ready completion and explicit Fence boundaries for this run.
+                if constexpr(detail::HasWaterlineFixedResources<Api>::value)
+                    waterline_->reserve(api_.waterline_fixed_resources());
                 for (const auto &[id, value] : parallel_values_) {
                     if (!value->value) continue;
                     auto storage = api_.value_resources(desc(id));
@@ -1518,6 +1524,7 @@ private:
                     const auto &indices=next->second;
                     ResourceUsage delta(devices),temp(devices);
                     std::vector<std::pair<std::size_t,PrepareResources>> needed;
+                    bool preparation_queue_full=false;
                     if(waterline_) {
                         temp=workspace(*tasks[indices.front()].task.instruction);delta+=temp;
                         for(auto i:indices) {
@@ -1528,7 +1535,16 @@ private:
                                 const auto d=static_cast<std::size_t>(desc(id).place.index);
                                 if(backend==PrepareBackend::Auto) {
                                     bool cpu_pending=workers[cpu_worker]->busy || !cpu_preparations.empty();
-                                    backend=cpu_pending && !workers[d%device_workers]->busy ? PrepareBackend::Gpu : PrepareBackend::Cpu;
+                                    const bool gpu_idle=!workers[d%device_workers]->busy;
+                                    // Do not accumulate many slow CPU preparations
+                                    // while a foreground operation temporarily
+                                    // occupies the GPU. Keep one queued complete
+                                    // group's preparations, then reconsider the
+                                    // next group after actual completion.
+                                    if(cpu_pending && !gpu_idle && !cpu_preparations.empty()) {
+                                        preparation_queue_full=true;break;
+                                    }
+                                    backend=cpu_pending && gpu_idle ? PrepareBackend::Gpu : PrepareBackend::Cpu;
                                     if(!prepare_cost(pi,backend).supported)backend=PrepareBackend::Cpu;
                                 }
                                 auto cost=prepare_cost(pi,backend);
@@ -1538,6 +1554,7 @@ private:
                             }
                             for(auto id:tasks[i].task.outputs)delta+=storage(id);
                         }
+                        if(preparation_queue_full)break;
                         // Auto's queue preference only applies to a legal
                         // complete group. GPU workspace can exceed the plain
                         // waterline even when the CPU preparation fits.
@@ -1547,6 +1564,10 @@ private:
                                 if(cpu.supported) {delta-=cost.peak;delta+=cpu.peak;cost=std::move(cpu);tasks[pi].task.backend=PrepareBackend::Cpu;}
                             }
                         }
+                        if(plan_->waterline->backend==PrepareBackend::Auto && !cpu_preparations.empty() &&
+                           std::any_of(needed.begin(),needed.end(),[&](const auto &entry) {
+                               return tasks[entry.first].task.backend==PrepareBackend::Cpu;
+                           }))break;
                         if(!waterline_->fits(delta))break;
                         waterline_->reserve(delta);
                         tickets.emplace(next->first,Ticket{temp,indices.size()});++active_groups;

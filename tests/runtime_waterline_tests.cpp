@@ -129,6 +129,40 @@ private:
     bool validated_=false;
 };
 
+class FixedBufferPrepareApi : public RestartablePrepareApi {
+public:
+    using RestartablePrepareApi::RestartablePrepareApi;
+    ResourceUsage waterline_fixed_resources() const {
+        ResourceUsage usage(devices);usage.host=80;usage.pinned=60;return usage;
+    }
+};
+
+void test_fixed_prepare_buffers(RuntimePlan plan,const LoadedOperatorSpec &spec,const std::vector<double> &input) {
+    plan.waterline->backend=PrepareBackend::Cpu;
+    plan.waterline->device_capacity_bytes={1000};
+    for(int boundary=0;boundary<3;++boundary) {
+        // External Host input and final Host output coexist (400 bytes),
+        // including after all dynamic preparation credit has been returned.
+        plan.waterline->host_budget_bytes=boundary==0?450:480;
+        plan.waterline->pinned_budget_bytes=boundary==1?100:110;
+        FixedBufferPrepareApi api(std::make_shared<MockCluster>(MockClusterConfig{}));
+        SequentialRuntime<FixedBufferPrepareApi> runtime(0,1,1,api,DeviceExecutionMode::PerDeviceWorkers);
+        const auto run=[&] {return runtime.run({plan,"sha256:"+std::string(64,'1')},{spec,std::nullopt,false},
+            {{0,make_cipher(input,spec.spec.context_id,spec.spec.poly_degree,3,30)}});};
+        if(boundary<2) {
+            CaptureRuntimeErrors capture;
+            expect_error(run,"Waterline single-group baseline infeasible");
+            require(api.preparation_attempts==0,"fixed buffer budget rejected after Prepare submission");
+        } else {
+            auto result=run().values.at(plan.final_outputs.front()).value.materialize();
+            require(std::abs(result.slots[0]-11)<1e-9 && std::abs(result.slots[1]+22)<1e-9,
+                    "fixed buffer exact budgets changed final arithmetic");
+            require(api.cpu==20 && api.gpu==0,"fixed buffer test lost rolling CPU preparations");
+        }
+    }
+    std::cout<<"PASS fixed Host/pinned buffers remain charged through rolling completions\n";
+}
+
 std::size_t event_index(const PrepareApi &api, const char *kind, ValueId id) {
     for (std::size_t i = 0; i < api.events.size(); ++i)
         if (std::string(api.events[i].kind) == kind && api.events[i].value == id) return i;
@@ -584,6 +618,7 @@ int main() {
     test_prepare_failure_and_explicit_restart(parsed,spec,input);
     test_four_device_progress_and_shared_budgets(parsed,spec,input);
     test_allocator_capacity(parsed,spec,input);
+    test_fixed_prepare_buffers(parsed,spec,input);
     test_parallel_encode_timing(parsed,spec,input);
     for(auto backend:{PrepareBackend::Cpu,PrepareBackend::Gpu,PrepareBackend::Auto}) {
         parsed.waterline->backend=backend;
