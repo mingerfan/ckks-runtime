@@ -1538,10 +1538,10 @@ private:
                                     const bool gpu_idle=!workers[d%device_workers]->busy;
                                     // Do not accumulate many slow CPU preparations
                                     // while a foreground operation temporarily
-                                    // occupies the GPU. Keep one queued complete
-                                    // group's preparations, then reconsider the
-                                    // next group after actual completion.
-                                    if(cpu_pending && !gpu_idle && !cpu_preparations.empty()) {
+                                    // occupies the GPU. Reconsider the next group
+                                    // after actual completion instead of binding
+                                    // it to the occupied CPU worker.
+                                    if(cpu_pending && !gpu_idle) {
                                         preparation_queue_full=true;break;
                                     }
                                     backend=cpu_pending && gpu_idle ? PrepareBackend::Gpu : PrepareBackend::Cpu;
@@ -1564,7 +1564,8 @@ private:
                                 if(cpu.supported) {delta-=cost.peak;delta+=cpu.peak;cost=std::move(cpu);tasks[pi].task.backend=PrepareBackend::Cpu;}
                             }
                         }
-                        if(plan_->waterline->backend==PrepareBackend::Auto && !cpu_preparations.empty() &&
+                        if(plan_->waterline->backend==PrepareBackend::Auto &&
+                           (workers[cpu_worker]->busy || !cpu_preparations.empty()) &&
                            std::any_of(needed.begin(),needed.end(),[&](const auto &entry) {
                                return tasks[entry.first].task.backend==PrepareBackend::Cpu;
                            }))break;
