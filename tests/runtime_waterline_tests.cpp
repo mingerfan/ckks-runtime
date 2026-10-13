@@ -137,6 +137,32 @@ public:
     }
 };
 
+class PrefixBudgetPrepareApi : public PrepareApi {
+public:
+    PrefixBudgetPrepareApi(bool pinned_limited)
+        :PrepareApi(std::make_shared<MockCluster>(MockClusterConfig{}),4),
+         pinned_limited_(pinned_limited) {}
+    std::atomic<unsigned> blocked_group_queries{0};
+    PrepareResources prepare_resources(const ValueDesc &desc,PrepareBackend backend) {
+        auto cost=PrepareApi::prepare_resources(desc,backend);
+        const std::uint64_t shared_cost[]={600,400,100,100};
+        if(pinned_limited_)cost.peak.pinned=shared_cost[desc.place.index];
+        else cost.peak.host=shared_cost[desc.place.index];
+        if(desc.id==21) {
+            std::lock_guard<std::mutex> lock(mutex);
+            bool first_started=false,first_completed=false;
+            for(const auto &entry:events)if(entry.value==11) {
+                first_started|=std::string(entry.kind)=="prepare";
+                first_completed|=std::string(entry.kind)=="prepare_complete";
+            }
+            if(first_started && !first_completed)++blocked_group_queries;
+        }
+        return cost;
+    }
+private:
+    bool pinned_limited_;
+};
+
 void test_fixed_prepare_buffers(RuntimePlan plan,const LoadedOperatorSpec &spec,const std::vector<double> &input) {
     plan.waterline->backend=PrepareBackend::Cpu;
     plan.waterline->device_capacity_bytes={1000};
@@ -498,6 +524,40 @@ void test_four_device_progress_and_shared_budgets(const RuntimePlan &rolling,con
                 "four-device ledger exceeded shared budgets or retained device credits");
         std::cout<<"PASS four logical GPUs, GPU1/2/3 complete before GPU0, shared "
                  <<(host_limited?"Host":"pinned")<<" limits Prepare concurrency to 2, temporary/device credits returned\n";
+    }
+    for(bool pinned_limited:{false,true}) {
+        // All device groups fit by themselves. While the first Prepare is
+        // pending, shared Host has 200 bytes left (or pinned has 200 left),
+        // so the second needs too much (400), but either later group (100)
+        // would fit. No group may reserve partially or skip the blocked head.
+        plan.waterline->device_capacity_bytes=std::vector<std::uint64_t>(4,700);
+        plan.waterline->host_budget_bytes=1000;
+        plan.waterline->pinned_budget_bytes=pinned_limited?800:500;
+        PrefixBudgetPrepareApi api(pinned_limited);
+        api.device_delay_ms={300,80,5,5};
+        SequentialRuntime<PrefixBudgetPrepareApi> runtime(0,1,4,api,DeviceExecutionMode::PerDeviceWorkers);
+        CaptureRuntimeErrors captured;
+        auto artifact=runtime.run({plan,"sha256:"+std::string(64,'1')},{spec,std::nullopt,false},
+            {{0,make_cipher(input,spec.spec.context_id,spec.spec.poly_degree,3,30)}});
+        require(api.blocked_group_queries>0,
+                "shared-budget prefix test never encountered the blocked second group during first Prepare");
+        const auto first_complete=event_index(api,"prepare_complete",11);
+        for(int device=1;device<4;++device)
+            require(first_complete<event_index(api,"prepare",11+10*device),
+                    "executor partially started the blocked group or skipped it for a later fitting group");
+        for(const auto id:plan.final_outputs) {
+            const auto result=artifact.values.at(id).value.materialize();
+            require(std::abs(result.slots[0]-1.5)<1e-9 && std::abs(result.slots[1]+3)<1e-9,
+                    "shared-budget prefix changed branch arithmetic");
+        }
+        require(api.cpu==0 && api.gpu==4 && api.active_preparations==0 && api.preparations.empty() &&
+                artifact.timing.fence_calls==0,"shared-budget prefix leaked, retried or inserted a Fence");
+        const auto log=captured.stream.str();
+        std::size_t cursor=0,returned=0;
+        while((cursor=log.find("remaining_front=0 remaining_plain=0",cursor))!=std::string::npos) {++returned;++cursor;}
+        require(returned==4,"blocked shared-budget admission retained partial device credits");
+        std::cout<<"PASS executor shared "<<(pinned_limited?"pinned":"Host")
+                 <<" head blocks later fitting groups atomically, completion resumes all four without Fence\n";
     }
 }
 
