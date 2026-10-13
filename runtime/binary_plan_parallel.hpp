@@ -22,7 +22,8 @@ inline void skip_instruction(Archive<true> &a) {
     std::uint8_t tag = 0;
     a.number(tag);
     switch (tag) {
-    case 0: {
+    case 0:
+    case 5: { // PreparePlaintext shares Encode's output and payload record.
         a.skip(8); // output
         std::uint8_t payload = 0;
         a.number(payload);
@@ -55,7 +56,7 @@ inline void skip_instruction(Archive<true> &a) {
         break;
     case 3: a.skip(8); break;
     case 4: break;
-    default: throw std::runtime_error("unknown binary instruction tag");
+    default: throw std::runtime_error("unknown binary instruction tag " + std::to_string(tag));
     }
 }
 
@@ -75,6 +76,7 @@ inline RuntimePlan read_plan_parallel(std::string_view bytes, unsigned threads,
         std::size_t begin, count;
         std::string_view bytes;
         std::vector<Instruction> *instructions; // nullptr denotes ValueDesc
+        const char *section;
     };
     std::vector<Job> jobs;
     constexpr std::size_t block_records = 16384;
@@ -91,17 +93,27 @@ inline RuntimePlan read_plan_parallel(std::string_view bytes, unsigned threads,
         const auto count = std::min(block_records, values_count - begin);
         const auto *start = a.cursor();
         a.skip(count * 35);
-        jobs.push_back({begin, count, {start, count * 35}, nullptr});
+        jobs.push_back({begin, count, {start, count * 35}, nullptr, "values"});
     }
     a.sequence(p.external_inputs, 8, [&](ValueId &id) { a.number(id); });
+    std::size_t phase_index = 0;
+    constexpr const char *phase_names[] = {"initialization", "execution", "finalization"};
     for (auto *phase : {&p.initialization, &p.execution, &p.finalization}) {
+        const auto *section = phase_names[phase_index++];
         const auto size = count_array(9, sizeof(Instruction));
         phase->resize(size);
         for (std::size_t begin = 0; begin < size; begin += block_records) {
             const auto count = std::min(block_records, size - begin);
             const auto *start = a.cursor();
-            for (std::size_t i = 0; i < count; ++i) skip_instruction(a);
-            jobs.push_back({begin, count, {start, static_cast<std::size_t>(a.cursor() - start)}, phase});
+            for (std::size_t i = 0; i < count; ++i) {
+                const auto offset = static_cast<std::size_t>(a.cursor() - bytes.data());
+                try { skip_instruction(a); }
+                catch (const std::exception &error) {
+                    throw std::runtime_error(std::string("binary ") + section + " record #" +
+                        std::to_string(begin + i) + " at byte offset " + std::to_string(offset) + ": " + error.what());
+                }
+            }
+            jobs.push_back({begin, count, {start, static_cast<std::size_t>(a.cursor() - start)}, phase, section});
         }
     }
     a.sequence(p.final_outputs, 8, [&](ValueId &id) { a.number(id); });
@@ -119,9 +131,16 @@ inline RuntimePlan read_plan_parallel(std::string_view bytes, unsigned threads,
                 if (index >= jobs.size()) break;
                 const auto &job = jobs[index];
                 Archive<true> block(job.bytes, &strings);
-                for (std::size_t i = job.begin; i < job.begin + job.count; ++i)
-                    if (job.instructions) instruction(block, (*job.instructions)[i], p.format_version);
-                    else value_record(block, p.values[i]);
+                for (std::size_t i = job.begin; i < job.begin + job.count; ++i) {
+                    const auto offset = static_cast<std::size_t>(block.cursor() - bytes.data());
+                    try {
+                        if (job.instructions) instruction(block, (*job.instructions)[i], p.format_version);
+                        else value_record(block, p.values[i]);
+                    } catch (const std::exception &error) {
+                        throw std::runtime_error(std::string("binary ") + job.section + " record #" +
+                            std::to_string(i) + " at byte offset " + std::to_string(offset) + ": " + error.what());
+                    }
+                }
                 block.finish();
             }
         } catch (...) {

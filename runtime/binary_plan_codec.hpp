@@ -204,7 +204,8 @@ template <bool R> void instruction(Archive<R> &a, Instruction &i, std::uint32_t 
             i.body = FenceOp{};
         break;
     default:
-        throw std::runtime_error("unknown binary instruction tag");
+        throw std::runtime_error("unknown binary instruction tag " + std::to_string(tag) +
+                                 " at ordinal " + std::to_string(i.ordinal));
     }
 }
 
