@@ -321,9 +321,9 @@ LoadedRuntimePlan read_stream(std::istream &input, const std::string &document, 
     if (stats) *stats = {};
     const auto start = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     RuntimePlan plan;
-    // The version may be the last root field. Parse records using V3's schema
+    // The version may be the last root field. Parse records using V4's schema
     // and retain only the first use of each version-dependent feature.
-    std::array<std::string, 3> v1_errors, v2_errors;
+    std::array<std::string, 3> v1_errors, v2_errors, v3_errors;
     StrictJsonSax sax(document,
         {"values", "external_inputs", "initialization", "execution", "finalization", "final_outputs"},
         [&](const std::string &field, std::size_t index, Json &&record) {
@@ -333,10 +333,14 @@ LoadedRuntimePlan read_stream(std::istream &input, const std::string &document, 
                     auto &ids = field == "external_inputs" ? plan.external_inputs : plan.final_outputs;
                     ids.push_back(read_id(record, doc, "$"));
                 } else {
-                    auto instruction = read_instruction(record, "$", 3);
+                    auto instruction = read_instruction(record, "$", 4);
                     const auto phase_index = field == "initialization" ? 0 : field == "execution" ? 1 : 2;
                     const char *message = nullptr;
-                    if (std::holds_alternative<FenceOp>(instruction.body)) {
+                    if (std::holds_alternative<PreparePlaintextOp>(instruction.body)) {
+                        if (v3_errors[phase_index].empty())
+                            v3_errors[phase_index] = item_path("$." + field, index) + ": PreparePlaintext requires format version 4";
+                        message = "PreparePlaintext requires format version 4";
+                    } else if (std::holds_alternative<FenceOp>(instruction.body)) {
                         if (v2_errors[phase_index].empty())
                             v2_errors[phase_index] = item_path("$." + field, index) + ": Fence requires format version 3";
                         message = "Fence requires format version 3";
@@ -363,6 +367,9 @@ LoadedRuntimePlan read_stream(std::istream &input, const std::string &document, 
     catch (const std::runtime_error &error) { throw std::runtime_error(document + ": " + error.what()); }
     if (plan.format_version < 3)
         for (const auto &error : plan.format_version == 1 ? v1_errors : v2_errors)
+            if (!error.empty()) fail(document, "$", error);
+    if (plan.format_version < 4)
+        for (const auto &error : v3_errors)
             if (!error.empty()) fail(document, "$", error);
     auto digest = buffer.source_sha256();
     if (stats) stats->parse_build_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()

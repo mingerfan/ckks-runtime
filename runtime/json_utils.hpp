@@ -68,7 +68,9 @@ inline int read_int(const Json &value, const std::string &document, const std::s
                     int minimum, int maximum) {
     if (value.is_number_unsigned()) {
         const auto number = value.get<std::uint64_t>();
-        if (number > static_cast<std::uint64_t>(maximum)) fail(document, path, "integer is outside the supported range");
+        if (number > static_cast<std::uint64_t>(maximum) ||
+            (minimum > 0 && number < static_cast<std::uint64_t>(minimum)))
+            fail(document, path, "integer is outside the supported range");
         return static_cast<int>(number);
     }
     if (!value.is_number_integer()) fail(document, path, "expected integer");

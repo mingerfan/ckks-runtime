@@ -22,6 +22,7 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -202,8 +203,10 @@ public:
             const auto initialization_start = std::chrono::steady_clock::now();
             timing_.setup_nanoseconds = elapsed_nanoseconds(
                 setup_start, initialization_start);
-            execute_phase(plan_->initialization);
-            finish_all_groups();
+            if (!plan_->waterline) {
+                execute_phase(plan_->initialization);
+                finish_all_groups();
+            }
 
             const auto online_execution_start = std::chrono::steady_clock::now();
             timing_.initialization_nanoseconds = elapsed_nanoseconds(
@@ -219,6 +222,7 @@ public:
             api_.drain();
             timing_.online_execution_nanoseconds = elapsed_nanoseconds(
                 online_execution_start, std::chrono::steady_clock::now());
+            if (plan_->waterline) timing_.online_execution_nanoseconds -= timing_.initialization_nanoseconds;
             auto artifact = make_artifact(diff_mode);
             store_ = ValueStore<Api>{};
             groups_.clear();
@@ -392,7 +396,7 @@ private:
                 }
             }
         };
-        count_phase(plan_->initialization, false);
+        count_phase(plan_->initialization, plan_->waterline.has_value());
         const bool parallel = device_execution_mode_ == DeviceExecutionMode::PerDeviceWorkers;
         count_phase(plan_->execution, parallel);
         count_phase(plan_->finalization, parallel);
@@ -534,6 +538,7 @@ private:
     }
 
     std::vector<double> read_encode_slots(const EncodePayload &payload, ValueId output, std::uint64_t ordinal) {
+        std::lock_guard<std::mutex> lock(prepare_read_mutex_);
         std::vector<double> slots;
         if (const auto *inline_payload = std::get_if<InlineEncodePayload>(&payload))
             slots = inline_payload->values;
@@ -863,7 +868,6 @@ private:
                         throw std::runtime_error(
                             "pending communication output group is invalid");
                     if(waterline_)value->completion.emplace(*output);
-                    if(waterline_)value->completion.emplace(*output);
                     if (!can_clear(value->uses))
                         value->value.emplace(std::move(*output));
                     output.reset();
@@ -1172,8 +1176,8 @@ private:
                 continue;
             }
             if (const auto *prepare = std::get_if<PreparePlaintextOp>(&instruction.body)) {
-                auto output = define_parallel_value(prepare->output, desc(prepare->output).place);
-                tasks.back().push_back(ParallelTask{{}, &instruction, {}, {prepare->output}, true});
+                // Registration has no allocation or eager preparation. A
+                // segment adds this producer when its first consumer needs it.
                 continue;
             }
             if (const auto *release = std::get_if<ReleaseOp>(&instruction.body)) {
@@ -1251,12 +1255,50 @@ private:
             worker_count > static_cast<std::size_t>(local_devices_))
             throw std::runtime_error(
                 "device worker count must be between one and local device count");
-        for (const auto *phase : {&plan_->execution, &plan_->finalization}) {
+        std::vector<const std::vector<Instruction> *> phases;
+        if (plan_->waterline) phases.push_back(&plan_->initialization);
+        phases.push_back(&plan_->execution);phases.push_back(&plan_->finalization);
+        std::unordered_map<ValueId,const Instruction *> preparation_instructions;
+        if(waterline_)for(const auto *phase:phases)for(const auto &instruction:*phase)
+            if(const auto *op=std::get_if<PreparePlaintextOp>(&instruction.body))
+                preparation_instructions.emplace(op->output,&instruction);
+        if (waterline_) {
+            // Metadata only: validate the entire graph before any initialization
+            // Encode, transfer or consumer is submitted.
+            std::vector<std::vector<ParallelTask>> baseline(2);
+            for (const auto *phase : phases) for (const auto &instruction : *phase) {
+                if (const auto *op=std::get_if<PreparePlaintextOp>(&instruction.body)) {
+                    baseline.back().push_back(ParallelTask{{},&instruction,{}, {op->output},true});
+                } else if (const auto *op=std::get_if<EncodeOp>(&instruction.body)) {
+                    if(desc(op->output).place.rank==rank_)baseline.back().push_back(ParallelTask{{},&instruction,{}, {op->output}});
+                } else if (const auto *op=std::get_if<ComputeOp>(&instruction.body)) {
+                    if(op->place.rank==rank_)baseline.back().push_back(ParallelTask{{},&instruction,op->inputs,{op->output}});
+                } else if (const auto *op=std::get_if<ReleaseOp>(&instruction.body)) {
+                    if(desc(op->value).place.rank==rank_)baseline.back().push_back(ParallelTask{{},&instruction,{op->value},{}});
+                } else if (const auto *op=std::get_if<CommAction>(&instruction.body)) {
+                    if(op->sources.front().rank==rank_)
+                        for(std::size_t slot=0;slot<op->outputs.size();++slot)
+                            if(op->destinations[slot].rank==rank_)baseline.back().push_back(ParallelTask{{},&instruction,op->inputs,{op->outputs[slot]}});
+                }
+            }
+            run_parallel_tasks(baseline,true);
+        }
+        for (const auto *phase : phases) {
+            const auto phase_start=std::chrono::steady_clock::now();
             std::size_t begin = 0;
             for (std::size_t end = 0; end <= phase->size(); ++end) {
                 if (end != phase->size() && !std::holds_alternative<FenceOp>((*phase)[end].body)) continue;
                 std::vector<std::vector<ParallelTask>> tasks(worker_count + 1);
                 compile_parallel_phase(*phase, tasks, begin, end);
+                if(waterline_) {
+                    std::set<ValueId> needed;
+                    for(const auto &queue:tasks)for(const auto &task:queue)for(auto id:task.inputs)
+                        if(preparation_instructions.count(id) && !parallel_values_.count(id))needed.insert(id);
+                    for(auto id:needed) {
+                        define_parallel_value(id,desc(id).place);
+                        tasks.back().push_back(ParallelTask{{},preparation_instructions.at(id),{}, {id},true});
+                    }
+                }
                 const auto start = std::chrono::steady_clock::now();
                 run_parallel_tasks(tasks);
                 if (end != phase->size()) {
@@ -1265,6 +1307,7 @@ private:
                 }
                 begin = end + 1;
             }
+            if (phase == &plan_->initialization) timing_.initialization_nanoseconds = elapsed_nanoseconds(phase_start,std::chrono::steady_clock::now());
         }
         if (waterline_) {
             for (std::size_t d=0; d<waterline_->peak.front.size(); ++d)
@@ -1282,7 +1325,7 @@ private:
         }
     }
 
-    void run_parallel_tasks(std::vector<std::vector<ParallelTask>> &queues) {
+    void run_parallel_tasks(std::vector<std::vector<ParallelTask>> &queues, bool baseline_only=false) {
         struct TaskState {
             ParallelTask task;
             std::size_t worker = 0;
@@ -1319,7 +1362,7 @@ private:
         const auto external=[&](ValueId id) {return std::find(plan_->external_inputs.begin(),plan_->external_inputs.end(),id)!=plan_->external_inputs.end();};
         // The same topological, one-group-at-a-time baseline is checked with
         // backend resource queries before submitting any online work.
-        if(waterline_) {
+        if(waterline_ && baseline_only) {
             WaterlineLedger baseline(*plan_->waterline); baseline.used=waterline_->used;
             auto resident=waterline_storage_; auto remaining=waterline_remaining_;auto released=waterline_released_;
             std::unordered_map<ValueId,bool> seen;
@@ -1355,6 +1398,7 @@ private:
                 }
             }
         }
+        if(baseline_only)return;
         struct Worker {
             std::mutex mutex; std::condition_variable condition;
             std::optional<std::size_t> assigned; bool stop=false;
@@ -1385,8 +1429,7 @@ private:
                     if(task.preparation) {
                         if constexpr(detail::HasWaterlineApi<Api>::value) {
                             const auto &op=std::get<PreparePlaintextOp>(task.instruction->body);
-                            std::vector<double> slots;
-                            {std::lock_guard<std::mutex> lock(prepare_read_mutex_);slots=read_encode_slots(op.payload,op.output,task.instruction->ordinal);}
+                            auto slots=read_encode_slots(op.payload,op.output,task.instruction->ordinal);
                             const auto start=std::chrono::steady_clock::now();
                             Value result=api_.prepare_plaintext_async(desc(op.output),slots,task.backend);
                             api_.validate_value(result,desc(op.output));
@@ -1484,6 +1527,15 @@ private:
                                 needed.emplace_back(pi,cost);delta+=cost.peak;
                             }
                             for(auto id:tasks[i].task.outputs)delta+=storage(id);
+                        }
+                        // Auto's queue preference only applies to a legal
+                        // complete group. GPU workspace can exceed the plain
+                        // waterline even when the CPU preparation fits.
+                        if(plan_->waterline->backend==PrepareBackend::Auto && !waterline_->fits(delta)) {
+                            for(auto &[pi,cost]:needed)if(tasks[pi].task.backend==PrepareBackend::Gpu) {
+                                auto cpu=prepare_cost(pi,PrepareBackend::Cpu);
+                                if(cpu.supported) {delta-=cost.peak;delta+=cpu.peak;cost=std::move(cpu);tasks[pi].task.backend=PrepareBackend::Cpu;}
+                            }
                         }
                         if(!waterline_->fits(delta))break;
                         waterline_->reserve(delta);
