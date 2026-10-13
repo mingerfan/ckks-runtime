@@ -67,6 +67,8 @@ struct HasComputeReuse<Api, std::void_t<
 
 namespace detail {
 template<class Api, class = void> struct HasWaterlineApi : std::false_type {};
+template<class Api,class=void>struct HasWaterlineValidation:std::false_type{};
+template<class Api>struct HasWaterlineValidation<Api,std::void_t<decltype(std::declval<Api &>().validate_waterline_resources(std::declval<const RuntimePlan &>()))>>:std::true_type{};
 template<class Api> struct HasWaterlineApi<Api, std::void_t<
     decltype(std::declval<Api &>().prepare_resources(std::declval<const ValueDesc &>(), PrepareBackend::Cpu)),
     decltype(std::declval<Api &>().value_resources(std::declval<const ValueDesc &>())),
@@ -198,6 +200,8 @@ public:
                                                                 : loaded_plan.preflight_identity,
                            resources.skip_artifact_digest_checks,
                            plan_->target, resources.operator_spec.spec, requirements);
+            if constexpr(detail::HasWaterlineValidation<Api>::value)
+                if(plan_->waterline)api_.validate_waterline_resources(*plan_);
             bind_inputs(local_inputs);
 
             const auto initialization_start = std::chrono::steady_clock::now();
@@ -1021,7 +1025,6 @@ private:
                 if (output) {
                     const auto &expected_desc = desc(local_output.id);
                     api_.validate_value(*output, expected_desc);
-                    if(waterline_)value->completion.emplace(*output);
                     if(waterline_)value->completion.emplace(*output);
                     if (!can_clear(value->uses))
                         value->value.emplace(std::move(*output));
