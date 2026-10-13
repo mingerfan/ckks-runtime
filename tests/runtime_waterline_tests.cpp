@@ -20,10 +20,16 @@ template <class F> void expect_error(F &&run, const char *message) {
 }
 class PrepareApi : public MockVecApi {
 public:
-    explicit PrepareApi(std::shared_ptr<MockCluster> cluster):MockVecApi(0,std::move(cluster)) {}
+    explicit PrepareApi(std::shared_ptr<MockCluster> cluster,std::size_t devices=1)
+        :MockVecApi(0,std::move(cluster)),devices(devices) {}
+    const std::size_t devices;
     std::atomic<int> cpu{0},gpu{0};
     std::atomic<int> host_encodes{0}, gpu_resource_queries{0};
     int delay_ms=5;bool unsupported=false;
+    int fail_prepare_call=0;
+    std::uint64_t prepare_host_bytes=100;
+    std::vector<int> device_delay_ms;
+    std::atomic<int> preparation_attempts{0},active_preparations{0},peak_preparations{0};
     struct Event { const char *kind; ValueId value; std::thread::id thread; };
     std::vector<Event> events;
     std::vector<std::future<void>> preparations;
@@ -33,13 +39,13 @@ public:
         events.push_back({kind, id, std::this_thread::get_id()});
     }
     ResourceUsage value_resources(const ValueDesc &v) {
-        ResourceUsage r(1);if(v.place.kind==PlaceKind::Host)r.host=v.components*100;
-        else if(v.kind==ValueKind::Plaintext)r.plain[0]=100;else r.front[0]=200;return r;
+        ResourceUsage r(devices);if(v.place.kind==PlaceKind::Host)r.host=v.components*100;
+        else if(v.kind==ValueKind::Plaintext)r.plain.at(v.place.index)=100;else r.front.at(v.place.index)=200;return r;
     }
     PrepareResources prepare_resources(const ValueDesc &v,PrepareBackend backend) {
         if (backend == PrepareBackend::Gpu) ++gpu_resource_queries;
-        auto resident=value_resources(v),peak=resident;peak.host=100;peak.pinned=50;peak.raw=20;
-        if(backend==PrepareBackend::Gpu)peak.plain[0]+=50;
+        auto resident=value_resources(v),peak=resident;peak.host=prepare_host_bytes;peak.pinned=50;peak.raw=20;
+        if(backend==PrepareBackend::Gpu)peak.plain.at(v.place.index)+=50;
         return {peak,resident,!unsupported};
     }
     Value encode_plaintext(const ValueDesc &desc, const std::vector<double> &slots) {
@@ -47,16 +53,26 @@ public:
         return MockVecApi::encode_plaintext(desc, slots);
     }
     ResourceUsage instruction_workspace(const Instruction &i) {
-        ResourceUsage r(1);if(std::holds_alternative<ComputeOp>(i.body))r.front[0]=100;return r;
+        ResourceUsage r(devices);
+        if(const auto *op=std::get_if<ComputeOp>(&i.body))r.front.at(op->place.kind==PlaceKind::Device?op->place.index:0)=100;
+        return r;
     }
     Value prepare_plaintext_async(const ValueDesc &desc,const std::vector<double> &slots,PrepareBackend backend) {
         event("prepare", desc.id);
         if(backend==PrepareBackend::Cpu)++cpu;else ++gpu;
+        const auto attempt=++preparation_attempts;
+        if(attempt==fail_prepare_call)throw std::runtime_error("injected Prepare allocation failure at attempt 2");
         auto host=desc;host.place={PlaceKind::Host,0,0};auto source=encode_plaintext(host,slots);
         auto result=Value::pending(source.kind(),source.metadata());
+        const int completion_delay=device_delay_ms.empty()?delay_ms:device_delay_ms.at(desc.place.index);
+        const int active=++active_preparations;
+        int peak=peak_preparations.load();
+        while(active>peak && !peak_preparations.compare_exchange_weak(peak,active)) {}
         std::lock_guard<std::mutex> lock(mutex);
         preparations.push_back(std::async(std::launch::async,[=,this] {
-            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));result.fulfill(source.materialize());
+            std::this_thread::sleep_for(std::chrono::milliseconds(completion_delay));
+            auto payload=source.materialize();
+            event("prepare_complete",desc.id);--active_preparations;result.fulfill(std::move(payload));
         }));return result;
     }
     Value compute(const ComputeOp &op, const std::vector<Value> &inputs) {
@@ -67,6 +83,37 @@ public:
     }
     bool is_ready(Value &v) {return v.is_ready();}
     void drain() {for(auto &future:preparations)future.get();preparations.clear();MockVecApi::drain();}
+};
+
+// Keep this single-rank mock alive after surfacing the fatal error so a second,
+// explicitly requested run can check that runtime state was reset. No retry occurs.
+class RestartablePrepareApi : public PrepareApi {
+public:
+    using PrepareApi::PrepareApi;
+    [[noreturn]] void abort_all(int,const std::string &reason) {throw ClusterPanic(reason);}
+    void preflight(std::string_view digest,bool skip,const TargetConfig &target,
+                   const OperatorSpec &spec,const PlanRequirements &requirements) {
+        if(preflight_done_) {
+            require(digest==digest_ && spec.poly_degree==degree_ && target.world_size==1,
+                    "restart fixture changed plan/spec");
+            return; // MockCluster itself intentionally permits only one handshake.
+        }
+        MockVecApi::preflight(digest,skip,target,spec,requirements);
+        digest_=digest;degree_=spec.poly_degree;preflight_done_=true;
+    }
+private:
+    bool preflight_done_=false;
+    std::string digest_;
+    std::uint64_t degree_=0;
+};
+
+class CaptureRuntimeErrors {
+public:
+    std::ostringstream stream;
+    CaptureRuntimeErrors():previous_(std::cerr.rdbuf(stream.rdbuf())) {}
+    ~CaptureRuntimeErrors() {std::cerr.rdbuf(previous_);std::cerr<<stream.str();}
+private:
+    std::streambuf *previous_;
 };
 
 std::size_t event_index(const PrepareApi &api, const char *kind, ValueId id) {
@@ -309,6 +356,103 @@ void test_prepare_across_fence_and_unused(const RuntimePlan &rolling, const Load
     }), "unused Prepare submitted work without a consumer group");
     std::cout << "PASS Prepare crosses explicit Fence and unused Prepare finishes without submission\n";
 }
+
+void test_prepare_failure_and_explicit_restart(const RuntimePlan &rolling,const LoadedOperatorSpec &spec,
+                                               const std::vector<double> &input) {
+    for(const auto backend:{PrepareBackend::Cpu,PrepareBackend::Gpu}) {
+        auto plan=rolling;plan.waterline->backend=backend;
+        RestartablePrepareApi api(std::make_shared<MockCluster>(MockClusterConfig{}));
+        api.fail_prepare_call=2;api.delay_ms=20;
+        SequentialRuntime<RestartablePrepareApi> runtime(0,1,1,api,DeviceExecutionMode::PerDeviceWorkers);
+        const LoadedRuntimePlan loaded{plan,"sha256:"+std::string(64,'1')};
+        const auto make_inputs=[&] {
+            return std::unordered_map<ValueId,PrepareApi::Value>{
+                {0,make_cipher(input,spec.spec.context_id,spec.spec.poly_degree,3,30)}};
+        };
+        expect_error([&] {runtime.run(loaded,{spec,std::nullopt,false},make_inputs());},
+                     "injected Prepare allocation failure at attempt 2");
+        api.drain();
+        require(api.preparation_attempts==2 && api.active_preparations==0 && api.preparations.empty() &&
+                (backend==PrepareBackend::Cpu?(api.cpu==2 && api.gpu==0):(api.gpu==2 && api.cpu==0)),
+                "failed Prepare retried, switched backend, or left live preparation work");
+        // The failure was observed above. This separate run explicitly removes
+        // the injection and reuses the same API/runtime, with the same fixed backend.
+        api.fail_prepare_call=0;
+        auto artifact=runtime.run(loaded,{spec,std::nullopt,false},make_inputs());
+        const auto result=artifact.values.at(42).value.materialize();
+        require(std::abs(result.slots[0]-11)<1e-9 && std::abs(result.slots[1]+22)<1e-9 &&
+                artifact.timing.encode_calls==20 && artifact.timing.fence_calls==0 &&
+                api.preparation_attempts==22 && api.active_preparations==0 && api.preparations.empty() &&
+                (backend==PrepareBackend::Cpu?(api.cpu==22 && api.gpu==0):(api.gpu==22 && api.cpu==0)),
+                "explicit restart retained stale credits/dependencies or changed backend");
+        std::cout<<"PASS injected second Prepare failure backend="<<int(backend)
+                 <<" surfaces exact error, workers converge, explicit same-runtime restart completes\n";
+    }
+}
+
+void test_four_device_progress_and_shared_budgets(const RuntimePlan &rolling,const LoadedOperatorSpec &spec,
+                                                 const std::vector<double> &input) {
+    auto plan=rolling;
+    plan.target.device_counts={4};plan.values.clear();plan.execution.clear();plan.finalization.clear();plan.final_outputs.clear();
+    const Place host{PlaceKind::Host,0,0};
+    const auto descriptor=[&](ValueId id,ValueKind kind,Place place) {
+        return ValueDesc{id,kind,place,spec.spec.context_id,3,30,true,kind==ValueKind::Plaintext?1:2};
+    };
+    plan.values.push_back(descriptor(0,ValueKind::Ciphertext,host));
+    CommAction replicate{0,CommKind::Replicate,CommHint::PointToPoint,{0},{},{host},{},{}};
+    for(int device=0;device<4;++device) {
+        const Place place{PlaceKind::Device,0,device};
+        const ValueId in=10+10*device,plaintext=in+1,out=in+2,result=100+device;
+        plan.values.push_back(descriptor(in,ValueKind::Ciphertext,place));
+        plan.values.push_back(descriptor(plaintext,ValueKind::Plaintext,place));
+        plan.values.push_back(descriptor(out,ValueKind::Ciphertext,place));
+        plan.values.push_back(descriptor(result,ValueKind::Ciphertext,host));
+        replicate.outputs.push_back(in);replicate.destinations.push_back(place);replicate.output_types.push_back(ValueKind::Ciphertext);
+        plan.execution.push_back({0,PreparePlaintextOp{InlineEncodePayload{{.5,-1}},plaintext}});
+        plan.execution.push_back({0,ComputeOp{ComputeKind::AddCP,{in,plaintext},out,place,{}}});
+        plan.execution.push_back({0,ReleaseOp{plaintext}});plan.execution.push_back({0,ReleaseOp{in}});
+        plan.finalization.push_back({0,CommAction{TransferId(1+device),CommKind::Transfer,CommHint::PointToPoint,
+            {out},{result},{place},{host},{ValueKind::Ciphertext}}});
+        plan.finalization.push_back({0,ReleaseOp{out}});plan.final_outputs.push_back(result);
+    }
+    plan.initialization={{0,std::move(replicate)}};number_instructions(plan);
+    plan.waterline->backend=PrepareBackend::Gpu;
+    plan.waterline->device_capacity_bytes=std::vector<std::uint64_t>(4,1000);
+    plan.waterline->device_reserve_bytes=std::vector<std::uint64_t>(4,0);
+    plan.waterline->device_fractions=std::vector<double>(4,.4);
+    plan.waterline->lookahead_groups=16;plan.waterline->raw_budget_bytes=200;
+    for(bool host_limited:{true,false}) {
+        // One external Host value uses 200 bytes. Two preparations need another
+        // 1000 Host / 100 pinned bytes; all four would need 2000 / 200 instead.
+        plan.waterline->host_budget_bytes=host_limited?1200:3000;
+        plan.waterline->pinned_budget_bytes=host_limited?500:100;
+        PrepareApi api(std::make_shared<MockCluster>(MockClusterConfig{}),4);
+        api.prepare_host_bytes=500;api.device_delay_ms={300,5,5,5};
+        SequentialRuntime<PrepareApi> runtime(0,1,4,api,DeviceExecutionMode::PerDeviceWorkers);
+        CaptureRuntimeErrors captured;
+        auto artifact=runtime.run({plan,"sha256:"+std::string(64,'1')},{spec,std::nullopt,false},
+            {{0,make_cipher(input,spec.spec.context_id,spec.spec.poly_degree,3,30)}});
+        const auto slow_complete=event_index(api,"prepare_complete",11);
+        for(int device=1;device<4;++device)
+            require(event_index(api,"compute_complete",12+10*device)<slow_complete,
+                    "slow GPU0 stopped an admitted independent device");
+        for(const auto id:plan.final_outputs) {
+            const auto result=artifact.values.at(id).value.materialize();
+            require(std::abs(result.slots[0]-1.5)<1e-9 && std::abs(result.slots[1]+3)<1e-9,
+                    "four-device preparation changed branch arithmetic");
+        }
+        require(api.cpu==0 && api.gpu==4 && api.peak_preparations==2 && api.active_preparations==0 &&
+                api.preparations.empty() && artifact.timing.fence_calls==0,
+                "shared Host/pinned budget exceeded two in-flight preparations or leaked temporary work");
+        const auto log=captured.stream.str();
+        std::size_t cursor=0,returned=0;
+        while((cursor=log.find("remaining_front=0 remaining_plain=0",cursor))!=std::string::npos) {++returned;++cursor;}
+        require(returned==4 && log.find("host_peak=1200 pinned_peak=100 raw_peak=40")!=std::string::npos,
+                "four-device ledger exceeded shared budgets or retained device credits");
+        std::cout<<"PASS four logical GPUs, GPU1/2/3 complete before GPU0, shared "
+                 <<(host_limited?"Host":"pinned")<<" limits Prepare concurrency to 2, temporary/device credits returned\n";
+    }
+}
 int main() {
  try {
     WaterlineConfig c; c.device_capacity_bytes={1000};c.device_reserve_bytes={0};c.device_fractions={.4};
@@ -354,6 +498,8 @@ int main() {
     test_json_and_negative_config(parsed, spec);
     test_initialization_preflight(parsed, spec, input);
     test_prepare_across_fence_and_unused(parsed, spec, input);
+    test_prepare_failure_and_explicit_restart(parsed,spec,input);
+    test_four_device_progress_and_shared_budgets(parsed,spec,input);
     for(auto backend:{PrepareBackend::Cpu,PrepareBackend::Gpu,PrepareBackend::Auto}) {
         parsed.waterline->backend=backend;
         // Auto needs room for two groups including GPU's extra 50-byte workspace.
