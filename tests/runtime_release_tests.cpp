@@ -266,7 +266,7 @@ void test_mock_multirank_release() {
     }
 }
 
-void test_streaming(bool parallel, bool deferred, bool fail_encode = false) {
+void test_online_encode_with_explicit_fence(bool parallel, bool deferred, bool fail_encode = false) {
     auto built = split_plan();
     auto &plan = built.plan;
     plan.format_version = 3;
@@ -317,7 +317,7 @@ void test_streaming(bool parallel, bool deferred, bool fail_encode = false) {
         require(drains == 4, "missing Fence or final drain");
     } catch (const ClusterPanic &error) {
         require(fail_encode && std::string(error.what()).find("injected Encode failure") != std::string::npos,
-                "wrong streaming failure");
+                "wrong online Encode/Fence failure");
     }
     for (int version : {1, 2}) {
         plan.format_version = version;
@@ -327,7 +327,7 @@ void test_streaming(bool parallel, bool deferred, bool fail_encode = false) {
     }
 }
 
-void test_streaming_scale(bool parallel) {
+void test_explicit_fence_scale(bool parallel) {
     auto built = split_plan();
     auto &plan = built.plan;
     built.operator_spec.spec.poly_degree = 16;
@@ -373,12 +373,12 @@ int main() {
     try {
         for (bool parallel : {false, true})
             for (bool deferred : {false, true}) {
-                test_streaming(parallel, deferred);
-                test_streaming(parallel, deferred, true);
+                test_online_encode_with_explicit_fence(parallel, deferred);
+                test_online_encode_with_explicit_fence(parallel, deferred, true);
             }
-        std::cout << "[PASS] V3 streaming, Fence reclamation, deferred outputs and CPU failure\n";
-        test_streaming_scale(false);
-        test_streaming_scale(true);
+        std::cout << "[PASS] V3 online Encode, explicit Fence reclamation, deferred outputs and CPU failure\n";
+        test_explicit_fence_scale(false);
+        test_explicit_fence_scale(true);
         std::cout << "[PASS] 20000 transfers and 625 Fence boundaries in each execution mode\n";
         test_cross_phase_and_repeated_operands();
         std::cout << "[PASS] cross-phase counts, repeated operands and repeated runs\n";
