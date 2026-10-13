@@ -243,7 +243,27 @@ public:
             const std::string diagnostic = format_error(error.what());
             std::cerr << diagnostic << std::endl;
             std::cerr.flush();
-            api_.abort_all(1, diagnostic);
+            try {
+                // Distributed backends may terminate the job here. Abort them
+                // before attempting a drain that could wait for a failed peer.
+                api_.abort_all(1, diagnostic);
+            } catch (...) {
+                // Local backends report abort by throwing. Finish their already
+                // submitted work and drop runtime-owned values before returning
+                // the original error to a caller that keeps this runtime alive.
+                const auto failure = std::current_exception();
+                try { api_.drain(); }
+                catch (const std::exception &cleanup) {
+                    std::cerr << "runtime failure cleanup also failed: " << cleanup.what() << std::endl;
+                }
+                catch (...) {
+                    std::cerr << "runtime failure cleanup also failed with a non-standard exception" << std::endl;
+                }
+                store_ = ValueStore<Api>{};
+                groups_.clear();
+                reset_parallel_execution_state();
+                std::rethrow_exception(failure);
+            }
         }
     }
 

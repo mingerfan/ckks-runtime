@@ -159,6 +159,13 @@ void test_split_release(bool fail_second_send) {
     const auto built = split_plan();
     TrackingApi api;
     Gate gate;
+    int failure_drains = 0;
+    api.on_drain = [&] {
+        if (fail_second_send) {
+            require(!api.expired(0), "failure cleanup dropped source before draining accepted sends");
+            ++failure_drains;
+        }
+    };
     api.on_collect = [&] { gate.signal(); };
     api.before_compute = [&](const ComputeOp &op) {
         if (op.output == 4) gate.wait(true); // Hold back the second physical send.
@@ -182,7 +189,9 @@ void test_split_release(bool fail_second_send) {
         catch (const ClusterPanic &error) {
             require(std::string(error.what()).find("injected second-send failure") != std::string::npos,
                     "wrong submission failure");
-            require(!api.expired(0), "failed send consumed its remaining use");
+            require(failure_drains == 1 && api.expired(0),
+                    "failed send retained its runtime-owned source after failure cleanup");
+            require(!api.expired(1), "failure cleanup destroyed caller's external input");
             return;
         }
         throw std::runtime_error("expected a submission failure");
@@ -296,15 +305,21 @@ void test_online_encode_with_explicit_fence(bool parallel, bool deferred, bool f
     TrackingApi api;
     api.defer_outputs = deferred;
     int drains = 0;
+    bool encode_failed = false;
     api.on_drain = [&] {
-        if (drains < 3) {
+        if (encode_failed) {
+            require(!api.expired(12), "failure cleanup released input before draining submitted work");
+        } else if (drains < 3) {
             require(api.expired(10 + drains * 3), "Fence retained host encoding");
             require(api.expired(11 + drains * 3), "Fence retained uploaded weight");
         }
         ++drains;
     };
     api.before_encode = [&](ValueId id) {
-        if (id == 13 && fail_encode) throw std::runtime_error("injected Encode failure");
+        if (id == 13 && fail_encode) {
+            encode_failed = true;
+            throw std::runtime_error("injected Encode failure");
+        }
         require(drains == int((id - 10) / 3), "Encode crossed unfinished Fence");
     };
     auto external = api.observe(1, make_cipher(slots({1, 2, 3, 4}), "ctx", 8192, 3, 1));
@@ -318,6 +333,9 @@ void test_online_encode_with_explicit_fence(bool parallel, bool deferred, bool f
     } catch (const ClusterPanic &error) {
         require(fail_encode && std::string(error.what()).find("injected Encode failure") != std::string::npos,
                 "wrong online Encode/Fence failure");
+        require(drains == 2 && api.expired(12),
+                "failed Encode did not drain and release its runtime-owned input");
+        require(!api.expired(1), "failed Encode cleanup destroyed caller's external input");
     }
     for (int version : {1, 2}) {
         plan.format_version = version;
@@ -385,7 +403,7 @@ int main() {
         test_split_release(false);
         std::cout << "[PASS] Release before split Replicate submissions\n";
         test_split_release(true);
-        std::cout << "[PASS] failed submission preserves source\n";
+        std::cout << "[PASS] failed submission preserves source until drain, then releases runtime ownership\n";
         for (bool parallel : {false, true})
             for (bool deferred : {false, true}) test_abandoned_output(parallel, deferred);
         std::cout << "[PASS] abandoned posted/pending outputs in both execution modes\n";
