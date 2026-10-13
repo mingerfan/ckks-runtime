@@ -117,3 +117,5 @@ cost_us = startup_latency_us + ceil(payload_bytes / rate(payload_bytes))
 这个首版模型只修正“所有 value 传输成本都一样”的问题，仍不建模链路争用、
 双向带宽差异、通信计算重叠、Host staging、显存峰值、密钥复制和具体 GPU
 之间的异构拓扑。这里的默认数值是联调用的粗估值，不是硬件实测结果。
+
+明文准备的完整组容量检查由后期 Waterline Pass 与 Runtime 事件准入账本处理，不属于通信 profile；HEFT 算法及前台顺序保持不变。

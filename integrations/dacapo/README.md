@@ -2,6 +2,12 @@
 
 这里放 Runtime 与 `third_party/dacapo` 的集成脚本和后续端到端测试。
 
+## Waterline 明文准备
+
+V4 Waterline 通过 `hecate-opt` 的 `--runtime-plan-plaintext-schedule=waterline` 和显式 GPU/Host/pinned/raw 正预算开启；同时配置 `--runtime-plan-reserve-bytes`、`--runtime-plan-waterline-fraction`、`--runtime-plan-prepare-backend=cpu|gpu|auto` 与 `--runtime-plan-lookahead-groups`。当前通用模型生成脚本没有这些预算选项。完整字段及约束见 [V4 规范](../../docs/runtime-plan/v4.md)。Pass 顺序是保持不变的 HEFT placement、communication、Waterline Prepare、Release/reuse；Prepare 后不再运行 Encode CSE。不会按批克隆权重或插自动 Fence，普通 Encode/Transfer 和显式 Fence 仍可执行。
+
+`.memory.json` 按顺序完成估算 RNS 对象，Host 系数按 8 字节、GPU 按 4 字节；`.waterline.json` 检查完整依赖单组基线，包含配置的消费者工作区上界。`--runtime-plan-workspace-bytes-per-op=0` 只做对象检查，不能保证算子实际空间。Runtime 再查询后端持久资源、准备峰值和 allocator capacity，在同一账本中检查单组及滚动准入。密钥、参数表、retained workspace、pool 外开销与余量必须被 reserve 覆盖；对象报告不能替代这些检查或整个进程的显存测量。
+
 当前已有 profile 迁移脚本：
 
 ```bash

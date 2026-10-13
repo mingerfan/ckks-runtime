@@ -2,7 +2,7 @@
 
 本目录是多设备 CKKS 推理 runtime 的设计基线。这里的 runtime 指的是"拿到一份编译器已经排好的执行计划，在多个设备上把它跑完"的那部分程序。
 
-> 本目录同时包含架构设计和当前实现说明。RuntimePlan V1 已冻结；真实 Poseidon 后端和 Dacapo 生成链属于后续阶段，见[实现状态](overview-design/implementation-status.md)。
+> 当前明文准备协议见 [RuntimePlan V4 Waterline](runtime-plan/v4.md)。Dacapo 在不改变 HEFT 的前提下生成 Device Prepare；Runtime 复用设备工作线程、完整组准入和事件回收，不维护静态批次执行器。普通 Encode/Transfer、Release/reuse 和显式 Fence 保留原义。
 
 ## 项目要做什么
 

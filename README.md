@@ -2,9 +2,9 @@
 
 这是一个面向多设备 CKKS 推理的执行器原型。编译器负责生成已经确定计算位置和数据搬运方式的计划，Runtime 负责验证并执行，具体计算和通信由 Api 实现。
 
-> 当前代码已经能执行 Compute、Transfer 和 Replicate，并提供 Vec/Mock/MPI 测试后端。显式 Encode、inline/bundle 双 payload、OperatorSpec 完整校验和 Host compute 仍是目标设计，尚未实现。准确边界见[实现状态](docs/overview-design/implementation-status.md)。
+当前支持 RuntimePlan V1/V2/V3/V4、inline/bundle Encode、Host/Device compute、Transfer/Replicate、Release、受支持算子的原位执行、显式 Fence 与按需明文装载。[V4 Waterline](docs/runtime-plan/v4.md) 使用 Device Prepare 和完整消费者组准入；CPU/GPU 完整 Encode 与简单 Auto 选择复用同一设备工作线程执行器，不插自动批末 Fence。计划读取入口支持二进制和 JSON；Dacapo 默认导出二进制计划和 pack bundle。Vec/Mock/MPI 提供参考后端，真实 CPU/GPU 后端在 Poseidon 中实现。
 
-目标数据流如下；当前 reader 仍读取上一版计划格式，也不会装载 OperatorSpec 或 bundle：
+普通顺序执行路径示意如下；V4 Waterline 使用现有 PerDeviceWorkers 执行器，完整组和真实完成事件控制 Device Prepare：
 
 ~~~text
 Dacapo / 其他编译器
