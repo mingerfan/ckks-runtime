@@ -1596,7 +1596,7 @@ private:
                         if(next!=groups.end())throw std::runtime_error("Waterline cannot advance at instruction #"+std::to_string(next->first)+ (waterline_?waterline_->describe(ResourceUsage(devices)):""));
                         throw std::runtime_error("executor has no runnable producer: dependency/order invariant violated");
                     }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
                 }
             }
             stop_workers();if(issuer.joinable())issuer.join();
