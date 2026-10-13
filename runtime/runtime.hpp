@@ -69,6 +69,8 @@ namespace detail {
 template<class Api, class = void> struct HasWaterlineApi : std::false_type {};
 template<class Api,class=void>struct HasWaterlineValidation:std::false_type{};
 template<class Api>struct HasWaterlineValidation<Api,std::void_t<decltype(std::declval<Api &>().validate_waterline_resources(std::declval<const RuntimePlan &>()))>>:std::true_type{};
+template<class Api,class=void>struct HasWaterlineAllocatorCapacity:std::false_type{};
+template<class Api>struct HasWaterlineAllocatorCapacity<Api,std::void_t<decltype(std::declval<Api &>().waterline_allocator_capacity())>>:std::true_type{};
 template<class Api> struct HasWaterlineApi<Api, std::void_t<
     decltype(std::declval<Api &>().prepare_resources(std::declval<const ValueDesc &>(), PrepareBackend::Cpu)),
     decltype(std::declval<Api &>().value_resources(std::declval<const ValueDesc &>())),
@@ -202,6 +204,8 @@ public:
                            plan_->target, resources.operator_spec.spec, requirements);
             if constexpr(detail::HasWaterlineValidation<Api>::value)
                 if(plan_->waterline)api_.validate_waterline_resources(*plan_);
+            if constexpr(detail::HasWaterlineAllocatorCapacity<Api>::value)
+                if(plan_->waterline)waterline_allocator_capacity_=api_.waterline_allocator_capacity();
             bind_inputs(local_inputs);
 
             const auto initialization_start = std::chrono::steady_clock::now();
@@ -570,7 +574,8 @@ private:
         Value output = api_.encode_plaintext(output_desc, slots);
         api_.validate_value(output, output_desc);
         const auto elapsed = elapsed_nanoseconds(start, std::chrono::steady_clock::now());
-        ++timing_.encode_calls; timing_.encode_nanoseconds += elapsed;
+        {std::lock_guard<std::mutex> lock(parallel_timing_mutex_);
+         ++timing_.encode_calls;timing_.encode_nanoseconds+=elapsed;}
         trace_event("encode", op.output, ordinal, std::nullopt, "Encode", elapsed);
         return output;
     }
@@ -786,12 +791,14 @@ private:
 
     std::mutex prepare_read_mutex_;
     std::unique_ptr<WaterlineLedger> waterline_;
+    std::vector<std::uint64_t> waterline_allocator_capacity_;
     std::unordered_map<ValueId, ResourceUsage> waterline_storage_;
     std::unordered_map<ValueId, std::size_t> waterline_remaining_;
     std::unordered_map<ValueId, bool> waterline_released_;
 
     void reset_parallel_execution_state() {
         waterline_.reset();
+        waterline_allocator_capacity_.clear();
         waterline_storage_.clear(); waterline_remaining_.clear(); waterline_released_.clear();
         parallel_values_.clear();
         parallel_groups_.clear();
@@ -1238,7 +1245,7 @@ private:
         prepare_parallel_values();
         if constexpr (detail::HasWaterlineApi<Api>::value) {
             if (plan_->waterline) {
-                waterline_ = std::make_unique<WaterlineLedger>(*plan_->waterline);
+                waterline_ = std::make_unique<WaterlineLedger>(*plan_->waterline,waterline_allocator_capacity_);
                 waterline_storage_.clear(); waterline_remaining_.clear(); waterline_released_.clear();
                 for (const auto &[id, value] : parallel_values_) {
                     if (!value->value) continue;
@@ -1366,7 +1373,7 @@ private:
         // The same topological, one-group-at-a-time baseline is checked with
         // backend resource queries before submitting any online work.
         if(waterline_ && baseline_only) {
-            WaterlineLedger baseline(*plan_->waterline); baseline.used=waterline_->used;
+            WaterlineLedger baseline(*plan_->waterline,waterline_allocator_capacity_); baseline.used=waterline_->used;
             auto resident=waterline_storage_; auto remaining=waterline_remaining_;auto released=waterline_released_;
             std::unordered_map<ValueId,bool> seen;
             for(const auto &[ordinal,indices]:groups) {

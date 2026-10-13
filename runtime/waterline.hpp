@@ -5,6 +5,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 namespace fhegpu {
 // Storage and temporary peaks, with device foreground and plaintext tracked separately.
 struct ResourceUsage {
@@ -29,18 +30,24 @@ struct ResourceUsage {
 struct PrepareResources { ResourceUsage peak, resident; bool supported = false; };
 class WaterlineLedger {
 public:
-    explicit WaterlineLedger(const WaterlineConfig &config) : used(config.device_capacity_bytes.size()), peak(used.front.size()), config_(config) {}
+    explicit WaterlineLedger(const WaterlineConfig &config,std::vector<std::uint64_t> allocator_capacity={})
+        :used(config.device_capacity_bytes.size()),peak(used.front.size()),config_(config),allocator_capacity_(std::move(allocator_capacity)) {
+        if(!allocator_capacity_.empty() && allocator_capacity_.size()!=used.front.size())
+            throw std::invalid_argument("Waterline allocator capacity table mismatch");
+    }
     bool fits(const ResourceUsage &delta) const {
         auto next=used;next+=delta;
         for (std::size_t d=0;d<next.front.size();++d) {
             const auto m=config_.device_capacity_bytes[d], k=config_.device_reserve_bytes[d];
             if (next.front[d]>m-k || next.plain[d]>m-k-next.front[d] ||
                 next.plain[d]>static_cast<std::uint64_t>(config_.device_fractions.at(d)*m)) return false;
+            if(!allocator_capacity_.empty() && (next.front[d]>allocator_capacity_[d] ||
+                next.plain[d]>allocator_capacity_[d]-next.front[d])) return false;
         }
         return next.host<=config_.host_budget_bytes && next.pinned<=config_.pinned_budget_bytes && next.raw<=config_.raw_budget_bytes;
     }
     void reserve(const ResourceUsage &delta) {
-        if (!fits(delta)) throw std::logic_error("Waterline reservation without complete group admission");
+        if (!fits(delta)) throw std::logic_error("Waterline reservation without complete group admission"+describe(delta));
         used+=delta;
         for (std::size_t d=0;d<used.front.size();++d) {peak.front[d]=std::max(peak.front[d],used.front[d]);peak.plain[d]=std::max(peak.plain[d],used.plain[d]);}
         peak.host=std::max(peak.host,used.host);peak.pinned=std::max(peak.pinned,used.pinned);peak.raw=std::max(peak.raw,used.raw);
@@ -48,11 +55,15 @@ public:
     void release(const ResourceUsage &delta) {used-=delta;}
     std::string describe(const ResourceUsage &delta) const {
         auto next=used;next+=delta;std::string result;
-        for(std::size_t d=0;d<next.front.size();++d) result+=" GPU"+std::to_string(d)+" front="+std::to_string(next.front[d])+" plain="+std::to_string(next.plain[d])+" M="+std::to_string(config_.device_capacity_bytes[d])+" reserve="+std::to_string(config_.device_reserve_bytes[d]);
+        for(std::size_t d=0;d<next.front.size();++d) {
+            result+=" GPU"+std::to_string(d)+" front="+std::to_string(next.front[d])+" plain="+std::to_string(next.plain[d])+" M="+std::to_string(config_.device_capacity_bytes[d])+" reserve="+std::to_string(config_.device_reserve_bytes[d]);
+            if(!allocator_capacity_.empty())result+=" allocator_capacity="+std::to_string(allocator_capacity_[d]);
+        }
         return result+" Host="+std::to_string(next.host)+" pinned="+std::to_string(next.pinned)+" raw="+std::to_string(next.raw);
     }
     ResourceUsage used, peak;
 private:
     const WaterlineConfig &config_;
+    std::vector<std::uint64_t> allocator_capacity_;
 };
 } // namespace fhegpu

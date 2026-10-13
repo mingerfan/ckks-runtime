@@ -116,6 +116,19 @@ private:
     std::streambuf *previous_;
 };
 
+class AllocatorLimitedPrepareApi : public PrepareApi {
+public:
+    using PrepareApi::PrepareApi;
+    std::vector<std::uint64_t> allocator_capacity;
+    void validate_waterline_resources(const RuntimePlan &) {validated_=true;}
+    std::vector<std::uint64_t> waterline_allocator_capacity() const {
+        require(validated_,"allocator capacity queried before resource validation");
+        return allocator_capacity;
+    }
+private:
+    bool validated_=false;
+};
+
 std::size_t event_index(const PrepareApi &api, const char *kind, ValueId id) {
     for (std::size_t i = 0; i < api.events.size(); ++i)
         if (std::string(api.events[i].kind) == kind && api.events[i].value == id) return i;
@@ -453,6 +466,76 @@ void test_four_device_progress_and_shared_budgets(const RuntimePlan &rolling,con
                  <<(host_limited?"Host":"pinned")<<" limits Prepare concurrency to 2, temporary/device credits returned\n";
     }
 }
+
+void test_allocator_capacity(const RuntimePlan &rolling,const LoadedOperatorSpec &spec,
+                              const std::vector<double> &input) {
+    auto plan=rolling;
+    auto plaintext=plan.values.front();plaintext.id=60;plaintext.kind=ValueKind::Plaintext;plaintext.components=1;
+    plan.values.push_back(plaintext);
+    plan.initialization.insert(plan.initialization.begin(),{0,ReleaseOp{60}});
+    plan.initialization.insert(plan.initialization.begin(),{0,EncodeOp{InlineEncodePayload{{.5,-1}},60}});
+    number_instructions(plan);
+    for(const auto backend:{PrepareBackend::Cpu,PrepareBackend::Gpu,PrepareBackend::Auto}) {
+        plan.waterline->backend=backend;
+        AllocatorLimitedPrepareApi rejected(std::make_shared<MockCluster>(MockClusterConfig{}));
+        rejected.allocator_capacity={550}; // M=1000 fits; CPU needs 500+100, GPU 500+150.
+        SequentialRuntime<AllocatorLimitedPrepareApi> bad_runtime(0,1,1,rejected,DeviceExecutionMode::PerDeviceWorkers);
+        expect_error([&] {
+            bad_runtime.run({plan,"sha256:"+std::string(64,'1')},{spec,std::nullopt,false},
+                {{0,make_cipher(input,spec.spec.context_id,spec.spec.poly_degree,3,30)}});
+        },"allocator_capacity=550");
+        require(rejected.host_encodes==0 && rejected.preparation_attempts==0 && rejected.stats().communicate_calls==0,
+                "small allocator capacity rejected only after initialization work was submitted");
+
+        const std::uint64_t limit=backend==PrepareBackend::Cpu?600:650;
+        AllocatorLimitedPrepareApi accepted(std::make_shared<MockCluster>(MockClusterConfig{}));
+        accepted.allocator_capacity={limit};
+        SequentialRuntime<AllocatorLimitedPrepareApi> runtime(0,1,1,accepted,DeviceExecutionMode::PerDeviceWorkers);
+        auto artifact=runtime.run({plan,"sha256:"+std::string(64,'1')},{spec,std::nullopt,false},
+            {{0,make_cipher(input,spec.spec.context_id,spec.spec.poly_degree,3,30)}});
+        auto result=artifact.values.at(42).value.materialize();
+        require(std::abs(result.slots[0]-11)<1e-9 && std::abs(result.slots[1]+22)<1e-9 &&
+                accepted.cpu+accepted.gpu==20 && artifact.timing.encode_calls==21 && artifact.timing.fence_calls==0 &&
+                accepted.active_preparations==0,
+                "legal small allocator capacity failed to reclaim and advance");
+        std::cout<<"PASS allocator cap backend="<<int(backend)<<" rejects 550 before initialization, rolls at "<<limit<<'\n';
+    }
+    auto config=*plan.waterline;
+    ResourceUsage group(1);group.front[0]=500;group.plain[0]=100;
+    WaterlineLedger unconstrained(config,{}),exact(config,{600}),too_small(config,{550});
+    require(unconstrained.fits(group) && exact.fits(group) && !too_small.fits(group),
+            "allocator cap did not constrain foreground plus plaintext together");
+    exact.reserve(group);exact.release(group);
+    require(exact.used.front[0]==0 && exact.used.plain[0]==0,"allocator-limited ledger retained credits");
+    expect_error([&] {WaterlineLedger mismatch(config,{600,600});},"allocator capacity table mismatch");
+    AllocatorLimitedPrepareApi no_limit(std::make_shared<MockCluster>(MockClusterConfig{}));
+    SequentialRuntime<AllocatorLimitedPrepareApi> empty_runtime(0,1,1,no_limit,DeviceExecutionMode::PerDeviceWorkers);
+    auto artifact=empty_runtime.run({plan,"sha256:"+std::string(64,'1')},{spec,std::nullopt,false},
+        {{0,make_cipher(input,spec.spec.context_id,spec.spec.poly_degree,3,30)}});
+    require(artifact.timing.encode_calls==21 && no_limit.cpu+no_limit.gpu==20,
+            "empty allocator-capacity vector changed ordinary Waterline behavior");
+    std::cout<<"PASS empty allocator capacity leaves configured budgets unchanged, malformed table rejects\n";
+}
+
+void test_parallel_encode_timing(const RuntimePlan &rolling,const LoadedOperatorSpec &spec,
+                                 const std::vector<double> &input) {
+    auto plan=rolling;plan.waterline->backend=PrepareBackend::Gpu;
+    auto plaintext=plan.values.front();plaintext.id=60;plaintext.kind=ValueKind::Plaintext;plaintext.components=1;
+    plan.values.push_back(plaintext);
+    plan.execution.insert(plan.execution.begin(),{0,ReleaseOp{60}});
+    plan.execution.insert(plan.execution.begin(),{0,EncodeOp{InlineEncodePayload{{.5,-1}},60}});
+    number_instructions(plan);
+    PrepareApi api(std::make_shared<MockCluster>(MockClusterConfig{}));
+    SequentialRuntime<PrepareApi> runtime(0,1,1,api,DeviceExecutionMode::PerDeviceWorkers);
+    auto artifact=runtime.run({plan,"sha256:"+std::string(64,'1')},{spec,std::nullopt,false},
+        {{0,make_cipher(input,spec.spec.context_id,spec.spec.poly_degree,3,30)}});
+    require(artifact.timing.encode_calls==21 && artifact.timing.encode_nanoseconds>0 && api.host_encodes==21 &&
+            api.gpu==20 && api.cpu==0,"ordinary Encode and GPU Prepare corrupted shared timing counters");
+    auto result=artifact.values.at(42).value.materialize();
+    require(std::abs(result.slots[0]-11)<1e-9 && std::abs(result.slots[1]+22)<1e-9,
+            "parallel ordinary Encode/GPU Prepare changed arithmetic");
+    std::cout<<"PASS ordinary CPU Encode and GPU Prepare share protected timing counters\n";
+}
 int main() {
  try {
     WaterlineConfig c; c.device_capacity_bytes={1000};c.device_reserve_bytes={0};c.device_fractions={.4};
@@ -500,6 +583,8 @@ int main() {
     test_prepare_across_fence_and_unused(parsed, spec, input);
     test_prepare_failure_and_explicit_restart(parsed,spec,input);
     test_four_device_progress_and_shared_budgets(parsed,spec,input);
+    test_allocator_capacity(parsed,spec,input);
+    test_parallel_encode_timing(parsed,spec,input);
     for(auto backend:{PrepareBackend::Cpu,PrepareBackend::Gpu,PrepareBackend::Auto}) {
         parsed.waterline->backend=backend;
         // Auto needs room for two groups including GPU's extra 50-byte workspace.
