@@ -95,3 +95,10 @@ VecValue make_cipher(std::vector<double> slots, std::string context, std::uint64
 }
 
 } // namespace fhegpu
+
+bool fhegpu::VecValue::is_ready() const {
+    if (!state_) throw std::runtime_error("unbound VecValue");
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    if (state_->error) std::rethrow_exception(state_->error);
+    return state_->ready;
+}

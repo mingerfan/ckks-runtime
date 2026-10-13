@@ -63,6 +63,25 @@ struct EncodeOp {
     ValueId output = 0;
 };
 
+// A complete preparation publishes a plaintext at its descriptor's Device.
+// Backend choice and temporary storage are runtime concerns.
+struct PreparePlaintextOp {
+    EncodePayload payload;
+    ValueId output = 0;
+};
+
+enum class PrepareBackend { Cpu, Gpu, Auto };
+struct WaterlineConfig {
+    std::vector<std::uint64_t> device_capacity_bytes;
+    std::vector<std::uint64_t> device_reserve_bytes;
+    std::vector<double> device_fractions;
+    std::uint64_t host_budget_bytes = 0;
+    std::uint64_t pinned_budget_bytes = 0;
+    std::uint64_t raw_budget_bytes = 0;
+    PrepareBackend backend = PrepareBackend::Cpu;
+    std::size_t lookahead_groups = 8;
+};
+
 struct ComputeOp {
     ComputeKind kind = ComputeKind::AddCC;
     std::vector<ValueId> inputs;
@@ -89,7 +108,7 @@ struct ReleaseOp {
 
 struct FenceOp {};
 
-using InstructionBody = std::variant<EncodeOp, ComputeOp, CommAction, ReleaseOp, FenceOp>;
+using InstructionBody = std::variant<EncodeOp, ComputeOp, CommAction, ReleaseOp, FenceOp, PreparePlaintextOp>;
 
 struct Instruction {
     std::size_t ordinal = 0;
@@ -148,6 +167,7 @@ struct RuntimePlan {
     std::uint64_t plan_id = 0;
     TargetConfig target;
     std::optional<PlaintextBundleRef> plaintext_bundle;
+    std::optional<WaterlineConfig> waterline;
     std::vector<ValueDesc> values;
     std::vector<ValueId> external_inputs;
     std::vector<Instruction> initialization;

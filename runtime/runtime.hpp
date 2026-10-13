@@ -3,6 +3,8 @@
 #include "runtime/plaintext_bundle.hpp"
 #include "runtime/thread_trace.hpp"
 #include "runtime/verifier.hpp"
+#include "runtime/waterline.hpp"
+#include <deque>
 
 #include <algorithm>
 #include <atomic>
@@ -62,6 +64,16 @@ struct HasComputeReuse<Api, std::void_t<
 
 } // namespace detail
 
+namespace detail {
+template<class Api, class = void> struct HasWaterlineApi : std::false_type {};
+template<class Api> struct HasWaterlineApi<Api, std::void_t<
+    decltype(std::declval<Api &>().prepare_resources(std::declval<const ValueDesc &>(), PrepareBackend::Cpu)),
+    decltype(std::declval<Api &>().value_resources(std::declval<const ValueDesc &>())),
+    decltype(std::declval<Api &>().instruction_workspace(std::declval<const Instruction &>())),
+    decltype(std::declval<Api &>().prepare_plaintext_async(std::declval<const ValueDesc &>(),
+        std::declval<const std::vector<double> &>(), PrepareBackend::Cpu)),
+    decltype(std::declval<Api &>().is_ready(std::declval<typename Api::Value &>()))>> : std::true_type {};
+}
 enum class DiffMode { FinalOnly, AllValuesAfterRun };
 enum class DeviceExecutionMode { Sequential, PerDeviceWorkers };
 
@@ -174,6 +186,10 @@ public:
             const PlanRequirements requirements = PlanVerifier::verify(
                 *plan_, resources.operator_spec, resources.skip_artifact_digest_checks);
             PlanVerifier::verify_runtime_target(*plan_, rank_, world_size_, local_devices_);
+            if (plan_->waterline && device_execution_mode_ != DeviceExecutionMode::PerDeviceWorkers)
+                throw std::runtime_error("Waterline uses the per-device executor; select PerDeviceWorkers");
+            if (plan_->waterline && !detail::HasWaterlineApi<Api>::value)
+                throw std::runtime_error("Api does not support complete plaintext preparation/resource queries");
             check_memory_instruction_support(diff_mode);
             count_uses();
             load_bundle(resources);
@@ -317,6 +333,7 @@ private:
         ValueUses uses;
         std::optional<Value> value;
         std::shared_ptr<ParallelGroup> group;
+        std::optional<Value> completion;
     };
 
     struct ParallelOutput {
@@ -337,7 +354,13 @@ private:
         bool completed = false;
     };
 
-    using ParallelTask = std::function<void()>;
+    struct ParallelTask {
+        std::function<void()> execute;
+        const Instruction *instruction = nullptr;
+        std::vector<ValueId> inputs, outputs;
+        bool preparation = false;
+        PrepareBackend backend = PrepareBackend::Cpu;
+    };
 
     const ValueDesc &desc(ValueId id) const {
         auto found = descriptors_.find(id);
@@ -458,12 +481,15 @@ private:
         std::vector<std::string> local_contents;
         for (const auto *phase : {&plan_->initialization, &plan_->execution})
         for (const auto &instruction : *phase) {
-            const auto *encode = std::get_if<EncodeOp>(&instruction.body);
-            if (!encode || desc(encode->output).place.rank != rank_) continue;
-            if (const auto *payload = std::get_if<BundleEncodePayload>(&encode->payload))
-                local_contents.push_back(payload->content);
+            const EncodePayload *payload = nullptr;
+            if (const auto *encode = std::get_if<EncodeOp>(&instruction.body)) {
+                if (desc(encode->output).place.rank == rank_) payload = &encode->payload;
+            } else if (const auto *prepare = std::get_if<PreparePlaintextOp>(&instruction.body)) {
+                if (desc(prepare->output).place.rank == rank_) payload = &prepare->payload;
+            }
+            if (payload) if (const auto *bundle = std::get_if<BundleEncodePayload>(payload)) local_contents.push_back(bundle->content);
         }
-        if (plan_->format_version == 3) {
+        if (plan_->format_version >= 3) {
             bundle_index_ = PlaintextBundleLoader::open(*resources.plaintext_bundle_dir,
                 *plan_->plaintext_bundle, local_contents,
                 resources.operator_spec.spec.poly_degree / 2,
@@ -507,13 +533,12 @@ private:
         current_ = nullptr;
     }
 
-    Value encode_value(const EncodeOp &op, std::uint64_t ordinal) {
-        const auto &output_desc = desc(op.output);
+    std::vector<double> read_encode_slots(const EncodePayload &payload, ValueId output, std::uint64_t ordinal) {
         std::vector<double> slots;
-        if (const auto *inline_payload = std::get_if<InlineEncodePayload>(&op.payload))
+        if (const auto *inline_payload = std::get_if<InlineEncodePayload>(&payload))
             slots = inline_payload->values;
         else {
-            const auto &content = std::get<BundleEncodePayload>(op.payload).content;
+            const auto &content = std::get<BundleEncodePayload>(payload).content;
             const auto start = std::chrono::steady_clock::now();
             slots = bundle_index_ ? bundle_index_->read(content) : bundle_slots_.at(content);
             if (bundle_index_) {
@@ -523,16 +548,20 @@ private:
                 timing_.bundle_read_bytes += slots.size() * sizeof(double);
                 timing_.raw_peak_bytes = std::max(timing_.raw_peak_bytes,
                     static_cast<std::uint64_t>(slots.size() * sizeof(double) * 2));
-                trace_event("bundle_read", op.output, ordinal, std::nullopt, "Read", elapsed);
+                trace_event("bundle_read", output, ordinal, std::nullopt, "Read", elapsed);
             }
         }
         for (double &value : slots) if (value == 0.0) value = 0.0;
+        return slots;
+    }
+    Value encode_value(const EncodeOp &op, std::uint64_t ordinal) {
+        const auto &output_desc = desc(op.output);
+        auto slots = read_encode_slots(op.payload, op.output, ordinal);
         const auto start = std::chrono::steady_clock::now();
         Value output = api_.encode_plaintext(output_desc, slots);
         api_.validate_value(output, output_desc);
         const auto elapsed = elapsed_nanoseconds(start, std::chrono::steady_clock::now());
-        ++timing_.encode_calls;
-        timing_.encode_nanoseconds += elapsed;
+        ++timing_.encode_calls; timing_.encode_nanoseconds += elapsed;
         trace_event("encode", op.output, ordinal, std::nullopt, "Encode", elapsed);
         return output;
     }
@@ -746,7 +775,15 @@ private:
         store_ = ValueStore<Api>{};
     }
 
+    std::mutex prepare_read_mutex_;
+    std::unique_ptr<WaterlineLedger> waterline_;
+    std::unordered_map<ValueId, ResourceUsage> waterline_storage_;
+    std::unordered_map<ValueId, std::size_t> waterline_remaining_;
+    std::unordered_map<ValueId, bool> waterline_released_;
+
     void reset_parallel_execution_state() {
+        waterline_.reset();
+        waterline_storage_.clear(); waterline_remaining_.clear(); waterline_released_.clear();
         parallel_values_.clear();
         parallel_groups_.clear();
         coordinator_groups_.clear();
@@ -755,12 +792,11 @@ private:
     }
 
     void record_parallel_failure(std::exception_ptr failure) {
-        bool expected = false;
-        if (!parallel_failed_.compare_exchange_strong(expected, true)) return;
         {
-            ThreadTraceLockGuard lock(
-                parallel_failure_mutex_, "runtime.parallel_failure");
+            ThreadTraceLockGuard lock(parallel_failure_mutex_, "runtime.parallel_failure");
+            if (parallel_failed_.load()) return;
             parallel_failure_ = std::move(failure);
+            parallel_failed_.store(true);
         }
         for (const auto &item : parallel_values_)
             item.second->condition.notify_all();
@@ -826,6 +862,8 @@ private:
                     if (value->group.get() != group.get())
                         throw std::runtime_error(
                             "pending communication output group is invalid");
+                    if(waterline_)value->completion.emplace(*output);
+                    if(waterline_)value->completion.emplace(*output);
                     if (!can_clear(value->uses))
                         value->value.emplace(std::move(*output));
                     output.reset();
@@ -925,6 +963,7 @@ private:
         {
             ThreadTraceLockGuard lock(
                 output_value->mutex, "runtime.parallel_value");
+            if(waterline_)output_value->completion.emplace(output);
             if (!can_clear(output_value->uses))
                 output_value->value.emplace(std::move(output));
             output_value->defined = true;
@@ -978,6 +1017,8 @@ private:
                 if (output) {
                     const auto &expected_desc = desc(local_output.id);
                     api_.validate_value(*output, expected_desc);
+                    if(waterline_)value->completion.emplace(*output);
+                    if(waterline_)value->completion.emplace(*output);
                     if (!can_clear(value->uses))
                         value->value.emplace(std::move(*output));
                     output.reset();
@@ -1109,24 +1150,30 @@ private:
                 const std::size_t worker =
                     op->place.kind == PlaceKind::Host ? tasks.size() - 1 :
                     static_cast<std::size_t>(op->place.index) % (tasks.size() - 1);
-                tasks[worker].push_back(
+                tasks[worker].push_back(ParallelTask{
                     [this, op = *op, ordinal = instruction.ordinal, output] {
                         execute_parallel_compute(op, ordinal, output);
-                    });
+                    }, &instruction, op->inputs, {op->output}});
                 continue;
             }
             if (const auto *encode = std::get_if<EncodeOp>(&instruction.body)) {
                 if (desc(encode->output).place.rank != rank_) continue;
                 auto output = define_parallel_value(encode->output, desc(encode->output).place);
-                tasks.back().push_back([this, op = *encode, ordinal = instruction.ordinal, output] {
+                tasks.back().push_back(ParallelTask{[this, op = *encode, ordinal = instruction.ordinal, output] {
                     auto encoded = encode_value(op, ordinal);
                     {
                         ThreadTraceLockGuard lock(output->mutex, "runtime.parallel_value");
+                        if(waterline_)output->completion.emplace(encoded);
                         if (!can_clear(output->uses)) output->value.emplace(std::move(encoded));
                         output->defined = true;
                     }
                     output->condition.notify_all();
-                });
+                }, &instruction, {}, {encode->output}});
+                continue;
+            }
+            if (const auto *prepare = std::get_if<PreparePlaintextOp>(&instruction.body)) {
+                auto output = define_parallel_value(prepare->output, desc(prepare->output).place);
+                tasks.back().push_back(ParallelTask{{}, &instruction, {}, {prepare->output}, true});
                 continue;
             }
             if (const auto *release = std::get_if<ReleaseOp>(&instruction.body)) {
@@ -1134,9 +1181,9 @@ private:
                 if (place.rank != rank_) continue;
                 const std::size_t worker = place.kind == PlaceKind::Device
                     ? static_cast<std::size_t>(place.index) % (tasks.size() - 1) : tasks.size() - 1;
-                tasks[worker].push_back([this, id = release->value, ordinal = instruction.ordinal] {
+                tasks[worker].push_back(ParallelTask{[this, id = release->value, ordinal = instruction.ordinal] {
                     execute_release(id, ordinal, true);
-                });
+                }, &instruction, {release->value}, {}});
                 continue;
             }
 
@@ -1170,18 +1217,32 @@ private:
                 const int device = local_communication_worker(local);
                 const std::size_t worker =
                     static_cast<std::size_t>(device) % (tasks.size() - 1);
-                tasks[worker].push_back(
+                tasks[worker].push_back(ParallelTask{
                     [this, local = std::move(local),
                      ordinal = instruction.ordinal, group] {
                         execute_parallel_communication(
                             local, ordinal, group);
-                    });
+                    }, &instruction, group->action.inputs, group->action.outputs});
             }
         }
     }
 
     void execute_device_parallel_phases() {
         prepare_parallel_values();
+        if constexpr (detail::HasWaterlineApi<Api>::value) {
+            if (plan_->waterline) {
+                waterline_ = std::make_unique<WaterlineLedger>(*plan_->waterline);
+                waterline_storage_.clear(); waterline_remaining_.clear(); waterline_released_.clear();
+                for (const auto &[id, value] : parallel_values_) {
+                    if (!value->value) continue;
+                    auto storage = api_.value_resources(desc(id));
+                    waterline_->reserve(storage); waterline_storage_.emplace(id, storage);
+                }
+                ResourceUsage resident_pack(local_devices_);resident_pack.host=timing_.bundle_resident_bytes;
+                waterline_->reserve(resident_pack);
+                for (const auto &[id, uses] : uses_) waterline_remaining_[id] = uses.remaining;
+            }
+        }
         const std::size_t worker_count =
             device_worker_count_ == 0
                 ? static_cast<std::size_t>(local_devices_)
@@ -1197,13 +1258,21 @@ private:
                 std::vector<std::vector<ParallelTask>> tasks(worker_count + 1);
                 compile_parallel_phase(*phase, tasks, begin, end);
                 const auto start = std::chrono::steady_clock::now();
-                run_parallel_batch(tasks);
+                run_parallel_tasks(tasks);
                 if (end != phase->size()) {
                     api_.drain();
                     record_fence((*phase)[end].ordinal, start);
                 }
                 begin = end + 1;
             }
+        }
+        if (waterline_) {
+            for (std::size_t d=0; d<waterline_->peak.front.size(); ++d)
+                std::cerr << "waterline GPU" << d << " front_peak=" << waterline_->peak.front[d]
+                          << " plain_peak=" << waterline_->peak.plain[d] << " remaining_front=" << waterline_->used.front[d]
+                          << " remaining_plain=" << waterline_->used.plain[d] << '\n';
+            std::cerr << "waterline shared host_peak=" << waterline_->peak.host << " pinned_peak=" << waterline_->peak.pinned
+                      << " raw_peak=" << waterline_->peak.raw << '\n';
         }
         for (ValueId id : plan_->final_outputs) {
             const auto &output_desc = desc(id);
@@ -1213,68 +1282,267 @@ private:
         }
     }
 
-    void run_parallel_batch(std::vector<std::vector<ParallelTask>> &tasks) {
-        std::vector<std::thread> workers;
-        workers.reserve(tasks.size());
-        for (std::size_t device = 0; device < tasks.size(); ++device) {
-            if (tasks[device].empty()) continue;
-            workers.emplace_back([this, &tasks, device] {
-                ThreadTrace::set_thread_name(
-                    "rank-" + std::to_string(rank_) +
-                    (device + 1 == tasks.size() ? "-cpu-worker" :
-                     "-device-worker-" + std::to_string(device)));
-                try {
-                    for (auto &task : tasks[device]) {
-                        if (parallel_failed_.load()) return;
-                        task();
-                    }
-                } catch (...) {
-                    record_parallel_failure(std::current_exception());
-                }
-            });
+    void run_parallel_tasks(std::vector<std::vector<ParallelTask>> &queues) {
+        struct TaskState {
+            ParallelTask task;
+            std::size_t worker = 0;
+            bool admitted = false, started = false, completed = false;
+            ResourceUsage temporary;
+        };
+        const std::size_t device_workers=queues.size()-1, cpu_worker=device_workers;
+        const std::size_t devices=static_cast<std::size_t>(local_devices_);
+        std::vector<TaskState> tasks;
+        for(std::size_t w=0;w<queues.size();++w)
+            for(auto &t:queues[w]) tasks.push_back({std::move(t),w,false,false,false,ResourceUsage(devices)});
+        std::stable_sort(tasks.begin(),tasks.end(),[](const auto &a,const auto &b){return a.task.instruction->ordinal<b.task.instruction->ordinal;});
+        std::map<std::size_t,std::vector<std::size_t>> groups;
+        std::unordered_map<ValueId,std::size_t> preparations;
+        for(std::size_t i=0;i<tasks.size();++i) {
+            if(tasks[i].task.preparation) preparations.emplace(tasks[i].task.outputs.front(),i);
+            else groups[tasks[i].task.instruction->ordinal].push_back(i);
         }
-        std::thread communication_issuer;
-        if constexpr (detail::UsesBackgroundCommunicationIssuer<Api>::value) {
-            communication_issuer = std::thread([this] {
-                ThreadTrace::set_thread_name(
-                    "rank-" + std::to_string(rank_) +
-                    "-communication-issuer");
-                try {
-                    for (const auto &group : coordinator_groups_) {
-                        if (parallel_failed_.load()) return;
-                        execute_parallel_communication(
-                            group->action, group->instruction_ordinal, group);
+        struct Ticket { ResourceUsage temporary; std::size_t remaining=0; };
+        std::map<std::size_t,Ticket> tickets;
+        const auto storage=[&](ValueId id) {
+            if constexpr(detail::HasWaterlineApi<Api>::value) return api_.value_resources(desc(id));
+            else return ResourceUsage(devices);
+        };
+        const auto prepare_cost=[&](std::size_t i,PrepareBackend backend) {
+            if constexpr(detail::HasWaterlineApi<Api>::value) return api_.prepare_resources(desc(tasks[i].task.outputs.front()),backend);
+            else throw std::runtime_error("Api lacks PreparePlaintext");
+            return PrepareResources{ResourceUsage(devices),ResourceUsage(devices),false};
+        };
+        const auto workspace=[&](const Instruction &instruction) {
+            if constexpr(detail::HasWaterlineApi<Api>::value) return api_.instruction_workspace(instruction);
+            else return ResourceUsage(devices);
+        };
+        const auto external=[&](ValueId id) {return std::find(plan_->external_inputs.begin(),plan_->external_inputs.end(),id)!=plan_->external_inputs.end();};
+        // The same topological, one-group-at-a-time baseline is checked with
+        // backend resource queries before submitting any online work.
+        if(waterline_) {
+            WaterlineLedger baseline(*plan_->waterline); baseline.used=waterline_->used;
+            auto resident=waterline_storage_; auto remaining=waterline_remaining_;auto released=waterline_released_;
+            std::unordered_map<ValueId,bool> seen;
+            for(const auto &[ordinal,indices]:groups) {
+                ResourceUsage delta(devices), transient=workspace(*tasks[indices.front()].task.instruction);
+                delta+=transient;
+                for(auto i:indices) {
+                    for(ValueId id:tasks[i].task.inputs) if(preparations.count(id) && !seen[id]) {
+                        const auto pi=preparations.at(id);
+                        auto backend=plan_->waterline->backend==PrepareBackend::Gpu?PrepareBackend::Gpu:PrepareBackend::Cpu;
+                        auto cost=prepare_cost(pi,backend);
+                        if(!cost.supported) throw std::runtime_error("unsupported complete Prepare backend at ValueId "+std::to_string(id));
+                        delta+=cost.peak;auto temp=cost.peak;temp-=cost.resident;transient+=temp;
+                        resident.emplace(id,cost.resident);seen[id]=true;
                     }
-                } catch (...) {
-                    record_parallel_failure(std::current_exception());
+                    for(ValueId id:tasks[i].task.outputs) {auto cost=storage(id);delta+=cost;resident.emplace(id,cost);}
                 }
-            });
-        } else {
-            try {
-                for (const auto &group : coordinator_groups_) {
-                    if (parallel_failed_.load()) break;
-                    execute_parallel_communication(
-                        group->action, group->instruction_ordinal, group);
-                    finish_parallel_group(group, std::nullopt);
+                if(!baseline.fits(delta)) throw std::runtime_error("Waterline single-group baseline infeasible at instruction #"+std::to_string(ordinal)+baseline.describe(delta));
+                baseline.reserve(delta);baseline.release(transient);
+                for(auto i:indices) {
+                    const auto &task=tasks[i].task;
+                    if(const auto *op=std::get_if<ReleaseOp>(&task.instruction->body)) released[op->value]=true;
+                    else {
+                        for(auto id:task.inputs) {if(!remaining.at(id))throw std::logic_error("Waterline baseline use underflow");--remaining.at(id);}
+                        if(const auto *op=std::get_if<ComputeOp>(&task.instruction->body);op && op->reuse_input)released[op->inputs.front()]=true;
+                    }
                 }
-            } catch (...) {
-                record_parallel_failure(std::current_exception());
+                for(auto i:indices) for(auto id:tasks[i].task.inputs) {
+                    const auto found=resident.find(id);
+                    if(found!=resident.end() && released[id] && !remaining.at(id) && !external(id)) {
+                        baseline.release(found->second);resident.erase(found);
+                    }
+                }
             }
         }
-        for (auto &worker : workers) worker.join();
-        if (communication_issuer.joinable()) communication_issuer.join();
-        if (parallel_failed_.load()) {
-            ThreadTraceLockGuard lock(
-                parallel_failure_mutex_, "runtime.parallel_failure");
-            std::rethrow_exception(parallel_failure_);
+        struct Worker {
+            std::mutex mutex; std::condition_variable condition;
+            std::optional<std::size_t> assigned; bool stop=false;
+            std::atomic<bool> submitted{false}; bool busy=false;
+            std::vector<Value> completions;
+        };
+        // Existing foreground/CPU workers, plus one independent preparation lane per GPU.
+        std::vector<std::unique_ptr<Worker>> workers;
+        for(std::size_t i=0;i<queues.size()+devices;++i) workers.push_back(std::make_unique<Worker>());
+        std::vector<std::deque<std::size_t>> pending(workers.size());
+        std::deque<std::size_t> cpu_preparations;
+        for (std::size_t i=0;i<tasks.size();++i) if(!tasks[i].task.preparation)pending[tasks[i].worker].push_back(i);
+        std::vector<std::thread> threads;
+        const auto stop_workers=[&] {
+            for(auto &w:workers) {{std::lock_guard<std::mutex> lock(w->mutex);w->stop=true;}w->condition.notify_all();}
+            for(auto &thread:threads) if(thread.joinable())thread.join();
+        };
+        for(std::size_t w=0;w<workers.size();++w) threads.emplace_back([&,w] {
+            ThreadTrace::set_thread_name("rank-"+std::to_string(rank_)+"-worker-"+std::to_string(w));
+            auto &worker=*workers[w];
+            try {
+                for(;;) {
+                    std::size_t i;
+                    {std::unique_lock<std::mutex> lock(worker.mutex);worker.condition.wait(lock,[&]{return worker.stop || worker.assigned.has_value();});
+                     if(worker.stop)return;
+                     i=*worker.assigned;}
+                    auto &task=tasks[i].task;
+                    if(task.preparation) {
+                        if constexpr(detail::HasWaterlineApi<Api>::value) {
+                            const auto &op=std::get<PreparePlaintextOp>(task.instruction->body);
+                            std::vector<double> slots;
+                            {std::lock_guard<std::mutex> lock(prepare_read_mutex_);slots=read_encode_slots(op.payload,op.output,task.instruction->ordinal);}
+                            const auto start=std::chrono::steady_clock::now();
+                            Value result=api_.prepare_plaintext_async(desc(op.output),slots,task.backend);
+                            api_.validate_value(result,desc(op.output));
+                            const auto elapsed=elapsed_nanoseconds(start,std::chrono::steady_clock::now());
+                            {std::lock_guard<std::mutex> lock(parallel_timing_mutex_);++timing_.encode_calls;timing_.encode_nanoseconds+=elapsed;}
+                            trace_event(task.backend==PrepareBackend::Cpu?"prepare_cpu":"prepare_gpu",op.output,task.instruction->ordinal,std::nullopt,"PreparePlaintext",elapsed);
+                            auto output=parallel_value(op.output);
+                            {std::lock_guard<std::mutex> lock(output->mutex);output->completion.emplace(result);output->value.emplace(std::move(result));output->defined=true;}
+                            output->condition.notify_all();
+                        } else throw std::runtime_error("Api lacks PreparePlaintext");
+                    } else task.execute();
+                    for(auto id:task.outputs) {
+                        auto output=parallel_value(id);
+                        std::shared_ptr<ParallelGroup> group;
+                        {std::lock_guard<std::mutex> lock(output->mutex);group=output->group;}
+                        if(group && waterline_)finish_parallel_group(group,std::nullopt);
+                        {std::lock_guard<std::mutex> lock(output->mutex);
+                         if(output->completion) {worker.completions.push_back(std::move(*output->completion));output->completion.reset();}}
+                    }
+                    {std::unique_lock<std::mutex> lock(worker.mutex);worker.submitted.store(true);
+                     worker.condition.wait(lock,[&]{return worker.stop || !worker.assigned.has_value() || *worker.assigned != i;});if(worker.stop)return;}
+                }
+            } catch(...) {record_parallel_failure(std::current_exception());worker.submitted.store(true);}
+        });
+        // Cross-rank communication retains its existing issuer semantics. V4 Waterline is single-rank.
+        std::thread issuer;
+        if(!coordinator_groups_.empty()) issuer=std::thread([this] {
+            try {for(const auto &group:coordinator_groups_) {if(parallel_failed_.load())return;
+                execute_parallel_communication(group->action,group->instruction_ordinal,group);
+                if constexpr (!detail::UsesBackgroundCommunicationIssuer<Api>::value) finish_parallel_group(group,std::nullopt);}}
+            catch(...) {record_parallel_failure(std::current_exception());}
+        });
+        auto next=groups.begin();std::size_t finished=0,active_groups=0;
+        const auto ready=[&](const ParallelTask &task) {
+            for(auto id:task.inputs) {auto value=parallel_value(id);std::lock_guard<std::mutex> lock(value->mutex);if(!value->defined)return false;}
+            return true;
+        };
+        const auto retire=[&](const std::vector<ValueId> &ids) {
+            for(auto id:ids) {
+                const auto it=waterline_storage_.find(id);
+                if(it!=waterline_storage_.end() && waterline_released_[id] && !waterline_remaining_.at(id) && !external(id)) {
+                    waterline_->release(it->second);waterline_storage_.erase(it);
+                }
+            }
+        };
+        try {
+            while(finished<tasks.size()) {
+                if(parallel_failed_.load())std::rethrow_exception(parallel_failure_);
+                bool progress=false;
+                api_.collect_completed();
+                for(auto &ptr:workers) {
+                    auto &worker=*ptr;if(!worker.busy || !worker.submitted.load())continue;
+                    bool complete=true;
+                    if(waterline_) if constexpr(detail::HasWaterlineApi<Api>::value)
+                        for(auto &v:worker.completions) if(!api_.is_ready(v))complete=false;
+                    if(!complete)continue;
+                    const auto i=*worker.assigned;auto &state=tasks[i];auto &task=state.task;
+                    worker.completions.clear();state.completed=true;++finished;progress=true;
+                    if(waterline_) {
+                        if(task.preparation)waterline_->release(state.temporary);
+                        else {
+                            auto &ticket=tickets.at(task.instruction->ordinal);
+                            if(--ticket.remaining==0) {waterline_->release(ticket.temporary);--active_groups;tickets.erase(task.instruction->ordinal);}
+                            if(const auto *op=std::get_if<ReleaseOp>(&task.instruction->body))waterline_released_[op->value]=true;
+                            else {
+                                for(auto id:task.inputs) {if(!waterline_remaining_.at(id))throw std::logic_error("Waterline completed use underflow");--waterline_remaining_.at(id);}
+                                if(const auto *op=std::get_if<ComputeOp>(&task.instruction->body);op && op->reuse_input)waterline_released_[op->inputs.front()]=true;
+                            }
+                        }
+                        retire(task.inputs);
+                    }
+                    {std::lock_guard<std::mutex> lock(worker.mutex);worker.assigned.reset();worker.busy=false;worker.submitted.store(false);}
+                    worker.condition.notify_all();
+                }
+                while(next!=groups.end() && (!waterline_ || active_groups<plan_->waterline->lookahead_groups)) {
+                    const auto &indices=next->second;
+                    ResourceUsage delta(devices),temp(devices);
+                    std::vector<std::pair<std::size_t,PrepareResources>> needed;
+                    if(waterline_) {
+                        temp=workspace(*tasks[indices.front()].task.instruction);delta+=temp;
+                        for(auto i:indices) {
+                            for(auto id:tasks[i].task.inputs) if(preparations.count(id) && !tasks[preparations.at(id)].admitted) {
+                                const auto pi=preparations.at(id);
+                                if(std::any_of(needed.begin(),needed.end(),[&](const auto &n){return n.first==pi;}))continue;
+                                auto backend=plan_->waterline->backend;
+                                const auto d=static_cast<std::size_t>(desc(id).place.index);
+                                if(backend==PrepareBackend::Auto) {
+                                    bool cpu_pending=workers[cpu_worker]->busy || !cpu_preparations.empty();
+                                    backend=cpu_pending && !workers[d%device_workers]->busy ? PrepareBackend::Gpu : PrepareBackend::Cpu;
+                                    if(!prepare_cost(pi,backend).supported)backend=PrepareBackend::Cpu;
+                                }
+                                auto cost=prepare_cost(pi,backend);
+                                if(!cost.supported)throw std::runtime_error("unsupported Prepare backend at ValueId "+std::to_string(id));
+                                tasks[pi].task.backend=backend;
+                                needed.emplace_back(pi,cost);delta+=cost.peak;
+                            }
+                            for(auto id:tasks[i].task.outputs)delta+=storage(id);
+                        }
+                        if(!waterline_->fits(delta))break;
+                        waterline_->reserve(delta);
+                        tickets.emplace(next->first,Ticket{temp,indices.size()});++active_groups;
+                        for(const auto &[pi,cost]:needed) {
+                            auto &state=tasks[pi];state.admitted=true;state.temporary=cost.peak;state.temporary-=cost.resident;
+                            const auto id=state.task.outputs.front();waterline_storage_.emplace(id,cost.resident);
+                            state.worker=state.task.backend==PrepareBackend::Cpu?cpu_worker:queues.size()+desc(id).place.index;
+                            if(state.task.backend==PrepareBackend::Cpu)cpu_preparations.push_back(pi);
+                            else pending[state.worker].push_back(pi);
+                        }
+                        for(auto i:indices)for(auto id:tasks[i].task.outputs)waterline_storage_.emplace(id,storage(id));
+                        trace_event("admit",0,next->first,std::nullopt,"CompleteGroup",0);
+                    }
+                    for(auto i:indices)tasks[i].admitted=true;
+                    ++next;progress=true;
+                }
+                for(std::size_t w=0;w<workers.size();++w) {
+                    auto &worker=*workers[w];if(worker.busy)continue;
+                    std::optional<std::size_t> selected;
+                    if(!pending[w].empty()) {
+                        const auto i=pending[w].front();const auto &state=tasks[i];
+                        if(state.admitted && ready(state.task)) {
+                            bool allowed=true;
+                            if(state.task.preparation && state.task.backend==PrepareBackend::Gpu) {
+                                const auto d=static_cast<std::size_t>(desc(state.task.outputs.front()).place.index)%device_workers;
+                                allowed=!workers[d]->busy;
+                                if(!pending[d].empty()) {
+                                    const auto &front=tasks[pending[d].front()];
+                                    if(front.admitted && ready(front.task))allowed=false;
+                                }
+                            }
+                            if(allowed) {selected=i;pending[w].pop_front();}
+                        }
+                    }
+                    if(!selected && w==cpu_worker && !cpu_preparations.empty()) {
+                        selected=cpu_preparations.front();cpu_preparations.pop_front();
+                    }
+                    if(selected) {
+                        tasks[*selected].started=true;
+                        {std::lock_guard<std::mutex> lock(worker.mutex);worker.assigned=*selected;worker.busy=true;worker.submitted.store(false);}
+                        worker.condition.notify_all();progress=true;
+                    }
+                }
+                if(!progress) {
+                    bool in_flight=false;for(const auto &w:workers)in_flight|=w->busy;
+                    if(!in_flight && coordinator_groups_.empty()) {
+                        if(next!=groups.end())throw std::runtime_error("Waterline cannot advance at instruction #"+std::to_string(next->first)+ (waterline_?waterline_->describe(ResourceUsage(devices)):""));
+                        throw std::runtime_error("executor has no runnable producer: dependency/order invariant violated");
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+            stop_workers();if(issuer.joinable())issuer.join();
+        } catch(...) {
+            record_parallel_failure(std::current_exception());stop_workers();if(issuer.joinable())issuer.join();throw;
         }
-
-        for (const auto &group : parallel_groups_)
-            if (!group->completed)
-                finish_parallel_group(group, std::nullopt);
-
-        parallel_groups_.clear();
-        coordinator_groups_.clear();
+        for(const auto &group:parallel_groups_)if(!group->completed)finish_parallel_group(group,std::nullopt);
+        parallel_groups_.clear();coordinator_groups_.clear();
     }
 
     void finish_all_groups() {

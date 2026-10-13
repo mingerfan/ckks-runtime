@@ -93,6 +93,10 @@ endif()
 
 if(CKKS_RUNTIME_BUILD_TESTS)
     enable_testing()
+    add_executable(runtime_waterline_tests tests/runtime_waterline_tests.cpp)
+    target_link_libraries(runtime_waterline_tests PRIVATE ckks_runtime_plan_json ckks_runtime_test_support)
+    target_compile_definitions(runtime_waterline_tests PRIVATE CKKS_RUNTIME_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME runtime_waterline_tests COMMAND runtime_waterline_tests)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     add_test(NAME pack_plaintext_bundle_tests
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/pack_plaintext_bundle_tests.py)

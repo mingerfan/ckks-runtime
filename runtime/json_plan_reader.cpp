@@ -253,6 +253,13 @@ Instruction read_instruction(const Json &value, const std::string &path, std::ui
     if (!value.is_object() || !value.contains("kind")) fail(doc, path, "missing required field 'kind'");
     const std::string kind = read_string(value.at("kind"), doc, path + ".kind");
     if (kind == "encode") return read_encode(value, path);
+    if (kind == "prepare_plaintext") {
+        if (version < 4) fail(doc, path + ".kind", "PreparePlaintext requires format version 4");
+        auto instruction = read_encode(value, path);
+        auto op = std::get<EncodeOp>(std::move(instruction.body));
+        instruction.body = PreparePlaintextOp{std::move(op.payload), op.output};
+        return instruction;
+    }
     if (kind == "fence") {
         if (version < 3) fail(doc, path + ".kind", "Fence requires format version 3");
         require_members(value, doc, path, {"ordinal", "kind"});
@@ -274,10 +281,35 @@ void read_metadata(const Json &root, RuntimePlan &plan) {
     require_members(root, doc, "$",
                     {"format_version", "plan_id", "target", "values", "external_inputs",
                      "initialization", "execution", "finalization", "final_outputs"},
-                    {"plaintext_bundle"});
+                    {"plaintext_bundle", "waterline"});
     plan.format_version = static_cast<std::uint32_t>(read_nonnegative_int(root.at("format_version"), doc, "$.format_version"));
-    if (plan.format_version != 1 && plan.format_version != 2 && plan.format_version != 3)
+    if (plan.format_version != 1 && plan.format_version != 2 && plan.format_version != 3 && plan.format_version != 4)
         fail(doc, "$.format_version", "unsupported format version");
+    if (root.contains("waterline")) {
+        if (plan.format_version != 4) fail(doc, "$.waterline", "waterline requires V4");
+        const auto &v = root.at("waterline");
+        require_members(v, doc, "$.waterline", {"device_capacity_bytes", "device_reserve_bytes", "device_fractions",
+            "host_budget_bytes", "pinned_budget_bytes", "raw_budget_bytes", "backend", "lookahead_groups"});
+        WaterlineConfig c;
+        const auto budget = [&](const Json &n) { return read_safe_uint(n, doc, "$.waterline", 0, (1ULL << 53)-1); };
+        for (const char *field : {"device_capacity_bytes", "device_reserve_bytes"}) {
+            if (!v.at(field).is_array()) fail(doc, "$.waterline", "device budgets must be arrays");
+            auto &out = std::string(field) == "device_capacity_bytes" ? c.device_capacity_bytes : c.device_reserve_bytes;
+            for (const auto &n : v.at(field)) out.push_back(budget(n));
+        }
+        if (!v.at("device_fractions").is_array()) fail(doc, "$.waterline.device_fractions", "expected array");
+        for (const auto &n : v.at("device_fractions")) c.device_fractions.push_back(read_finite_double(n, doc, "$.waterline.device_fractions"));
+        c.host_budget_bytes = budget(v.at("host_budget_bytes"));
+        c.pinned_budget_bytes = budget(v.at("pinned_budget_bytes"));
+        c.raw_budget_bytes = budget(v.at("raw_budget_bytes"));
+        c.lookahead_groups = read_positive_int(v.at("lookahead_groups"), doc, "$.waterline.lookahead_groups");
+        const auto backend = read_string(v.at("backend"), doc, "$.waterline.backend");
+        if (backend == "cpu") c.backend = PrepareBackend::Cpu;
+        else if (backend == "gpu") c.backend = PrepareBackend::Gpu;
+        else if (backend == "auto") c.backend = PrepareBackend::Auto;
+        else fail(doc, "$.waterline.backend", "expected cpu, gpu or auto");
+        plan.waterline = std::move(c);
+    }
     plan.plan_id = read_id(root.at("plan_id"), doc, "$.plan_id");
     plan.target = read_target(root.at("target"), "$.target");
     if (root.contains("plaintext_bundle")) plan.plaintext_bundle = read_bundle_ref(root.at("plaintext_bundle"), "$.plaintext_bundle");

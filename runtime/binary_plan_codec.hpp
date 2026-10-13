@@ -15,6 +15,14 @@ inline Json metadata(const RuntimePlan &p) {
                    {{"id", p.target.operator_spec.id},
                     {"version", p.target.operator_spec.version},
                     {"source_sha256", p.target.operator_spec.source_sha256}}}}}};
+    if (p.waterline) {
+        const auto &c = *p.waterline;
+        result["waterline"] = {{"device_capacity_bytes", c.device_capacity_bytes},
+            {"device_reserve_bytes", c.device_reserve_bytes}, {"device_fractions", c.device_fractions},
+            {"host_budget_bytes", c.host_budget_bytes}, {"pinned_budget_bytes", c.pinned_budget_bytes},
+            {"raw_budget_bytes", c.raw_budget_bytes}, {"lookahead_groups", c.lookahead_groups},
+            {"backend", c.backend == PrepareBackend::Cpu ? "cpu" : c.backend == PrepareBackend::Gpu ? "gpu" : "auto"}};
+    }
     if (p.plaintext_bundle) {
         result["plaintext_bundle"] = {{"id", p.plaintext_bundle->id},
                                       {"version", p.plaintext_bundle->version},
@@ -47,7 +55,26 @@ template <bool R> void instruction(Archive<R> &a, Instruction &i, std::uint32_t 
     std::uint8_t tag = static_cast<std::uint8_t>(i.body.index());
     a.number(tag);
     switch (tag) {
+    case 5:
+        if (version < 4) throw std::runtime_error("binary PreparePlaintext requires plan V4");
+        [[fallthrough]];
     case 0: {
+        if constexpr (!R) {
+            if (tag == 5) {
+                const auto &prepare = std::get<PreparePlaintextOp>(i.body);
+                Instruction temporary{i.ordinal, EncodeOp{prepare.payload, prepare.output}};
+                // Emit the shared payload record below, with the original tag.
+                auto &op = std::get<EncodeOp>(temporary.body);
+                a.number(op.output);
+                std::uint8_t payload = static_cast<std::uint8_t>(op.payload.index());
+                a.number(payload);
+                if (payload == 0) {
+                    auto &values = std::get<InlineEncodePayload>(op.payload).values;
+                    a.sequence(values, 8, [&](double &v) { a.real(v); });
+                } else a.string_ref(std::get<BundleEncodePayload>(op.payload).content);
+                break;
+            }
+        }
         if constexpr (R)
             i.body = EncodeOp{};
         auto &op = std::get<EncodeOp>(i.body);
@@ -69,6 +96,10 @@ template <bool R> void instruction(Archive<R> &a, Instruction &i, std::uint32_t 
             json_utils::read_sha256(Json(content), "binary plan", "content");
         } else
             throw std::runtime_error("unknown binary payload tag");
+        if (tag == 5) {
+            auto encoded = std::get<EncodeOp>(std::move(i.body));
+            i.body = PreparePlaintextOp{std::move(encoded.payload), encoded.output};
+        }
         break;
     }
     case 1: {
@@ -207,6 +238,8 @@ inline Strings collect_strings(const RuntimePlan &p) {
             if (const auto *op = std::get_if<EncodeOp>(&i.body)) {
                 if (const auto *payload = std::get_if<BundleEncodePayload>(&op->payload))
                     strings.add(payload->content);
+            } else if (const auto *op = std::get_if<PreparePlaintextOp>(&i.body)) {
+                if (const auto *payload = std::get_if<BundleEncodePayload>(&op->payload)) strings.add(payload->content);
             } else if (const auto *op = std::get_if<ComputeOp>(&i.body)) {
                 if (const auto *attrs = std::get_if<BootAttrs>(&op->attrs))
                     strings.add(attrs->operator_profile);

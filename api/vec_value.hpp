@@ -39,6 +39,7 @@ public:
     ValueKind kind() const;
     VecMetadata metadata() const;
     VecPayload materialize() const;
+    bool is_ready() const;
     VecValue deep_copy() const;
     void mutate_slots(const std::function<void(std::vector<double> &)> &mutation);
     void fulfill(VecPayload payload) const;

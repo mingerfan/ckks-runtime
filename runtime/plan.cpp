@@ -110,6 +110,8 @@ void RuntimePlan::print(std::ostream &out) const {
                 if (const auto *bundle = std::get_if<BundleEncodePayload>(&encode->payload)) out << bundle->content;
                 else out << "inline";
                 out << ")\n";
+            } else if (const auto *prepare = std::get_if<PreparePlaintextOp>(&inst.body)) {
+                out << '%' << prepare->output << " = PreparePlaintext\n";
             } else if (const auto *op = std::get_if<ComputeOp>(&inst.body)) {
                 out << '%' << op->output << " = " << to_string(op->kind) << '(';
                 for (std::size_t i = 0; i < op->inputs.size(); ++i) { if (i) out << ','; out << '%' << op->inputs[i]; }

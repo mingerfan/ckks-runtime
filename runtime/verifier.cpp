@@ -1,4 +1,5 @@
 #include "runtime/verifier.hpp"
+#include <cmath>
 
 #include <algorithm>
 #include <array>
@@ -196,9 +197,21 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                                       const LoadedOperatorSpec &loaded_spec,
                                       bool skip_artifact_digest_checks) {
     const auto &spec = loaded_spec.spec;
-    if (plan.format_version != 1 && plan.format_version != 2 && plan.format_version != 3) fail("unsupported format version");
+    if (plan.format_version != 1 && plan.format_version != 2 && plan.format_version != 3 && plan.format_version != 4) fail("unsupported format version");
     if (plan.format_version == 3 && plan.target.world_size != 1)
         fail("RuntimePlan V3 supports one rank only");
+    if (plan.waterline) {
+        const auto &c = *plan.waterline;
+        if (plan.format_version != 4 || plan.target.world_size != 1 || plan.target.device_counts.size() != 1)
+            fail("Waterline requires V4 and one rank");
+        if (c.device_capacity_bytes.size() != static_cast<std::size_t>(plan.target.device_counts[0]) ||
+            c.device_reserve_bytes.size() != c.device_capacity_bytes.size() || c.device_fractions.size() != c.device_capacity_bytes.size()) fail("Waterline device budget table mismatch");
+        if (!c.host_budget_bytes || !c.pinned_budget_bytes || !c.raw_budget_bytes || !c.lookahead_groups)
+            fail("Waterline requires positive budgets and 0 < fraction < 1");
+        for (double fraction : c.device_fractions) if (!(fraction > 0 && fraction < 1)) fail("Waterline requires 0 < device fraction < 1");
+        for (std::size_t i = 0; i < c.device_capacity_bytes.size(); ++i)
+            if (!c.device_capacity_bytes[i] || c.device_reserve_bytes[i] >= c.device_capacity_bytes[i]) fail("invalid Waterline capacity/reserve");
+    }
     if (spec.format_version != 1 && spec.format_version != 2)
         fail("unsupported OperatorSpec format version");
     if (plan.target.target_id.empty()) fail("target id is empty");
@@ -299,7 +312,7 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
             if (instruction.ordinal != expected_ordinal++) fail("instruction ordinals must be contiguous and stable");
             if (const auto *encode = std::get_if<EncodeOp>(&instruction.body)) {
                 if (phase != Phase::Initialization &&
-                    !(plan.format_version == 3 && phase == Phase::Execution))
+                    !(plan.format_version >= 3 && phase == Phase::Execution))
                     fail("Encode is only allowed in initialization (or V3 execution)");
                 const auto &output = lookup(descs, encode->output, "Encode output");
                 auto &s = state(output.id, "Encode output");
@@ -317,6 +330,22 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                 } else {
                     fail("unknown Encode payload");
                 }
+            } else if (const auto *prepare = std::get_if<PreparePlaintextOp>(&instruction.body)) {
+                if (plan.format_version != 4 || !plan.waterline || phase != Phase::Execution)
+                    fail("PreparePlaintext requires V4 execution with Waterline config");
+                const auto &output = lookup(descs, prepare->output, "PreparePlaintext output");
+                auto &s = state(output.id, "PreparePlaintext output");
+                mention(s);
+                if (output.kind != ValueKind::Plaintext || output.place.kind != PlaceKind::Device || output.components != 1 || !output.ntt)
+                    fail("PreparePlaintext output must be Device NTT plaintext");
+                if (s.flags & Defined) fail("duplicate definition of ValueId " + std::to_string(output.id));
+                s.flags |= Defined;
+                capabilities.insert(RequiredCapability::Encode);
+                capabilities.insert(RequiredCapability::Transfer);
+                if (const auto *payload = std::get_if<InlineEncodePayload>(&prepare->payload)) {
+                    if (payload->values.empty() || payload->values.size() > spec.poly_degree / 2) fail("invalid PreparePlaintext slot count");
+                    for (double v : payload->values) if (!std::isfinite(v)) fail("non-finite PreparePlaintext payload");
+                } else has_bundle_encode = true;
             } else if (const auto *op = std::get_if<ComputeOp>(&instruction.body)) {
                 if (op->reuse_input && plan.format_version == 1)
                     fail("instruction #" + std::to_string(instruction.ordinal) + " reuse_input requires format version 2");

@@ -130,7 +130,7 @@ void test_versions_and_strict_fields() {
     v3["execution"].back().erase("output");
     v3["format_version"] = 2;
     expect_throw([&] { read(v3); }, "Fence requires format version 3");
-    plan["format_version"] = 4;
+    plan["format_version"] = 5;
     expect_throw([&] { read(plan); }, "unsupported format version");
     for (const Json &index : {Json(-1), Json(0.0), Json("0"), Json(true), Json(nullptr), Json(2147483648ULL)}) {
         auto invalid = fixture();
