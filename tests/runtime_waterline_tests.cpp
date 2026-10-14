@@ -3,9 +3,12 @@
 #include "runtime/plan_reader.hpp"
 #include "runtime/operator_spec_reader.hpp"
 #include "runtime/binary_plan_codec.hpp"
+#include "runtime/utils/sha256.hpp"
 #include <iostream>
 #include <atomic>
 #include <algorithm>
+#include <cstring>
+#include <fstream>
 #include <limits>
 #include <sstream>
 using namespace fhegpu;
@@ -105,6 +108,87 @@ private:
     bool preflight_done_=false;
     std::string digest_;
     std::uint64_t degree_=0;
+};
+
+// As in runtime_release_tests, weak wrappers observe Runtime ownership without
+// keeping the underlying mock executor's payloads alive on its behalf.
+class BundleFailurePrepareApi {
+public:
+    using Value = std::shared_ptr<VecValue>;
+    static constexpr bool background_communication_issuer = true;
+    struct CommHandle {
+        MockVecApi::CommHandle inner;
+        std::vector<std::optional<Value>> outputs;
+    };
+    RestartablePrepareApi inner{std::make_shared<MockCluster>(MockClusterConfig{})};
+    int aborts=0,drains=0;
+    bool expect_failed_cleanup=true;
+    std::string name() const {return "BundleFailurePrepareApi";}
+    Value observe(ValueId id,VecValue value) {
+        auto result=std::make_shared<VecValue>(std::move(value));
+        std::lock_guard<std::mutex> lock(mutex_);observed_[id]=result;return result;
+    }
+    bool expired(ValueId id) {
+        std::lock_guard<std::mutex> lock(mutex_);return observed_.at(id).expired();
+    }
+    Value encode_plaintext(const ValueDesc &desc,const std::vector<double> &slots) {
+        return observe(desc.id,inner.encode_plaintext(desc,slots));
+    }
+    Value prepare_plaintext_async(const ValueDesc &desc,const std::vector<double> &slots,
+                                  PrepareBackend backend) {
+        return observe(desc.id,inner.prepare_plaintext_async(desc,slots,backend));
+    }
+    ResourceUsage value_resources(const ValueDesc &desc) {return inner.value_resources(desc);}
+    PrepareResources prepare_resources(const ValueDesc &desc,PrepareBackend backend) {
+        return inner.prepare_resources(desc,backend);
+    }
+    ResourceUsage instruction_workspace(const Instruction &instruction) {
+        return inner.instruction_workspace(instruction);
+    }
+    Value compute(const ComputeOp &op,const std::vector<Value> &inputs) {
+        return observe(op.output,inner.compute(op,unwrap(inputs)));
+    }
+    CommHandle communicate_async(const CommAction &action,const std::vector<Value> &inputs,
+                                 const std::vector<ValueDesc> &descs) {
+        CommHandle handle;
+        handle.inner=inner.communicate_async(action,unwrap(inputs),descs);
+        auto outputs=inner.posted_outputs(handle.inner);handle.outputs.resize(outputs.size());
+        for(std::size_t slot=0;slot<outputs.size();++slot)
+            if(outputs[slot])handle.outputs[slot]=observe(action.outputs[slot],std::move(*outputs[slot]));
+        return handle;
+    }
+    std::vector<std::optional<Value>> posted_outputs(CommHandle &handle) {return take_outputs(handle);}
+    std::vector<std::optional<Value>> wait(CommHandle &handle) {
+        inner.wait(handle.inner);return take_outputs(handle);
+    }
+    void collect_completed() {inner.collect_completed();}
+    bool is_ready(Value &value) {return inner.is_ready(*value);}
+    void synchronize(Value &value) {inner.synchronize(*value);}
+    void validate_value(const Value &value,const ValueDesc &desc) const {inner.validate_value(*value,desc);}
+    void preflight(std::string_view digest,bool skip,const TargetConfig &target,
+                   const OperatorSpec &spec,const PlanRequirements &requirements) {
+        inner.preflight(digest,skip,target,spec,requirements);
+    }
+    [[noreturn]] void abort_all(int,const std::string &reason) {++aborts;throw ClusterPanic(reason);}
+    void drain() {
+        ++drains;
+        if(expect_failed_cleanup)
+            require(aborts==1 && !expired(2),"bundle failure released the admitted source before drain");
+        inner.drain();
+        require(inner.active_preparations==0 && inner.preparations.empty(),
+                "bundle failure drain left submitted preparation work live");
+        if(expect_failed_cleanup)
+            require(!expired(2),"bundle failure released the admitted source during drain");
+    }
+private:
+    static std::vector<VecValue> unwrap(const std::vector<Value> &inputs) {
+        std::vector<VecValue> result;for(const auto &value:inputs)result.push_back(*value);return result;
+    }
+    static std::vector<std::optional<Value>> take_outputs(CommHandle &handle) {
+        std::vector<std::optional<Value>> result(handle.outputs.size());result.swap(handle.outputs);return result;
+    }
+    std::mutex mutex_;
+    std::unordered_map<ValueId,std::weak_ptr<VecValue>> observed_;
 };
 
 class CaptureRuntimeErrors {
@@ -463,6 +547,97 @@ void test_prepare_failure_and_explicit_restart(const RuntimePlan &rolling,const 
     }
 }
 
+void test_lazy_bundle_failure_and_explicit_repair(const RuntimePlan &rolling,const LoadedOperatorSpec &spec,
+                                                 const std::vector<double> &input) {
+    // There is no replaceable BundleReader in RuntimeResources. A format1
+    // manifest is indexed without opening its blobs, so a genuinely missing
+    // blob fails in read_encode_slots on the selected Prepare worker.
+    for(const auto backend:{PrepareBackend::Cpu,PrepareBackend::Gpu}) {
+        struct TemporaryBundle {
+            std::filesystem::path path;
+            ~TemporaryBundle() {std::error_code error;std::filesystem::remove_all(path,error);}
+        } bundle{std::filesystem::temp_directory_path()/
+            ("ckks-waterline-bundle-failure-"+std::to_string(int(backend))+"-"+
+             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()))};
+        std::filesystem::create_directories(bundle.path/"data");
+        const auto slot_bytes=[](double first,double second) {
+            std::string bytes(16,'\0');const double values[]={first,second};
+            for(std::size_t i=0;i<2;++i) {
+                std::uint64_t bits=0;std::memcpy(&bits,&values[i],sizeof(bits));
+                for(unsigned byte=0;byte<8;++byte)bytes[i*8+byte]=static_cast<char>(bits>>(byte*8));
+            }
+            return bytes;
+        };
+        const auto good_bytes=slot_bytes(.5,-1),missing_bytes=slot_bytes(.25,.75);
+        const auto good="sha256:"+sha256_hex(good_bytes),missing="sha256:"+sha256_hex(missing_bytes);
+        const auto write=[&](const std::filesystem::path &path,const std::string &bytes) {
+            std::ofstream output(path,std::ios::binary);output.write(bytes.data(),bytes.size());
+            require(bool(output),"failed to write temporary bundle fixture");
+        };
+        const binary_io::Json manifest={{"bundle_format_version",1},{"bundle_id","worker-read-failure"},
+            {"version",1},{"blobs",binary_io::Json::array({
+                {{"content",good},{"byte_length",16}},{{"content",missing},{"byte_length",16}}})}};
+        const auto manifest_bytes=manifest.dump();
+        write(bundle.path/"manifest.json",manifest_bytes);
+        write(bundle.path/"data"/(good.substr(7)+".bin"),good_bytes);
+        auto plan=rolling;plan.waterline->backend=backend;
+        // One complete group fits exactly within the shared temporary budgets;
+        // a second plaintext cannot overlap the first resident plaintext. The
+        // first consumer therefore produces an owned source before read #2.
+        plan.waterline->device_capacity_bytes={700};
+        plan.waterline->host_budget_bytes=400;
+        plan.waterline->pinned_budget_bytes=50;plan.waterline->raw_budget_bytes=20;
+        plan.plaintext_bundle=PlaintextBundleRef{"worker-read-failure",1,"sha256:"+sha256_hex(manifest_bytes)};
+        for(auto &instruction:plan.execution)
+            if(auto *prepare=std::get_if<PreparePlaintextOp>(&instruction.body))
+                prepare->payload=BundleEncodePayload{prepare->output==3?missing:good};
+        BundleFailurePrepareApi api;
+        auto external=api.observe(0,make_cipher(input,spec.spec.context_id,spec.spec.poly_degree,3,30));
+        SequentialRuntime<BundleFailurePrepareApi> runtime(0,1,1,api,DeviceExecutionMode::PerDeviceWorkers);
+        const LoadedRuntimePlan loaded{plan,"sha256:"+std::string(64,'1')};
+        CaptureRuntimeErrors captured;
+        expect_error([&] {runtime.run(loaded,{spec,bundle.path,false},{{0,external}});},
+                     (missing.substr(7)+".bin").c_str());
+        require(captured.stream.str().find("cannot open file:")!=std::string::npos && api.aborts==1 && api.drains==1,
+                "lazy bundle read failure was not surfaced through abort and cleanup drain");
+        require(api.inner.preparation_attempts==1 && api.inner.host_encodes==1 &&
+                api.inner.stats().compute_calls==1 && api.inner.active_preparations==0 &&
+                api.inner.preparations.empty() &&
+                (backend==PrepareBackend::Cpu?(api.inner.cpu==1 && api.inner.gpu==0):
+                                             (api.inner.gpu==1 && api.inner.cpu==0)),
+                "bundle read failure submitted its consumer, retried, changed backend, or left work live");
+        require(event_index(api.inner,"compute_complete",2)>event_index(api.inner,"prepare",1) &&
+                std::none_of(api.inner.events.begin(),api.inner.events.end(),[](const PrepareApi::Event &event) {
+                    return std::string(event.kind)=="compute_start" && event.value>=4;
+                }),"failed bundle consumer or a later consumer was submitted");
+        require(api.expired(1) && api.expired(2) && api.expired(41) && !api.expired(0),
+                "bundle failure retained owned plaintext/source or destroyed the caller input");
+
+        // Only this explicit second call repairs the real source file. Reusing
+        // this runtime and the unchanged tight budgets checks that failed
+        // admission/dependency credits do not survive into a subsequent run.
+        write(bundle.path/"data"/(missing.substr(7)+".bin"),missing_bytes);
+        api.expect_failed_cleanup=false;
+        auto artifact=runtime.run(loaded,{spec,bundle.path,false},{{0,external}});
+        const auto result=artifact.values.at(42).value->materialize();
+        require(std::abs(result.slots[0]-10.75)<1e-9 && std::abs(result.slots[1]+20.25)<1e-9 &&
+                artifact.timing.bundle_read_calls==20 && artifact.timing.encode_calls==20 &&
+                artifact.timing.fence_calls==0 && api.inner.preparation_attempts==21 &&
+                api.inner.active_preparations==0 && api.inner.preparations.empty() && api.drains==2 &&
+                (backend==PrepareBackend::Cpu?(api.inner.cpu==21 && api.inner.gpu==0):
+                                             (api.inner.gpu==21 && api.inner.cpu==0)),
+                "explicit repaired-bundle run retained failed work/credits or changed its selected backend");
+        const auto log=captured.stream.str();
+        require(log.find("remaining_front=0 remaining_plain=0")!=std::string::npos &&
+                log.find("pinned_peak=50 raw_peak=20")!=std::string::npos,
+                "repaired-bundle run retained device credits or exceeded the shared temporary budgets");
+        require(api.expired(1) && api.expired(2) && api.expired(41) && !api.expired(0),
+                "repaired-bundle run retained intermediate runtime ownership");
+        std::cout<<"PASS real lazy bundle read failure backend="<<int(backend)
+                 <<" before failing consumer, admitted work drained, owned source released, explicit repaired run succeeds\n";
+    }
+}
+
 void test_four_device_progress_and_shared_budgets(const RuntimePlan &rolling,const LoadedOperatorSpec &spec,
                                                  const std::vector<double> &input) {
     auto plan=rolling;
@@ -676,6 +851,7 @@ int main() {
     test_initialization_preflight(parsed, spec, input);
     test_prepare_across_fence_and_unused(parsed, spec, input);
     test_prepare_failure_and_explicit_restart(parsed,spec,input);
+    test_lazy_bundle_failure_and_explicit_repair(parsed,spec,input);
     test_four_device_progress_and_shared_budgets(parsed,spec,input);
     test_allocator_capacity(parsed,spec,input);
     test_fixed_prepare_buffers(parsed,spec,input);
