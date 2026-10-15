@@ -229,6 +229,13 @@ if(CKKS_RUNTIME_BUILD_MPI)
                 COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${ranks}
                     ${MPIEXEC_PREFLAGS} $<TARGET_FILE:mpi_runtime_test>
                     --release ${MPIEXEC_POSTFLAGS})
+            foreach(mode IN ITEMS device-workers device-workers-release)
+                add_test(NAME mpi_runtime_${mode}_${ranks}
+                    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${ranks}
+                        ${MPIEXEC_PREFLAGS} $<TARGET_FILE:mpi_runtime_test>
+                        --${mode} ${MPIEXEC_POSTFLAGS})
+                set_tests_properties(mpi_runtime_${mode}_${ranks} PROPERTIES TIMEOUT 30)
+            endforeach()
         endforeach()
     endif()
 endif()

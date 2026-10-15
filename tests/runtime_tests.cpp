@@ -5,10 +5,12 @@
 #include <filesystem>
 #include <fstream>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <thread>
 
@@ -362,6 +364,99 @@ void test_multi_rank_device_workers() {
             "local Device-to-Host copy did not run on a worker thread");
 }
 
+template <bool Background>
+class ThreadCheckedIssuerApi : public MockVecApi {
+public:
+    static constexpr bool background_communication_issuer = Background;
+    ThreadCheckedIssuerApi(int rank, std::shared_ptr<MockCluster> cluster,
+                           const std::set<TransferId> &remote_transfers)
+        : MockVecApi(rank, std::move(cluster), {VecExecMode::Async, 31, 3}),
+          caller_(std::this_thread::get_id()), remote_transfers_(remote_transfers) {}
+    CommHandle communicate_async(const CommAction &action, const std::vector<Value> &inputs,
+                                 const std::vector<ValueDesc> &descs) {
+        if (remote_transfers_.count(action.id)) {
+            require((std::this_thread::get_id() != caller_) == Background,
+                    "cross-rank post violated the API issuer thread contract");
+            ++remote_posts;
+        }
+        return MockVecApi::communicate_async(action, inputs, descs);
+    }
+    std::vector<std::optional<Value>> wait(CommHandle &handle) {
+        if (!Background && remote_transfers_.count(handle.id))
+            require(std::this_thread::get_id() == caller_,
+                    "non-background cross-rank wait left the caller thread");
+        return MockVecApi::wait(handle);
+    }
+    std::atomic<std::size_t> remote_posts{0};
+private:
+    const std::thread::id caller_;
+    const std::set<TransferId> &remote_transfers_;
+};
+
+template <bool Background>
+std::vector<RunArtifact<VecValue>> run_thread_checked_cluster(
+    const RuntimePlan &plan, const LoadedOperatorSpec &spec,
+    const std::unordered_map<ValueId, VecValue> &rank0_inputs) {
+    std::set<TransferId> remote_transfers;
+    for (const auto *phase : {&plan.execution, &plan.finalization})
+        for (const auto &instruction : *phase)
+            if (const auto *action = std::get_if<CommAction>(&instruction.body))
+                if (std::any_of(action->destinations.begin(), action->destinations.end(),
+                    [&](const Place &place) { return place.rank != action->sources.front().rank; }))
+                    remote_transfers.insert(action->id);
+    MockClusterConfig config;config.world_size = plan.target.world_size;
+    config.delay_seed = 64;config.max_delay_ms = 7;
+    auto cluster = std::make_shared<MockCluster>(config);
+    std::vector<RunArtifact<VecValue>> artifacts(plan.target.world_size);
+    std::vector<std::exception_ptr> errors(plan.target.world_size);
+    std::vector<std::thread> ranks;
+    for (int rank = 0; rank < plan.target.world_size; ++rank)
+        ranks.emplace_back([&, rank] {
+            try {
+                ThreadCheckedIssuerApi<Background> api(rank, cluster, remote_transfers);
+                SequentialRuntime<ThreadCheckedIssuerApi<Background>> runtime(rank,
+                    plan.target.world_size, plan.target.device_counts.at(rank), api,
+                    DeviceExecutionMode::PerDeviceWorkers);
+                artifacts[rank] = runtime.run({plan, "sha256:" + std::string(64, '1')},
+                    {spec, std::nullopt, false}, rank == 0 ? rank0_inputs :
+                    std::unordered_map<ValueId, VecValue>{});
+                require(api.remote_posts == remote_transfers.size(),
+                        "executor skipped a cross-rank group without local tasks");
+            } catch (...) {errors[rank] = std::current_exception();}
+        });
+    for (auto &rank : ranks) rank.join();
+    for (const auto &error : errors) if (error) std::rethrow_exception(error);
+    return artifacts;
+}
+
+void test_issuer_thread_contract_and_empty_worker_queues() {
+    const auto built = make_fanout_plan({1, 1});
+    const auto cipher = make_cipher({1, 2, 3, 4}, "ctx", 8192, 3, 1);
+    const auto plain = make_plain({2, 3, 4, 5}, "ctx", 8192, 3, 1);
+    const std::unordered_map<ValueId, VecValue> inputs{{0, cipher}, {1, plain}};
+    for (const auto &artifacts : {
+            run_thread_checked_cluster<false>(built.plan, built.operator_spec, inputs),
+            run_thread_checked_cluster<true>(built.plan, built.operator_spec, inputs)})
+        compare_values(artifacts.back().values.at(built.plan.final_outputs.front()).value,
+            run_fanout_reference(cipher, plain).at(built.reference_output));
+
+    auto plan = built.plan;
+    const auto upload = std::get<CommAction>(plan.initialization.front().body);
+    const auto source = *std::find_if(plan.values.begin(), plan.values.end(),
+        [&](const ValueDesc &value) {return value.id == upload.outputs.front();});
+    auto output = source;output.id = 99;output.place = {PlaceKind::Device, 1, 0};
+    plan.values = {plan.values.front(), source, output};plan.external_inputs = {0};
+    plan.initialization.resize(1);
+    plan.execution = {{1, CommAction{200, CommKind::Transfer, CommHint::PointToPoint,
+        {source.id}, {output.id}, {source.place}, {output.place}, {ValueKind::Ciphertext}}}};
+    plan.finalization.clear();plan.final_outputs = {output.id};
+    // Both ranks have only a coordinator group in this execution segment.
+    for (const auto &artifacts : {
+            run_thread_checked_cluster<false>(plan, built.operator_spec, {{0, cipher}}),
+            run_thread_checked_cluster<true>(plan, built.operator_spec, {{0, cipher}})})
+        compare_values(artifacts.back().values.at(output.id).value, cipher);
+}
+
 void test_multi_rank_bidirectional_dependency_chain() {
     auto built = make_fanout_plan({1, 1});
     auto &plan = built.plan;
@@ -434,6 +529,11 @@ void test_multi_rank_bidirectional_dependency_chain() {
     compare_values(
         result.artifacts.front().values.at(final).value,
         run_fanout_reference(cipher, plain).at(2));
+    for (const auto &artifacts : {
+            run_thread_checked_cluster<false>(plan, built.operator_spec, {{0, cipher}, {1, plain}}),
+            run_thread_checked_cluster<true>(plan, built.operator_spec, {{0, cipher}, {1, plain}})})
+        compare_values(artifacts.front().values.at(final).value,
+            run_fanout_reference(cipher, plain).at(2));
 
     const auto &forward = std::get<CommAction>(plan.execution.at(1).body);
     for (const auto &stats : result.stats) {
@@ -609,6 +709,8 @@ int main() {
         run_test("preflight and digest debug mode", test_preflight_and_digest_debug_mode);
         run_test("Mock sync/async multi-rank matrix", test_mock_sync_async_matrix);
         run_test("multi-rank per-device workers", test_multi_rank_device_workers);
+        run_test("issuer thread contract and empty worker queues",
+                 test_issuer_thread_contract_and_empty_worker_queues);
         run_test("multi-rank bidirectional dependency chain",
                  test_multi_rank_bidirectional_dependency_chain);
         run_test("single-rank worker Replicate", test_single_rank_device_worker_replicate);

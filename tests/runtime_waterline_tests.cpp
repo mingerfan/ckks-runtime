@@ -514,6 +514,73 @@ void test_prepare_across_fence_and_unused(const RuntimePlan &rolling, const Load
     std::cout << "PASS Prepare crosses explicit Fence and unused Prepare finishes without submission\n";
 }
 
+void test_prepare_final_outputs(const RuntimePlan &rolling, const LoadedOperatorSpec &spec,
+                                const std::vector<double> &input) {
+    auto plan = rolling;
+    const auto plaintext = *std::find_if(plan.values.begin(), plan.values.end(),
+        [](const ValueDesc &value) { return value.id == 1; });
+    plan.initialization.clear();plan.execution.clear();plan.finalization.clear();
+    plan.values.clear();plan.external_inputs.clear();plan.final_outputs.clear();
+    plan.waterline->device_fractions = {.3};
+    // Only one preparation fits the shared budgets at a time, while both
+    // returned plaintexts must remain resident together.
+    plan.waterline->host_budget_bytes = 100;
+    plan.waterline->pinned_budget_bytes = 50;
+    plan.waterline->raw_budget_bytes = 20;
+    for (ValueId id : {1, 3}) {
+        auto output = plaintext;output.id = id;plan.values.push_back(output);
+        plan.execution.push_back({0, PreparePlaintextOp{InlineEncodePayload{{double(id), -1}}, id}});
+        plan.final_outputs.push_back(id);
+    }
+    plan.execution.insert(plan.execution.begin() + 1, {0, FenceOp{}});
+    number_instructions(plan);
+    for (auto backend : {PrepareBackend::Cpu, PrepareBackend::Gpu, PrepareBackend::Auto}) {
+        plan.waterline->backend = backend;
+        PrepareApi api(std::make_shared<MockCluster>(MockClusterConfig{}));
+        SequentialRuntime<PrepareApi> runtime(0, 1, 1, api, DeviceExecutionMode::PerDeviceWorkers);
+        auto artifact = runtime.run({plan, "sha256:" + std::string(64, '1')},
+            {spec, std::nullopt, false}, {});
+        require(artifact.values.size() == 2 && api.preparation_attempts == 2 &&
+                api.peak_preparations == 1 && artifact.timing.fence_calls == 1,
+                "returned-only Prepare values bypassed admission or repeated preparation");
+        for (auto id : plan.final_outputs) {
+            const auto result = artifact.values.at(id).value.materialize();
+            require(result.slots[0] == double(id) && result.slots[1] == -1,
+                    "returned-only Prepare result was not materialized");
+        }
+    }
+    // A returned value which already has a compute consumer is prepared once.
+    auto consumed = rolling;consumed.execution.resize(2);consumed.finalization.clear();
+    consumed.final_outputs = {1, 2};
+    consumed.values.erase(std::remove_if(consumed.values.begin(), consumed.values.end(),
+        [](const ValueDesc &v) {return v.id != 0 && v.id != 41 && v.id != 1 && v.id != 2;}),
+        consumed.values.end());
+    number_instructions(consumed);
+    PrepareApi consumed_api(std::make_shared<MockCluster>(MockClusterConfig{}));
+    SequentialRuntime<PrepareApi> consumed_runtime(0, 1, 1, consumed_api, DeviceExecutionMode::PerDeviceWorkers);
+    auto consumed_artifact = consumed_runtime.run({consumed, "sha256:" + std::string(64, '1')},
+        {spec, std::nullopt, false},
+        {{0, make_cipher(input, spec.spec.context_id, spec.spec.poly_degree, 3, 30)}});
+    require(consumed_api.preparation_attempts == 1 && consumed_artifact.values.size() == 2,
+            "final-output demand prepared a consumed plaintext twice");
+
+    // The terminal demand must participate in preflight with its full peak,
+    // even though its resident plaintext alone fits the device waterline.
+    plan.values.resize(1);plan.final_outputs.resize(1);plan.execution.resize(1);
+    for (auto backend : {PrepareBackend::Cpu, PrepareBackend::Gpu}) {
+        plan.waterline->backend = backend;
+        plan.waterline->host_budget_bytes = backend == PrepareBackend::Cpu ? 99 : 100;
+        plan.waterline->device_fractions = {backend == PrepareBackend::Gpu ? .12 : .3};
+        PrepareApi api(std::make_shared<MockCluster>(MockClusterConfig{}));
+        SequentialRuntime<PrepareApi> runtime(0, 1, 1, api, DeviceExecutionMode::PerDeviceWorkers);
+        expect_error([&] { runtime.run({plan, "sha256:" + std::string(64, '1')},
+            {spec, std::nullopt, false}, {}); }, "single-group baseline infeasible");
+        require(api.preparation_attempts == 0 && api.host_encodes == 0,
+                "infeasible returned Prepare submitted work before preflight rejection");
+    }
+    std::cout << "PASS returned Prepare demands share admission, survive Fence, and preflight full peaks\n";
+}
+
 void test_prepare_failure_and_explicit_restart(const RuntimePlan &rolling,const LoadedOperatorSpec &spec,
                                                const std::vector<double> &input) {
     for(const auto backend:{PrepareBackend::Cpu,PrepareBackend::Gpu}) {
@@ -850,6 +917,7 @@ int main() {
     test_json_and_negative_config(parsed, spec);
     test_initialization_preflight(parsed, spec, input);
     test_prepare_across_fence_and_unused(parsed, spec, input);
+    test_prepare_final_outputs(parsed, spec, input);
     test_prepare_failure_and_explicit_restart(parsed,spec,input);
     test_lazy_bundle_failure_and_explicit_repair(parsed,spec,input);
     test_four_device_progress_and_shared_budgets(parsed,spec,input);

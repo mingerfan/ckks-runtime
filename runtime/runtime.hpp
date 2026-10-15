@@ -394,6 +394,7 @@ private:
         std::vector<ValueId> inputs, outputs;
         bool preparation = false;
         PrepareBackend backend = PrepareBackend::Cpu;
+        bool final_output = false;
     };
 
     const ValueDesc &desc(ValueId id) const {
@@ -1298,6 +1299,20 @@ private:
         if(waterline_)for(const auto *phase:phases)for(const auto &instruction:*phase)
             if(const auto *op=std::get_if<PreparePlaintextOp>(&instruction.body))
                 preparation_instructions.emplace(op->output,&instruction);
+        // Returning a lazy plaintext is also a demand. Give each returned
+        // Prepare its own terminal group, after the plan's instructions, so
+        // both preflight and admission include its complete preparation peak.
+        std::vector<std::pair<ValueId, Instruction>> final_output_demands;
+        std::size_t terminal_ordinal = plan_->initialization.size() +
+            plan_->execution.size() + plan_->finalization.size();
+        for (auto id : plan_->final_outputs)
+            if (preparation_instructions.count(id))
+                final_output_demands.emplace_back(id, Instruction{terminal_ordinal++, FenceOp{}});
+        const auto add_final_output_demands = [&](std::vector<std::vector<ParallelTask>> &tasks) {
+            for (const auto &[id, instruction] : final_output_demands)
+                tasks.back().push_back(ParallelTask{[] {}, &instruction, {id}, {},
+                    false, PrepareBackend::Cpu, true});
+        };
         if (waterline_) {
             // Metadata only: validate the entire graph before any initialization
             // Encode, transfer or consumer is submitted.
@@ -1317,6 +1332,7 @@ private:
                             if(op->destinations[slot].rank==rank_)baseline.back().push_back(ParallelTask{{},&instruction,op->inputs,{op->outputs[slot]}});
                 }
             }
+            add_final_output_demands(baseline);
             run_parallel_tasks(baseline,true);
         }
         for (const auto *phase : phases) {
@@ -1326,6 +1342,8 @@ private:
                 if (end != phase->size() && !std::holds_alternative<FenceOp>((*phase)[end].body)) continue;
                 std::vector<std::vector<ParallelTask>> tasks(worker_count + 1);
                 compile_parallel_phase(*phase, tasks, begin, end);
+                if (phase == &plan_->finalization && end == phase->size())
+                    add_final_output_demands(tasks);
                 if(waterline_) {
                     std::set<ValueId> needed;
                     for(const auto &queue:tasks)for(const auto &task:queue)for(auto id:task.inputs)
@@ -1403,7 +1421,9 @@ private:
             auto resident=waterline_storage_; auto remaining=waterline_remaining_;auto released=waterline_released_;
             std::unordered_map<ValueId,bool> seen;
             for(const auto &[ordinal,indices]:groups) {
-                ResourceUsage delta(devices), transient=workspace(*tasks[indices.front()].task.instruction);
+                const auto &first = tasks[indices.front()].task;
+                ResourceUsage delta(devices), transient = first.final_output
+                    ? ResourceUsage(devices) : workspace(*first.instruction);
                 delta+=transient;
                 for(auto i:indices) {
                     for(ValueId id:tasks[i].task.inputs) if(preparations.count(id) && !seen[id]) {
@@ -1421,7 +1441,7 @@ private:
                 for(auto i:indices) {
                     const auto &task=tasks[i].task;
                     if(const auto *op=std::get_if<ReleaseOp>(&task.instruction->body)) released[op->value]=true;
-                    else {
+                    else if (!task.final_output) {
                         for(auto id:task.inputs) {if(!remaining.at(id))throw std::logic_error("Waterline baseline use underflow");--remaining.at(id);}
                         if(const auto *op=std::get_if<ComputeOp>(&task.instruction->body);op && op->reuse_input)released[op->inputs.front()]=true;
                     }
@@ -1490,17 +1510,21 @@ private:
                 }
             } catch(...) {record_parallel_failure(std::current_exception());worker.submitted.store(true);}
         });
-        // Cross-rank communication retains its existing issuer semantics. V4 Waterline is single-rank.
+        // Only APIs that opt into a background issuer may communicate off the
+        // caller thread. MPI_THREAD_FUNNELED backends advance below, after
+        // dispatching the local producers they need. V4 Waterline is single-rank.
         std::thread issuer;
-        if(!coordinator_groups_.empty()) issuer=std::thread([this] {
-            try {for(const auto &group:coordinator_groups_) {if(parallel_failed_.load())return;
-                execute_parallel_communication(group->action,group->instruction_ordinal,group);
-                if constexpr (!detail::UsesBackgroundCommunicationIssuer<Api>::value) finish_parallel_group(group,std::nullopt);}}
-            catch(...) {record_parallel_failure(std::current_exception());}
-        });
+        if constexpr (detail::UsesBackgroundCommunicationIssuer<Api>::value) {
+            if(!coordinator_groups_.empty()) issuer=std::thread([this] {
+                try {for(const auto &group:coordinator_groups_) {if(parallel_failed_.load())return;
+                    execute_parallel_communication(group->action,group->instruction_ordinal,group);}}
+                catch(...) {record_parallel_failure(std::current_exception());}
+            });
+        }
+        std::size_t next_coordinator_group = 0;
         auto next=groups.begin();std::size_t finished=0,active_groups=0;
-        const auto ready=[&](const ParallelTask &task) {
-            for(auto id:task.inputs) {auto value=parallel_value(id);std::lock_guard<std::mutex> lock(value->mutex);if(!value->defined)return false;}
+        const auto ready=[&](const std::vector<ValueId> &inputs) {
+            for(auto id:inputs) {auto value=parallel_value(id);std::lock_guard<std::mutex> lock(value->mutex);if(!value->defined)return false;}
             return true;
         };
         const auto retire=[&](const std::vector<ValueId> &ids) {
@@ -1512,7 +1536,9 @@ private:
             }
         };
         try {
-            while(finished<tasks.size()) {
+            while(finished<tasks.size() ||
+                  (!detail::UsesBackgroundCommunicationIssuer<Api>::value &&
+                   next_coordinator_group<coordinator_groups_.size())) {
                 if(parallel_failed_.load())std::rethrow_exception(parallel_failure_);
                 bool progress=false;
                 api_.collect_completed();
@@ -1530,7 +1556,7 @@ private:
                             auto &ticket=tickets.at(task.instruction->ordinal);
                             if(--ticket.remaining==0) {waterline_->release(ticket.temporary);--active_groups;tickets.erase(task.instruction->ordinal);}
                             if(const auto *op=std::get_if<ReleaseOp>(&task.instruction->body))waterline_released_[op->value]=true;
-                            else {
+                            else if (!task.final_output) {
                                 for(auto id:task.inputs) {if(!waterline_remaining_.at(id))throw std::logic_error("Waterline completed use underflow");--waterline_remaining_.at(id);}
                                 if(const auto *op=std::get_if<ComputeOp>(&task.instruction->body);op && op->reuse_input)waterline_released_[op->inputs.front()]=true;
                             }
@@ -1546,7 +1572,9 @@ private:
                     std::vector<std::pair<std::size_t,PrepareResources>> needed;
                     bool preparation_queue_full=false;
                     if(waterline_) {
-                        temp=workspace(*tasks[indices.front()].task.instruction);delta+=temp;
+                        const auto &first = tasks[indices.front()].task;
+                        if (!first.final_output) temp=workspace(*first.instruction);
+                        delta+=temp;
                         for(auto i:indices) {
                             for(auto id:tasks[i].task.inputs) if(preparations.count(id) && !tasks[preparations.at(id)].admitted) {
                                 const auto pi=preparations.at(id);
@@ -1610,14 +1638,14 @@ private:
                     std::optional<std::size_t> selected;
                     if(!pending[w].empty()) {
                         const auto i=pending[w].front();const auto &state=tasks[i];
-                        if(state.admitted && ready(state.task)) {
+                        if(state.admitted && ready(state.task.inputs)) {
                             bool allowed=true;
                             if(state.task.preparation && state.task.backend==PrepareBackend::Gpu) {
                                 const auto d=static_cast<std::size_t>(desc(state.task.outputs.front()).place.index)%device_workers;
                                 allowed=!workers[d]->busy;
                                 if(!pending[d].empty()) {
                                     const auto &front=tasks[pending[d].front()];
-                                    if(front.admitted && ready(front.task))allowed=false;
+                                    if(front.admitted && ready(front.task.inputs))allowed=false;
                                 }
                             }
                             if(allowed) {selected=i;pending[w].pop_front();}
@@ -1632,9 +1660,20 @@ private:
                         worker.condition.notify_all();progress=true;
                     }
                 }
+                if constexpr (!detail::UsesBackgroundCommunicationIssuer<Api>::value) {
+                    if (next_coordinator_group < coordinator_groups_.size()) {
+                        const auto &group = coordinator_groups_[next_coordinator_group];
+                        if (ready(group->local_input_ids)) {
+                            execute_parallel_communication(group->action, group->instruction_ordinal, group);
+                            finish_parallel_group(group, std::nullopt);
+                            ++next_coordinator_group;
+                            progress = true;
+                        }
+                    }
+                }
                 if(!progress) {
                     bool in_flight=false;for(const auto &w:workers)in_flight|=w->busy;
-                    if(!in_flight && coordinator_groups_.empty()) {
+                    if(!in_flight && (!detail::UsesBackgroundCommunicationIssuer<Api>::value || coordinator_groups_.empty())) {
                         if(next!=groups.end())throw std::runtime_error("Waterline cannot advance at instruction #"+std::to_string(next->first)+ (waterline_?waterline_->describe(ResourceUsage(devices)):""));
                         throw std::runtime_error("executor has no runnable producer: dependency/order invariant violated");
                     }
@@ -1642,6 +1681,7 @@ private:
                 }
             }
             stop_workers();if(issuer.joinable())issuer.join();
+            if (parallel_failed_.load()) std::rethrow_exception(parallel_failure_);
         } catch(...) {
             record_parallel_failure(std::current_exception());stop_workers();if(issuer.joinable())issuer.join();throw;
         }

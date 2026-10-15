@@ -31,7 +31,12 @@ int main(int argc, char **argv) {
     const bool inject_digest_mismatch = argc == 2 && std::strcmp(argv[1], "--digest-mismatch") == 0;
     const bool inject_skip_mismatch = argc == 2 && std::strcmp(argv[1], "--skip-mismatch") == 0;
     auto built = make_fanout_plan(std::vector<int>(static_cast<std::size_t>(world), 1));
-    const bool release = argc == 2 && std::strcmp(argv[1], "--release") == 0;
+    const bool device_workers = argc == 2 &&
+        (std::strcmp(argv[1], "--device-workers") == 0 ||
+         std::strcmp(argv[1], "--device-workers-release") == 0);
+    const bool release = argc == 2 &&
+        (std::strcmp(argv[1], "--release") == 0 ||
+         std::strcmp(argv[1], "--device-workers-release") == 0);
     if (release) built.plan = with_releases(std::move(built.plan));
     if (inject_large_transfer_id)
         std::get<CommAction>(built.plan.initialization.at(1).body).id = std::numeric_limits<TransferId>::max();
@@ -41,7 +46,9 @@ int main(int argc, char **argv) {
     const auto reference = run_fanout_reference(cipher, plain);
 
     MpiVecApi api;
-    SequentialRuntime<MpiVecApi> runtime(rank, world, 1, api);
+    SequentialRuntime<MpiVecApi> runtime(rank, world, 1, api,
+        device_workers ? DeviceExecutionMode::PerDeviceWorkers
+                       : DeviceExecutionMode::Sequential);
     std::unordered_map<ValueId, VecValue> inputs;
     if (rank == 0) {
         inputs.emplace(0, inject_error ? make_plain({1, 2, 3, 4}, "ctx", 8192, 3, 1) : cipher.deep_copy());
@@ -68,7 +75,8 @@ int main(int argc, char **argv) {
     }
     int global_ok = 0;
     MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-    if (rank == 0) std::printf("MPI runtime end-to-end (%d ranks, Release=%d): %s\n", world, release, global_ok ? "PASS" : "FAIL");
+    if (rank == 0) std::printf("MPI runtime end-to-end (%d ranks, Release=%d, DeviceWorkers=%d): %s\n",
+                             world, release, device_workers, global_ok ? "PASS" : "FAIL");
     MPI_Finalize();
     return global_ok ? 0 : 1;
 }
