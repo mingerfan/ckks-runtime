@@ -1,209 +1,83 @@
 # Dacapo 集成
 
-这里放 Runtime 与 `third_party/dacapo` 的集成脚本和后续端到端测试。
+这里维护 Runtime 与可选 `third_party/dacapo` 编译器的构建和使用说明。执行协议见 [RuntimePlan](../../docs/runtime-plan/README.md)、[OperatorSpec](../../docs/operator-spec/README.md) 和 [bundle](../../docs/runtime-plan/plaintext-bundle.md)。开发计划和历史测试过程由 Git 历史保存。
 
-## Waterline 明文准备
+以下 Python、Runtime 构建和差分命令从 CKKS Runtime 仓库根目录执行。
 
-V4 Waterline 通过 `hecate-opt` 的 `--runtime-plan-plaintext-schedule=waterline` 和显式 GPU/Host/pinned/raw 正预算开启；同时配置 `--runtime-plan-reserve-bytes`、`--runtime-plan-waterline-fraction`、`--runtime-plan-prepare-backend=cpu|gpu|auto` 与 `--runtime-plan-lookahead-groups`。当前通用模型生成脚本没有这些预算选项。完整字段及约束见 [V4 规范](../../docs/runtime-plan/v4.md)。Pass 顺序是保持不变的 HEFT placement、communication、Waterline Prepare、Release/reuse；Prepare 后不再运行 Encode CSE。不会按批克隆权重或插自动 Fence，普通 Encode/Transfer 和显式 Fence 仍可执行。
-
-`.memory.json` 按顺序完成估算 RNS 对象，Host 系数按 8 字节、GPU 按 4 字节；`.waterline.json` 检查完整依赖单组基线，包含配置的消费者工作区上界。`--runtime-plan-workspace-bytes-per-op=0` 只做对象检查，不能保证算子实际空间。Runtime 再查询后端持久资源、准备峰值和 allocator capacity，在同一账本中检查单组及滚动准入。密钥、参数表、retained workspace、pool 外开销与余量必须被 reserve 覆盖；对象报告不能替代这些检查或整个进程的显存测量。
-
-当前已有 profile 迁移脚本：
+## 编译器与 profile
 
 ```bash
 git submodule update --init third_party/dacapo
 python3 integrations/dacapo/migrate_profiles.py --check
 ```
 
-脚本从 provenance 固定的 Dacapo revision 读取三份旧 profile，再转成 `docs/operator-spec/v2/profiles/` 下的版本化 OperatorSpec。当前 submodule 可以继续前进，不会改变这批已迁移 profile 的来源或输出。
+迁移脚本从 provenance 固定的 revision 读取三份旧 profile，并检查 `docs/operator-spec/v2/profiles/` 中的数据。submodule 可以继续前进；迁移数据仍来自其记录的 revision。`imported` 只表示复现旧编译模型，不表示 Poseidon 实测配置。
 
-Dialect 和 RuntimePlan 管线可以独立构建、测试：
-
-```bash
-cd third_party/dacapo
-nix develop --command cmake --preset nix
-nix develop --command cmake --build --preset nix
-nix develop --command ctest --test-dir build/nix --output-on-failure
-```
-
-`emit-runtime-plan` 默认输出 RuntimePlan V1；开启内存规划后输出 V2，文件名是 `<prefix>.<func>.runtime-plan.json`。Dacapo 的 CKKS MLIR 使用纯 SSA result-style，不再生成 `dst` 和 `tensor.empty`。target、OperatorSpec 引用和 context 必须通过 Pass option 明确提供。Encode payload 默认以 4096 字节为界：不超过阈值的常量内联到 JSON，超过阈值的 float64 常量写入 `<prefix>.<func>.bundle/`；相同内容按 SHA-256 复用同一个 blob。
-
-当 OperatorSpec 声明 `rescale_mode=lazy` 时，生成脚本会在 Earth→CKKS 之后、placement 之前自动加入 `materialize-ckks-physical-levels`。默认一个逻辑 level 展开为 4 个物理 RNS level，可用 `--lazy-rescale-level-factor` 显式调整。Pass 使用目标 spec 的 `levels.upper_bound` 作为物理起始 level，并检查每条 Rescale 的 scale 降幅是否等于被丢弃模数的 bit 数之和；因此 Poseidon GPU 的 Dacapo compiler profile 必须把 `rescalingFactor` 设为 120，目标 OperatorSpec 必须记录真实的 30-bit 模数链并允许一次 Rescale 至少下降 4 层。只改 JSON writer 或只把 profile 标成 lazy 都不够。
-
-不传 `--device-counts` 时生成原来的单 Host 计划。传入后，编译器用 OperatorSpec V2 的逐 level 延迟做确定性 HEFT placement，再为跨 Place 操作数插入 1 对 1 的 `point_to_point` Transfer。`8` 表示 1 rank × 8 devices，`8x8` 表示 2 ranks × 8 devices，`0x0` 表示 2 个只有 Host 的 CPU rank。零和正数不能混用。
-
-placement 可通过 `--communication-profile` 使用按 CKKS value 大小估算的通信代价。每类链路配置启动延迟、速率上限和曲线饱和尺寸，也可以提供 `payload_bytes`/`rate_bytes_per_us` 点位表做线性插值。完整格式和公式见 [Placement 通信 Profile](communication-profile.md)。不传该选项时保留原来的两个固定整数，只用于兼容已有命令和测试。
-
-Profile V2 还可以通过 `topology.rank_to_node` 描述 MPI rank 所在的逻辑节点，
-并用有序 `rules` 对具体 `(rank, device)` 对或 rank/node 通配范围进行覆盖。
-规则从前到后采用 first-match；没有命中时回退到 V2 中的旧 `links` 模型。这样
-可以在保持旧 profile 兼容的同时，单独描述某一条 GPU 对或某一组 rank 的速率。
-
-GPU MLP 的 8192 实机校准 profile 可用下面的 preset 生成。它保留
-`synthetic` 默认 preset，不覆盖现有 32768/65536 产物：
+Dacapo 单独构建，下面的括号使后续命令仍从 Runtime 根目录执行：
 
 ```bash
-python3 integrations/dacapo/generate_mlp_gpu_e2e_profiles.py \
-  --poly-degree 8192 \
-  --profile-preset poseidon-8192 \
-  --output-dir third_party/dacapo/review_artifacts/mlp/8192/profiles
+(
+  cd third_party/dacapo
+  nix develop --command cmake --preset nix
+  nix develop --command cmake --build --preset nix --parallel 2
+  nix develop --command ctest --test-dir build/nix --output-on-failure
+)
 ```
 
-`poseidon-8192` 的最高物理 level 来自 RTX 4060 Laptop GPU 上的 Release
-实测：degree=8192、Q=17、P=2，每轮 20 次预热和 100 次计时，取三轮 GPU
-wall time 中位数后按 OperatorSpec 的整数微秒精度取整。L1-L16 仍按温和曲线
-估计，最低 level 约为最高 level 的 80%，不代表逐 level 实测。ModSwitch
-当前没有独立 benchmark，暂用实测的 HYBRID BConv/ModUp 作为代理。
+Python 模型 tracing 需要 Dacapo 的 `requirements.txt`；C++ 编译器与 Runtime 核心库不依赖 PyTorch。
 
-同一台 GPU 上的 8192 单卡 MLP 校准使用最终 1×1 RuntimePlan，包含 375 次
-Compute、122 次 Host→Device plaintext Transfer 和 111 个 rotation key。该 cost
-profile 下 Dacapo 选择了 0-Boot 图，因此运行时需显式设置
-`POSEIDON_GPU_MLP_ALLOW_NO_BOOT=1`；默认 E2E 行为仍要求至少一次 Host Boot。
-三轮均通过 Python/Mock 数值校验：
+## 默认产物与语义版本
 
-Runtime 现在把时间拆成 setup、initialization 和 online execution。initialization
-包含 Encode 以及 122 次 plaintext upload，并在边界同步完成；online execution
-包含 execution、finalization、通信完成和最终输出同步。外层 Runtime wall 仍保留为
-完整冷启动墙钟时间。使用 `sm_89` Release 构建重新运行三轮：
+`generate_model_artifacts.py` 和 `emit-runtime-plan` 默认导出 `.runtime-plan.bin`，大常量写到 `.bundle/manifest.bin` 与 `.bundle/data.bin`。JSON 模式使用 `.runtime-plan.json` 和 `manifest.json`，仍默认 pack。格式与兼容规则见[二进制规范](../../docs/runtime-plan/binary.md)。
 
-| run | Runtime wall (ms) | Setup (ms) | Initialization (ms) | Online (ms) | Compute (ms) |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 504.762 | 31.118 | 115.044 | 358.593 | 350.667 |
-| 2 | 425.653 | 4.885 | 101.751 | 319.012 | 312.238 |
-| 3 | 406.849 | 4.932 | 112.317 | 289.595 | 283.658 |
-| 中位数 | 425.653 | 4.932 | 112.317 | 319.012 | 312.238 |
+| 规划模式 | RuntimePlan 语义版本 |
+| --- | --- |
+| 普通 eager 计划 | V1 |
+| Release / reuse 内存规划 | V2 |
+| execution Encode 或显式 Fence | V3 |
+| Waterline Device Prepare 与预算配置 | V4 |
 
-最终 placement MLIR 的最大 `dist.schedule_finish` 是 61,688 us。正确的比较对象是
-319.012 ms 的 online 中位数，实测约为静态跨度的 5.17 倍，而不是原先用完整
-Runtime wall 得到的 6.87 倍。生成阶段打印的 `Estimated Latency: 0.143722 sec`
-是 Earth 优化阶段的旧 latency 汇总，不是最终 placement 跨度。
+Encode 的 inline 阈值默认 4096 字节，超过阈值的 float64 payload 按 content 去重写入 bundle；`--inline-payload-max-bytes=0` 外化所有非空 payload。不同文件表示使用独立输出 prefix。
 
-剔除 plaintext upload 后差距仍然较大，且 online 与 Compute 只差约 6.8 ms。
-因此主要误差在逐 Compute 路径：算子微基准复用预分配输出，而 Runtime 为每个
-SSA value 分配 GPU storage、记录 completion event。不能再把初始化上传解释为全部
-差距，也不能用统一缩放因子回填单算子 profile；后续应分别建模 allocation/event
-和 Host→Device 传输。
-
-## 32768 CPU 与 2-rank MPI 复测
-
-CPU 计划使用 degree 32768、14 个 60-bit Q limb 和 398 次 Compute。单 rank
-计划有 122 次初始化 Encode，没有 Transfer；2-rank 计划有 62 次初始化期 Transfer
-和 223 次执行期 Transfer。两者使用同一个 `sm_89` Release+MPI 构建顺序运行三轮，
-均通过 Python/Mock 数值校验：
-
-| 拓扑 | run | Runtime wall (ms) | Setup (ms) | Initialization (ms) | Online (ms) | Critical compute (ms) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 rank | 1 | 3101.351 | 18.636 | 215.540 | 2867.173 | 2865.750 |
-| 1 rank | 2 | 3102.800 | 5.873 | 216.722 | 2880.202 | 2878.861 |
-| 1 rank | 3 | 3152.117 | 5.800 | 218.978 | 2927.337 | 2925.870 |
-| 2 ranks | 1 | 3238.153 | 17.403 | 248.764 | 2972.418 | 1570.701 |
-| 2 ranks | 2 | 3085.930 | 6.137 | 236.462 | 2843.467 | 1553.760 |
-| 2 ranks | 3 | 3084.814 | 6.008 | 241.424 | 2837.570 | 1547.781 |
-
-单 CPU placement profile 的 398 个算子成本串行求和是 2,234,355 us；2-rank
-placement MLIR 的最大 `dist.schedule_finish` 是 1,728,637 us。与 online 中位数
-比较如下：
-
-| 拓扑 | 模拟 (ms) | 实测 online (ms) | 实测 / 模拟 |
-| --- | ---: | ---: | ---: |
-| 1 rank | 2234.355 | 2880.202 | 1.289x |
-| 2 ranks | 1728.637 | 2843.467 | 1.645x |
-
-模拟预计 1.293x 加速，实测只有 1.013x。2-rank 中位数的 online 比 critical
-compute 多 1,289.707 ms，这部分主要是通信和依赖等待。当前 CPU MPI placement
-仍为每条跨 rank 依赖使用固定 10,000 us，不按 ciphertext 的 level、component
-和传输字节数计算，也不建模 MPI 阻塞、链路争用或大量小传输的串行化。
-
-计算 profile 本身也不是统一倍率误差：静态调度分给 rank 0/1 的算子成本分别是
-1,407.383/826.972 ms，而中位数实测为 1,553.760/1,419.564 ms；模拟 Boot 是
-500 ms，实测约 29 ms。应补测 Poseidon CPU 的逐 level 算子曲线，并为 CPU MPI
-增加 payload-aware 通信 profile，不能用一次 MLP wall time 整体缩放当前 profile。
-
-GPU MLP 的 65536 degree 估算 profile 可用下面的 preset 生成：
-
-```bash
-python3 integrations/dacapo/generate_mlp_gpu_e2e_profiles.py \
-  --poly-degree 65536 \
-  --profile-preset poseidon-65536 \
-  --output-dir third_party/dacapo/review_artifacts/mlp/65536/profiles
-```
-
-`poseidon-65536` 使用 GPU 表格中 L40 的算子 wall time 作为最高物理 level；
-表格的 L1-L40 对应 Runtime 的 level 0-39（即 `level + 1` 个 RNS limb）。
-L1-L39 按温和曲线填充，最低 level 约为最高 level 的 80%，用于 placement
-估算而不是宣称已逐 level 实测。`multiply_relinearize_rescale` 的 500 us
-拆成 `mul_cc=20 us`、`relinearize=370 us`、`rescale=110 us`；表格没有直接
-给出 ModSwitch，因此暂以 `keyswitch_bconv_modup=40 us` 作为代理。
-
-通信 profile 采用 count=32 带宽表中的 `object_loop_a2e` 点位，payload 按
-MiB 转换为 bytes，`contiguous_buffer` 的 395.7 GB/s 作为速率上限。该 profile
-仍是多 GPU placement 的粗粒度估算：点位来自批量 count=32 测试，当前调度器
-尚未建模具体 transfer batch、链路争用和异步重叠。
-
-## 生成模型审阅产物
-
-`generate_model_artifacts.py` 从选定的 OperatorSpec V1 或 V2 读取 target、spec id/version、context 和 Boot 配置，并根据 OperatorSpec 文件的完整原始字节计算 RuntimePlan 使用的 SHA-256。V2 默认校验 `provenance` 指向的旧 Dacapo profile；没有这份 provenance 时必须显式传入 `--compiler-profile`。多个 Boot profile 必须用 `--boot-profile` 选定一个。placement 仍只接受 V2。
-
-生成 MLP：
+## 生成模型
 
 ```bash
 python3 integrations/dacapo/generate_model_artifacts.py mlp \
   --operator-spec docs/operator-spec/v2/profiles/dacapo-heaan-cpu.v1.json
-```
 
-生成 ResNet-20：
-
-```bash
 python3 integrations/dacapo/generate_model_artifacts.py resnet20 \
   --operator-spec docs/operator-spec/v2/profiles/dacapo-heaan-gpu.v1.json
 ```
 
-默认输出到 `third_party/dacapo/review_artifacts/<model>/`，该目录不会进入 Git。大常量同时生成 `.bundle/manifest.json` 和 `.bundle/data/*.bin`。可以用 `--inline-payload-max-bytes` 调整阈值；设为 `0` 会外化所有非空 float64 Encode payload。Python tracing 需要安装 `requirements.txt` 中的模型依赖；Dacapo C++ 编译器仍可独立离线构建，不把 PyTorch 加入默认构建依赖。
+默认输出到 `third_party/dacapo/review_artifacts/<model>/`。用 `--traced-mlir /path/to/model.mlir` 跳过 tracing；`--dry-run` 校验配置并打印编译命令，不运行编译器。
 
-如果已经有 Earth MLIR，可以跳过 Python tracing：
+脚本从 OperatorSpec V1/V2 读取 target、context、id/version、Boot 配置，并对原始文件字节计算摘要。V2 默认校验 provenance 对应的旧 profile；没有该来源时显式传入 `--compiler-profile`。多个 Boot profile 用 `--boot-profile` 选定。placement 要求 OperatorSpec V2。
 
-```bash
-python3 integrations/dacapo/generate_model_artifacts.py mlp \
-  --operator-spec docs/operator-spec/v2/profiles/dacapo-heaan-cpu.v1.json \
-  --traced-mlir /path/to/MLP.mlir
-```
+`--boot-placement=optimized|greedy|depth-dp` 选择 Boot 规划算法，默认 optimized。lazy spec 自动在 Earth→CKKS 后、placement 前加入物理 level 换算；默认倍率 4，可用 `--lazy-rescale-level-factor` 修改。倍率必须与逻辑 scale 降幅和真实模数链匹配。
 
-使用 `--dry-run` 可以只检查 OperatorSpec、旧 profile 摘要并打印完整的 `hecate-opt` 命令，不执行编译。
+`--device-counts=8` 表示一 rank 八卡，`8x8` 表示两 rank 各八卡，`0x0` 表示两个 Host-only CPU rank；零与正数不能混用。不传该参数时生成单 Host 计划。`--communication-profile` 选择[通信代价模型](communication-profile.md)，包括 V2 拓扑与设备对规则。
 
-## 生成并检查多 rank MLP
+## 生成并差分检查 MLP
 
-先保留一份 Host 参考计划，再把两个拓扑输出到不同目录：
+为了便于审阅，下面显式生成 JSON；计划不启用 Release/reuse，以便捕获所有历史值。traced MLIR 来自上面的 MLP 生成步骤。
 
 ```bash
 python3 integrations/dacapo/generate_model_artifacts.py mlp \
   --operator-spec docs/operator-spec/v2/profiles/dacapo-heaan-cpu.v1.json \
   --traced-mlir third_party/dacapo/review_artifacts/mlp/mlp.traced.earth.mlir \
+  --plan-format=json \
   --output-dir third_party/dacapo/review_artifacts/mlp/host
 
 python3 integrations/dacapo/generate_model_artifacts.py mlp \
   --operator-spec docs/operator-spec/v2/profiles/dacapo-heaan-cpu.v1.json \
   --traced-mlir third_party/dacapo/review_artifacts/mlp/mlp.traced.earth.mlir \
-  --device-counts 8 \
-  --communication-profile /path/to/communication-profile.json \
-  --output-dir third_party/dacapo/review_artifacts/mlp/1x8
-
-python3 integrations/dacapo/generate_model_artifacts.py mlp \
-  --operator-spec docs/operator-spec/v2/profiles/dacapo-heaan-cpu.v1.json \
-  --traced-mlir third_party/dacapo/review_artifacts/mlp/mlp.traced.earth.mlir \
-  --device-counts 8x8 \
+  --device-counts=8x8 \
+  --plan-format=json \
   --output-dir third_party/dacapo/review_artifacts/mlp/2x8
-```
 
-构建通用 VecApi 差分程序：
-
-```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target dacapo_plan_vec_diff --parallel 2
-```
 
-程序依次接收 Host 计划、分布式计划、OperatorSpec、两份 bundle 目录和报告路径。它先检查原 CKKS ValueId/算子/操作数与 Transfer 谱系，再用 `DiffMode::AllValuesAfterRun` 执行两份计划，比较每条 Encode、Compute、Transfer，最后单独再比较 final output。没有 bundle 时对应参数写 `-`。
-
-```bash
 build/dacapo_plan_vec_diff \
   third_party/dacapo/review_artifacts/mlp/host/mlp.optimized._hecate_MLP.runtime-plan.json \
   third_party/dacapo/review_artifacts/mlp/2x8/mlp.optimized._hecate_MLP.runtime-plan.json \
@@ -213,35 +87,20 @@ build/dacapo_plan_vec_diff \
   third_party/dacapo/review_artifacts/mlp/2x8/vec.diff.txt
 ```
 
+差分工具也接受 `.bin`，但文件名必须与所选生成格式一致。它比较原 CKKS 指令与 Transfer 谱系，再用 Mock 的 `AllValuesAfterRun` 比较每条 Encode/Compute/Transfer 和 final output；没有 bundle 时对应参数传 `-`。它验证明文语义，不代替真实后端验收。
 
-### 自动释放、原位计算和内存报告
+## 内存规划与 Waterline
 
-在模型生成命令中加入 `--runtime-plan-memory --runtime-plan-memory-report`，
-编译器会在设备分配和通信插入之后规划内存，再估算并导出。生成的 V2 计划
-包含 `Release` 和安全的 `reuse_input=0`。GPU 支持 AddCP、Rotate；CPU 支持
-Negate、Rotate。只有同处、类型相同、仅一次使用且非最终输出的内部计算结果
-可以被覆盖。GPU SubCP 通过手写计划调用，不新增 MLIR 数学算子。
+模型生成脚本的 `--runtime-plan-memory --runtime-plan-memory-report` 插入 Release 和安全的 `reuse_input=0`，输出 V2 与 `.memory.json`、规划前的 `.memory.before.json`。`--runtime-plan-memory-no-reuse` 只插 Release；单独打开 report 只估算，不自动释放。`hecate-opt` 的关闭原位选项是 `--runtime-plan-memory-reuse=false`。
 
-`--runtime-plan-memory-no-reuse` 只插 Release，用于分开比较释放和原位的收益。
-只加 `--runtime-plan-memory-report` 则分析原有 IR，仍导出 V1。
-`hecate-opt` 的对应开关为 `--runtime-plan-memory-reuse=false`。
+CPU 原位算子为 Negate/Rotate，GPU 为 AddCP/Rotate；Runtime 的手写计划还支持 GPU SubCP 原位。被覆盖值必须是同 Place、元信息相同、仅一次使用且非 final output 的内部计算结果。具体 Api 不支持时执行前报错。
 
-报告文件为 `<prefix>.<func>.memory.json`。同时规划和报告时，还会生成
-`.memory.before.json`，来自通信插入后、内存规划前的实际 IR。各 rank 的 Host
-和每张 GPU 分别报告峰值、对应阶段/指令、明文/密文分项、最大的五个对象，
-以及不同对象块的累计分配量。ValueId 和指令编号与导出的计划一致。
+V4 Waterline 通过 `hecate-opt` 的 `--runtime-plan-plaintext-schedule=waterline` 和显式 GPU/Host/pinned/raw 正预算开启；同时配置 `--runtime-plan-reserve-bytes`、`--runtime-plan-waterline-fraction`、`--runtime-plan-prepare-backend=cpu|gpu|auto` 与 `--runtime-plan-lookahead-groups`。当前通用模型生成脚本没有这些预算选项。完整字段及约束见 [V4 规范](../../docs/runtime-plan/v4.md)。Pass 顺序是保持不变的 HEFT placement、communication、Waterline Prepare、Release/reuse；Prepare 后不再运行 Encode CSE。不会按批克隆权重或插自动 Fence，普通 Encode/Transfer 和显式 Fence 仍可执行。
 
-已有 CKKS/Dist IR 可以直接运行：
+`.memory.json` 按顺序完成估算 RNS 对象，Host 系数按 8 字节、GPU 按 4 字节；`.waterline.json` 检查完整依赖单组基线，包含配置的消费者工作区上界。`--runtime-plan-workspace-bytes-per-op=0` 只做对象检查，不能保证算子实际空间。Runtime 再查询后端持久资源、准备峰值和 allocator capacity，在同一账本中检查单组及滚动准入。密钥、参数表、retained workspace、pool 外开销与余量必须被 reserve 覆盖；对象报告不能替代这些检查或整个进程的显存测量。
 
-```text
--p='builtin.module(func.func(plan-runtime-memory,estimate-runtime-memory{prefix=/tmp/model operator-spec=/path/to/operator-spec.json},emit-runtime-plan{...}))'
-```
+## Poseidon 联调数据
 
-内存 Pass 不允许重复运行；其后只接只读估算和导出，不再优化或重排操作。
-估算器不修改 IR，也不会猜测额外的释放。公式使用实际 RNS 层级，Host 按
-8 字节、GPU 按 4 字节计算每个系数。外部输入按调用方始终持有计入。
+`generate_mlp_e2e_fixture.py`、`generate_mlp_gpu_e2e_profiles.py` 和 ResNet-20 对应脚本生成联调输入与 profile；查看各脚本 `--help` 选择参数和输出目录。`poseidon-8192`、`poseidon-65536` preset 含有实测、插值或代理代价，不能当作全部 level 都已实测。检查生成文件中的来源和支持范围。
 
-报告假设每条操作完成后才执行下一条。它只估算计划里的明文/密文，不包含
-密钥、参数表、Rotate/Boot 工作区、传输暂存、编码缓存及内存池保留空间。
-多卡峰值不能相加作为同时发生的总峰值，也不能据此保证并行运行一定不超显存。
-不同对象块的分配总量也不是整个进程的显存上限。
+历史跑分、某台机器的验收过程和当时的计划编号不作为当前使用说明维护；复现时查询对应提交及其产物记录。

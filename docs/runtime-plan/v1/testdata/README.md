@@ -1,10 +1,10 @@
 # RuntimePlan V1 测试数据
 
-`valid/` 是 reader、verifier 和 Runtime 必须接受的冻结样例；`invalid/` 每份只引入一个错误，必须被拒绝。
+`valid/` 是 reader、verifier 和 Runtime 的合法回归样例；`invalid/` 每份引入一个错误，必须被拒绝。当前字段和执行规则见 [RuntimePlan 规范](../../README.md)。
 
 合法样例覆盖 inline Encode、bundle Encode、同一 content 多次编码、Host compute、Host decrypt/re-encrypt Boot、Device native Boot、显式 Transfer/Replicate、Rotate、Relinearize 和 Rescale。
 
-`bundles/v005-demo/` 使用冻结的纯 `blobs` manifest。`generate.py` 先写最终 OperatorSpec 和 manifest 字节，再计算原始字节 SHA-256 写入计划。重新生成命令：
+`bundles/v005-demo/` 使用 V1 逐文件布局的 `blobs` manifest。`generate.py` 先写最终 OperatorSpec 和 manifest 字节，再计算原始字节 SHA-256 写入计划。重新生成命令：
 
 ```bash
 python3 docs/runtime-plan/v1/testdata/generate.py

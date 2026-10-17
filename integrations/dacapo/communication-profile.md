@@ -31,8 +31,9 @@ bytes/us。它不进入 RuntimePlan V1，也不改变 Runtime 的传输语义。
 }
 ```
 
-`host_device` 用于同 rank 的 Host/GPU 传输，`intra_rank` 用于同 rank 的
-不同 GPU，`inter_rank` 用于不同 rank。当前不区分传输方向和具体 GPU 对。
+V1 的 `host_device` 用于同 rank 的 Host/GPU 传输，`intra_rank` 用于同 rank 的
+不同 GPU，`inter_rank` 用于不同 rank。V1 不区分传输方向和具体 GPU 对；
+V2 可用下面的规则分别配置。
 
 ## V2 有序规则
 
@@ -114,8 +115,8 @@ cost_us = startup_latency_us + ceil(payload_bytes / rate(payload_bytes))
 
 ## 当前边界
 
-这个首版模型只修正“所有 value 传输成本都一样”的问题，仍不建模链路争用、
-双向带宽差异、通信计算重叠、Host staging、显存峰值、密钥复制和具体 GPU
-之间的异构拓扑。这里的默认数值是联调用的粗估值，不是硬件实测结果。
-
-明文准备的完整组容量检查由后期 Waterline Pass 与 Runtime 事件准入账本处理，不属于通信 profile；HEFT 算法及前台顺序保持不变。
+V2 已支持 rank/node 拓扑、具体 GPU 对和方向不同的规则代价。
+placement 仍不显式调度链路争用、Host staging、密钥复制或通信资源占用，
+也不将静态到达时间当作真实通信计算重叠的保证。明文准备的完整组容量检查由后期
+Waterline Pass 与 Runtime 的事件准入账本处理，不属于通信 profile；HEFT 不变。上面的示例数值用于说明
+格式，不代表硬件实测结果。

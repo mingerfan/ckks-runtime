@@ -1,6 +1,6 @@
-# RuntimePlan binary container V1
+# RuntimePlan binary format
 
-The compiler generates binary plans by default. Select JSON when inspecting instructions:
+This is the current binary file contract. Container V1 is independent of semantic RuntimePlan V1/V2/V3; see the [RuntimePlan contract](README.md). The compiler generates binary plans by default. Select JSON when inspecting instructions:
 
 ```sh
 hecate-opt ... --runtime-plan-format=binary
