@@ -471,7 +471,9 @@ private:
             uses_.at(id).release_requested = true;
             clear_sequential_value(id);
         }
-        api_.collect_completed();
+        // Waterline's dispatcher reaps whole submitted batches. Repeating the
+        // same query for every Release only adds contention with that collector.
+        if (!parallel || !waterline_) api_.collect_completed();
         trace_event("release", id, ordinal, std::nullopt, "Release", 0);
     }
 
@@ -1379,7 +1381,50 @@ private:
         }
     }
 
+    void run_resident_tasks(std::vector<std::vector<ParallelTask>> &queues) {
+        std::vector<std::thread> workers;
+        for (std::size_t w = 0; w < queues.size(); ++w) {
+            if (queues[w].empty()) continue;
+            workers.emplace_back([&, w] {
+                ThreadTrace::set_thread_name("rank-" + std::to_string(rank_) +
+                    (w + 1 == queues.size() ? "-cpu-worker" : "-device-worker-" + std::to_string(w)));
+                try {
+                    for (auto &task : queues[w]) {
+                        if (parallel_failed_.load()) return;
+                        task.execute();
+                    }
+                } catch (...) { record_parallel_failure(std::current_exception()); }
+            });
+        }
+        const auto communicate = [&] {
+            try {
+                for (const auto &group : coordinator_groups_) {
+                    if (parallel_failed_.load()) return;
+                    execute_parallel_communication(group->action, group->instruction_ordinal, group);
+                    if constexpr (!detail::UsesBackgroundCommunicationIssuer<Api>::value)
+                        finish_parallel_group(group, std::nullopt);
+                }
+            } catch (...) { record_parallel_failure(std::current_exception()); }
+        };
+        std::thread issuer;
+        if constexpr (detail::UsesBackgroundCommunicationIssuer<Api>::value) {
+            if (!coordinator_groups_.empty()) issuer = std::thread(communicate);
+        } else communicate(); // MPI_THREAD_FUNNELED stays on the calling thread.
+        for (auto &worker : workers) worker.join();
+        if (issuer.joinable()) issuer.join();
+        if (parallel_failed_.load()) std::rethrow_exception(parallel_failure_);
+        for (const auto &group : parallel_groups_)
+            if (!group->completed) finish_parallel_group(group, std::nullopt);
+        parallel_groups_.clear(); coordinator_groups_.clear();
+    }
+
     void run_parallel_tasks(std::vector<std::vector<ParallelTask>> &queues, bool baseline_only=false) {
+        // Resident execution needs neither admission metadata nor a central
+        // handoff between successive submissions on the same worker.
+        if (!waterline_) {
+            if (!baseline_only) run_resident_tasks(queues);
+            return;
+        }
         struct TaskState {
             ParallelTask task;
             std::size_t worker = 0;
@@ -1424,17 +1469,33 @@ private:
                 const auto &first = tasks[indices.front()].task;
                 ResourceUsage delta(devices), transient = first.final_output
                     ? ResourceUsage(devices) : workspace(*first.instruction);
+                std::vector<std::pair<std::size_t,PrepareResources>> needed;
                 delta+=transient;
                 for(auto i:indices) {
                     for(ValueId id:tasks[i].task.inputs) if(preparations.count(id) && !seen[id]) {
                         const auto pi=preparations.at(id);
-                        auto backend=plan_->waterline->backend==PrepareBackend::Gpu?PrepareBackend::Gpu:PrepareBackend::Cpu;
+                        auto backend=plan_->waterline->backend==PrepareBackend::Cpu?PrepareBackend::Cpu:PrepareBackend::Gpu;
                         auto cost=prepare_cost(pi,backend);
+                        if(plan_->waterline->backend==PrepareBackend::Auto && !cost.supported) {
+                            backend=PrepareBackend::Cpu;cost=prepare_cost(pi,backend);
+                        }
                         if(!cost.supported) throw std::runtime_error("unsupported complete Prepare backend at ValueId "+std::to_string(id));
                         delta+=cost.peak;auto temp=cost.peak;temp-=cost.resident;transient+=temp;
+                        tasks[pi].task.backend=backend;needed.emplace_back(pi,cost);
                         resident.emplace(id,cost.resident);seen[id]=true;
                     }
                     for(ValueId id:tasks[i].task.outputs) {auto cost=storage(id);delta+=cost;resident.emplace(id,cost);}
+                }
+                if(plan_->waterline->backend==PrepareBackend::Auto && !baseline.fits(delta)) {
+                    for(auto &[pi,cost]:needed)if(tasks[pi].task.backend==PrepareBackend::Gpu) {
+                        auto cpu=prepare_cost(pi,PrepareBackend::Cpu);
+                        if(!cpu.supported)continue;
+                        delta-=cost.peak;delta+=cpu.peak;
+                        auto old_temp=cost.peak;old_temp-=cost.resident;transient-=old_temp;
+                        auto new_temp=cpu.peak;new_temp-=cpu.resident;transient+=new_temp;
+                        resident[tasks[pi].task.outputs.front()]=cpu.resident;
+                        cost=std::move(cpu);tasks[pi].task.backend=PrepareBackend::Cpu;
+                    }
                 }
                 if(!baseline.fits(delta)) throw std::runtime_error("Waterline single-group baseline infeasible at instruction #"+std::to_string(ordinal)+baseline.describe(delta));
                 baseline.reserve(delta);baseline.release(transient);
@@ -1455,19 +1516,29 @@ private:
             }
         }
         if(baseline_only)return;
+        struct Completion { std::size_t task; std::vector<Value> values; };
         struct Worker {
             std::mutex mutex; std::condition_variable condition;
-            std::optional<std::size_t> assigned; bool stop=false;
-            std::atomic<bool> submitted{false}; bool busy=false;
-            std::vector<Value> completions;
+            std::deque<std::size_t> assigned; bool stop=false, busy=false;
+            std::size_t preparations_remaining=0;
+            std::deque<Completion> submitted;
         };
         // Existing foreground/CPU workers, plus one independent preparation lane per GPU.
         std::vector<std::unique_ptr<Worker>> workers;
         for(std::size_t i=0;i<queues.size()+devices;++i) workers.push_back(std::make_unique<Worker>());
         std::vector<std::deque<std::size_t>> pending(workers.size());
+        std::vector<std::deque<Completion>> completing(workers.size());
+        std::set<ValueId> producing;
         std::deque<std::size_t> cpu_preparations;
         for (std::size_t i=0;i<tasks.size();++i) if(!tasks[i].task.preparation)pending[tasks[i].worker].push_back(i);
         std::vector<std::thread> threads;
+        std::mutex dispatcher_mutex;
+        std::condition_variable dispatcher_condition;
+        bool submission_changed = false;
+        const auto notify_dispatcher = [&] {
+            {std::lock_guard<std::mutex> lock(dispatcher_mutex);submission_changed = true;}
+            dispatcher_condition.notify_one();
+        };
         const auto stop_workers=[&] {
             for(auto &w:workers) {{std::lock_guard<std::mutex> lock(w->mutex);w->stop=true;}w->condition.notify_all();}
             for(auto &thread:threads) if(thread.joinable())thread.join();
@@ -1477,15 +1548,24 @@ private:
             auto &worker=*workers[w];
             try {
                 for(;;) {
-                    std::size_t i;
-                    {std::unique_lock<std::mutex> lock(worker.mutex);worker.condition.wait(lock,[&]{return worker.stop || worker.assigned.has_value();});
+                    std::deque<std::size_t> batch;
+                    {std::unique_lock<std::mutex> lock(worker.mutex);worker.condition.wait(lock,[&]{return worker.stop || !worker.assigned.empty();});
                      if(worker.stop)return;
-                     i=*worker.assigned;}
+                     batch.swap(worker.assigned);}
+                    std::deque<Completion> submitted;
+                    for (auto i : batch) {
+                    if (parallel_failed_.load()) return;
+                    Completion completion{i,{}};
                     auto &task=tasks[i].task;
                     if(task.preparation) {
                         if constexpr(detail::HasWaterlineApi<Api>::value) {
                             const auto &op=std::get<PreparePlaintextOp>(task.instruction->body);
                             auto slots=read_encode_slots(op.payload,op.output,task.instruction->ordinal);
+                            // Read ahead while the preceding Encode is on the
+                            // GPU. Wait only when its staging is about to be
+                            // reused. Both preparations already own full credit.
+                            if(!submitted.empty())for(auto &value:submitted.back().values)
+                                api_.synchronize(value);
                             const auto start=std::chrono::steady_clock::now();
                             Value result=api_.prepare_plaintext_async(desc(op.output),slots,task.backend);
                             api_.validate_value(result,desc(op.output));
@@ -1493,7 +1573,12 @@ private:
                             {std::lock_guard<std::mutex> lock(parallel_timing_mutex_);++timing_.encode_calls;timing_.encode_nanoseconds+=elapsed;}
                             trace_event(task.backend==PrepareBackend::Cpu?"prepare_cpu":"prepare_gpu",op.output,task.instruction->ordinal,std::nullopt,"PreparePlaintext",elapsed);
                             auto output=parallel_value(op.output);
-                            {std::lock_guard<std::mutex> lock(output->mutex);output->completion.emplace(result);output->value.emplace(std::move(result));output->defined=true;}
+                            {
+                                std::lock_guard<std::mutex> lock(output->mutex);
+                                output->completion.emplace(result);
+                                if(!can_clear(output->uses))output->value.emplace(std::move(result));
+                                output->defined=true;
+                            }
                             output->condition.notify_all();
                         } else throw std::runtime_error("Api lacks PreparePlaintext");
                     } else task.execute();
@@ -1503,12 +1588,15 @@ private:
                         {std::lock_guard<std::mutex> lock(output->mutex);group=output->group;}
                         if(group && waterline_)finish_parallel_group(group,std::nullopt);
                         {std::lock_guard<std::mutex> lock(output->mutex);
-                         if(output->completion) {worker.completions.push_back(std::move(*output->completion));output->completion.reset();}}
+                         if(output->completion) {completion.values.push_back(std::move(*output->completion));output->completion.reset();}}
                     }
-                    {std::unique_lock<std::mutex> lock(worker.mutex);worker.submitted.store(true);
-                     worker.condition.wait(lock,[&]{return worker.stop || !worker.assigned.has_value() || *worker.assigned != i;});if(worker.stop)return;}
+                    submitted.push_back(std::move(completion));
+                    }
+                    {std::lock_guard<std::mutex> lock(worker.mutex);
+                     for (auto &completion : submitted) worker.submitted.push_back(std::move(completion));}
+                    notify_dispatcher();
                 }
-            } catch(...) {record_parallel_failure(std::current_exception());worker.submitted.store(true);}
+            } catch(...) {record_parallel_failure(std::current_exception());notify_dispatcher();}
         });
         // Only APIs that opt into a background issuer may communicate off the
         // caller thread. MPI_THREAD_FUNNELED backends advance below, after
@@ -1522,7 +1610,7 @@ private:
             });
         }
         std::size_t next_coordinator_group = 0;
-        auto next=groups.begin();std::size_t finished=0,active_groups=0;
+        auto next=groups.begin();std::size_t finished=0,started=0,active_groups=0;
         const auto ready=[&](const std::vector<ValueId> &inputs) {
             for(auto id:inputs) {auto value=parallel_value(id);std::lock_guard<std::mutex> lock(value->mutex);if(!value->defined)return false;}
             return true;
@@ -1530,7 +1618,7 @@ private:
         const auto retire=[&](const std::vector<ValueId> &ids) {
             for(auto id:ids) {
                 const auto it=waterline_storage_.find(id);
-                if(it!=waterline_storage_.end() && waterline_released_[id] && !waterline_remaining_.at(id) && !external(id)) {
+                if(it!=waterline_storage_.end() && !producing.count(id) && waterline_released_[id] && !waterline_remaining_.at(id) && !external(id)) {
                     waterline_->release(it->second);waterline_storage_.erase(it);
                 }
             }
@@ -1540,17 +1628,35 @@ private:
                   (!detail::UsesBackgroundCommunicationIssuer<Api>::value &&
                    next_coordinator_group<coordinator_groups_.size())) {
                 if(parallel_failed_.load())std::rethrow_exception(parallel_failure_);
+                {std::lock_guard<std::mutex> lock(dispatcher_mutex);submission_changed=false;}
                 bool progress=false;
                 api_.collect_completed();
-                for(auto &ptr:workers) {
-                    auto &worker=*ptr;if(!worker.busy || !worker.submitted.load())continue;
+                for(std::size_t w=0;w<workers.size();++w) {
+                    auto &worker=*workers[w];
+                    std::deque<Completion> submitted;
+                    {std::lock_guard<std::mutex> lock(worker.mutex);submitted.swap(worker.submitted);}
+                    if(submitted.empty())continue;
+                    // The Api has retained the inputs and published Ready handles.
+                    // Foreground submission can continue while the GPU is running;
+                    // its completion ticket still owns all resource credit.
+                    // A preparation lane instead keeps its reusable staging buffer
+                    // exclusive until the actual upload/encode has completed.
+                    if(!tasks[submitted.front().task].task.preparation)worker.busy=false;
+                    for(auto &completion:submitted)completing[w].push_back(std::move(completion));
+                    progress=true;
+                }
+                for(std::size_t w=0;w<completing.size();++w) {
+                  auto &queue=completing[w];
+                  while(!queue.empty()) {
+                    auto &completion=queue.front();
+                    auto &state=tasks[completion.task];auto &task=state.task;
                     bool complete=true;
                     if(waterline_) if constexpr(detail::HasWaterlineApi<Api>::value)
-                        for(auto &v:worker.completions) if(!api_.is_ready(v))complete=false;
-                    if(!complete)continue;
-                    const auto i=*worker.assigned;auto &state=tasks[i];auto &task=state.task;
-                    worker.completions.clear();state.completed=true;++finished;progress=true;
+                        for(auto &v:completion.values) if(!api_.is_ready(v))complete=false;
+                    if(!complete)break;
+                    completion.values.clear();state.completed=true;++finished;progress=true;
                     if(waterline_) {
+                        for(auto id:task.outputs)producing.erase(id);
                         if(task.preparation)waterline_->release(state.temporary);
                         else {
                             auto &ticket=tickets.at(task.instruction->ordinal);
@@ -1562,15 +1668,16 @@ private:
                             }
                         }
                         retire(task.inputs);
+                        retire(task.outputs);
                     }
-                    {std::lock_guard<std::mutex> lock(worker.mutex);worker.assigned.reset();worker.busy=false;worker.submitted.store(false);}
-                    worker.condition.notify_all();
+                    if(task.preparation && --workers[w]->preparations_remaining==0)workers[w]->busy=false;
+                    queue.pop_front();
+                  }
                 }
                 while(next!=groups.end() && (!waterline_ || active_groups<plan_->waterline->lookahead_groups)) {
                     const auto &indices=next->second;
                     ResourceUsage delta(devices),temp(devices);
                     std::vector<std::pair<std::size_t,PrepareResources>> needed;
-                    bool preparation_queue_full=false;
                     if(waterline_) {
                         const auto &first = tasks[indices.front()].task;
                         if (!first.final_output) temp=workspace(*first.instruction);
@@ -1580,19 +1687,8 @@ private:
                                 const auto pi=preparations.at(id);
                                 if(std::any_of(needed.begin(),needed.end(),[&](const auto &n){return n.first==pi;}))continue;
                                 auto backend=plan_->waterline->backend;
-                                const auto d=static_cast<std::size_t>(desc(id).place.index);
                                 if(backend==PrepareBackend::Auto) {
-                                    bool cpu_pending=workers[cpu_worker]->busy || !cpu_preparations.empty();
-                                    const bool gpu_idle=!workers[d%device_workers]->busy;
-                                    // Do not accumulate many slow CPU preparations
-                                    // while a foreground operation temporarily
-                                    // occupies the GPU. Reconsider the next group
-                                    // after actual completion instead of binding
-                                    // it to the occupied CPU worker.
-                                    if(cpu_pending && !gpu_idle) {
-                                        preparation_queue_full=true;break;
-                                    }
-                                    backend=cpu_pending && gpu_idle ? PrepareBackend::Gpu : PrepareBackend::Cpu;
+                                    backend=PrepareBackend::Gpu;
                                     if(!prepare_cost(pi,backend).supported)backend=PrepareBackend::Cpu;
                                 }
                                 auto cost=prepare_cost(pi,backend);
@@ -1602,62 +1698,53 @@ private:
                             }
                             for(auto id:tasks[i].task.outputs)delta+=storage(id);
                         }
-                        if(preparation_queue_full)break;
-                        // Auto's queue preference only applies to a legal
-                        // complete group. GPU workspace can exceed the plain
-                        // waterline even when the CPU preparation fits.
-                        if(plan_->waterline->backend==PrepareBackend::Auto && !waterline_->fits(delta)) {
+                        // Temporary pressure waits for already admitted work.
+                        // CPU is chosen only when the GPU group still cannot
+                        // fit after those groups have completed.
+                        if(plan_->waterline->backend==PrepareBackend::Auto && active_groups==0 && started==finished && !waterline_->fits(delta)) {
                             for(auto &[pi,cost]:needed)if(tasks[pi].task.backend==PrepareBackend::Gpu) {
                                 auto cpu=prepare_cost(pi,PrepareBackend::Cpu);
                                 if(cpu.supported) {delta-=cost.peak;delta+=cpu.peak;cost=std::move(cpu);tasks[pi].task.backend=PrepareBackend::Cpu;}
                             }
                         }
-                        if(plan_->waterline->backend==PrepareBackend::Auto &&
-                           (workers[cpu_worker]->busy || !cpu_preparations.empty()) &&
-                           std::any_of(needed.begin(),needed.end(),[&](const auto &entry) {
-                               return tasks[entry.first].task.backend==PrepareBackend::Cpu;
-                           }))break;
                         if(!waterline_->fits(delta))break;
                         waterline_->reserve(delta);
                         tickets.emplace(next->first,Ticket{temp,indices.size()});++active_groups;
                         for(const auto &[pi,cost]:needed) {
                             auto &state=tasks[pi];state.admitted=true;state.temporary=cost.peak;state.temporary-=cost.resident;
                             const auto id=state.task.outputs.front();waterline_storage_.emplace(id,cost.resident);
+                            producing.insert(id);
                             state.worker=state.task.backend==PrepareBackend::Cpu?cpu_worker:queues.size()+desc(id).place.index;
                             if(state.task.backend==PrepareBackend::Cpu)cpu_preparations.push_back(pi);
                             else pending[state.worker].push_back(pi);
                         }
-                        for(auto i:indices)for(auto id:tasks[i].task.outputs)waterline_storage_.emplace(id,storage(id));
+                        for(auto i:indices)for(auto id:tasks[i].task.outputs) {waterline_storage_.emplace(id,storage(id));producing.insert(id);}
                         trace_event("admit",0,next->first,std::nullopt,"CompleteGroup",0);
                     }
                     for(auto i:indices)tasks[i].admitted=true;
                     ++next;progress=true;
                 }
                 for(std::size_t w=0;w<workers.size();++w) {
-                    auto &worker=*workers[w];if(worker.busy)continue;
-                    std::optional<std::size_t> selected;
-                    if(!pending[w].empty()) {
+                    auto &worker=*workers[w];
+                    const bool foreground=w<device_workers;
+                    const bool cpu=w==cpu_worker;
+                    if(!foreground && worker.busy)continue;
+                    std::deque<std::size_t> selected;
+                    while(!pending[w].empty()) {
                         const auto i=pending[w].front();const auto &state=tasks[i];
-                        if(state.admitted && ready(state.task.inputs)) {
-                            bool allowed=true;
-                            if(state.task.preparation && state.task.backend==PrepareBackend::Gpu) {
-                                const auto d=static_cast<std::size_t>(desc(state.task.outputs.front()).place.index)%device_workers;
-                                allowed=!workers[d]->busy;
-                                if(!pending[d].empty()) {
-                                    const auto &front=tasks[pending[d].front()];
-                                    if(front.admitted && ready(front.task.inputs))allowed=false;
-                                }
-                            }
-                            if(allowed) {selected=i;pending[w].pop_front();}
-                        }
+                        if(!state.admitted || (!foreground && !ready(state.task.inputs)))break;
+                        selected.push_back(i);pending[w].pop_front();
+                        if(cpu)break;
                     }
-                    if(!selected && w==cpu_worker && !cpu_preparations.empty()) {
-                        selected=cpu_preparations.front();cpu_preparations.pop_front();
+                    if(selected.empty() && w==cpu_worker && !cpu_preparations.empty()) {
+                        selected.push_back(cpu_preparations.front());cpu_preparations.pop_front();
                     }
-                    if(selected) {
-                        tasks[*selected].started=true;
-                        {std::lock_guard<std::mutex> lock(worker.mutex);worker.assigned=*selected;worker.busy=true;worker.submitted.store(false);}
-                        worker.condition.notify_all();progress=true;
+                    if(!selected.empty()) {
+                        for(auto i:selected) {tasks[i].started=true;++started;}
+                        if(tasks[selected.front()].task.preparation)worker.preparations_remaining=selected.size();
+                        {std::lock_guard<std::mutex> lock(worker.mutex);
+                         for(auto i:selected)worker.assigned.push_back(i);}
+                        worker.busy=true;worker.condition.notify_one();progress=true;
                     }
                 }
                 if constexpr (!detail::UsesBackgroundCommunicationIssuer<Api>::value) {
@@ -1672,12 +1759,17 @@ private:
                     }
                 }
                 if(!progress) {
-                    bool in_flight=false;for(const auto &w:workers)in_flight|=w->busy;
+                    const bool in_flight=started!=finished;
                     if(!in_flight && (!detail::UsesBackgroundCommunicationIssuer<Api>::value || coordinator_groups_.empty())) {
                         if(next!=groups.end())throw std::runtime_error("Waterline cannot advance at instruction #"+std::to_string(next->first)+ (waterline_?waterline_->describe(ResourceUsage(devices)):""));
                         throw std::runtime_error("executor has no runnable producer: dependency/order invariant violated");
                     }
-                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    // Host submissions wake the dispatcher immediately. Only
+                    // GPU completions (without a host notifier) need timed polls.
+                    std::unique_lock<std::mutex> lock(dispatcher_mutex);
+                    dispatcher_condition.wait_for(lock,std::chrono::microseconds(100),[&] {
+                        return submission_changed || parallel_failed_.load();
+                    });
                 }
             }
             stop_workers();if(issuer.joinable())issuer.join();

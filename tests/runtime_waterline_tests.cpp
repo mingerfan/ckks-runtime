@@ -29,6 +29,8 @@ public:
     std::atomic<int> cpu{0},gpu{0};
     std::atomic<int> host_encodes{0}, gpu_resource_queries{0};
     int delay_ms=5;bool unsupported=false;
+    bool gpu_unsupported=false;
+    std::uint64_t cpu_extra_host_bytes=0;
     int fail_prepare_call=0;
     std::uint64_t prepare_host_bytes=100;
     std::vector<int> device_delay_ms;
@@ -49,7 +51,8 @@ public:
         if (backend == PrepareBackend::Gpu) ++gpu_resource_queries;
         auto resident=value_resources(v),peak=resident;peak.host=prepare_host_bytes;peak.pinned=50;peak.raw=20;
         if(backend==PrepareBackend::Gpu)peak.plain.at(v.place.index)+=50;
-        return {peak,resident,!unsupported};
+        else peak.host+=cpu_extra_host_bytes;
+        return {peak,resident,!unsupported && !(gpu_unsupported && backend==PrepareBackend::Gpu)};
     }
     Value encode_plaintext(const ValueDesc &desc, const std::vector<double> &slots) {
         ++host_encodes;
@@ -872,6 +875,179 @@ void test_parallel_encode_timing(const RuntimePlan &rolling,const LoadedOperator
             "parallel ordinary Encode/GPU Prepare changed arithmetic");
     std::cout<<"PASS ordinary CPU Encode and GPU Prepare share protected timing counters\n";
 }
+
+void test_continuous_submission(RuntimePlan plan,const LoadedOperatorSpec &spec,
+                                const std::vector<double> &input) {
+    class BatchApi : public PrepareApi {
+    public:
+        using PrepareApi::PrepareApi;
+        std::mutex submitted_mutex;
+        std::condition_variable submitted_condition;
+        std::atomic<unsigned> submitted{0};
+        Value compute(const ComputeOp &op,const std::vector<Value> &inputs) {
+            auto value=PrepareApi::compute(op,inputs);
+            {std::lock_guard<std::mutex> lock(submitted_mutex);++submitted;}
+            submitted_condition.notify_one();return value;
+        }
+        bool is_ready(Value &value) {
+            if(submitted.load()) {
+                // Hold the dispatcher here. The worker must finish its already
+                // admitted queue without another per-operation acknowledgement.
+                std::unique_lock<std::mutex> lock(submitted_mutex);
+                require(submitted_condition.wait_for(lock,std::chrono::seconds(2),[&] {return submitted==8;}),
+                        "worker needs dispatcher acknowledgement between admitted submissions");
+            }
+            return PrepareApi::is_ready(value);
+        }
+    };
+    plan.values.resize(2);plan.execution.clear();plan.finalization.clear();
+    auto value=plan.values.at(1);ValueId previous=value.id;
+    for(unsigned i=0;i<8;++i) {
+        value.id=100+i;plan.values.push_back(value);
+        plan.execution.push_back({0,ComputeOp{ComputeKind::Negate,{previous},value.id,value.place,{}}});
+        plan.execution.push_back({0,ReleaseOp{previous}});previous=value.id;
+    }
+    plan.final_outputs={previous};number_instructions(plan);
+    plan.waterline->device_capacity_bytes={10000};plan.waterline->lookahead_groups=32;
+    for(bool waterline:{true,false}) {
+        if(!waterline) {plan.waterline.reset();plan.format_version=3;}
+        BatchApi api(std::make_shared<MockCluster>(MockClusterConfig{}));
+        SequentialRuntime<BatchApi> runtime(0,1,1,api,DeviceExecutionMode::PerDeviceWorkers);
+        auto artifact=runtime.run({plan,"sha256:"+std::string(64,'1')},{spec,std::nullopt,false},
+            {{0,make_cipher(input,spec.spec.context_id,spec.spec.poly_degree,3,30)}});
+        const auto result=artifact.values.at(previous).value.materialize();
+        require(api.submitted==8 && result.slots==input,
+                "continuous resident/admitted submission changed dependencies or Release");
+    }
+    std::cout<<"PASS resident and admitted workers submit dependent chains without per-operation acknowledgement\n";
+}
+
+void test_auto_gpu_preference(RuntimePlan plan,const LoadedOperatorSpec &spec,
+                              const std::vector<double> &input) {
+    plan.waterline->backend=PrepareBackend::Auto;
+    plan.waterline->device_capacity_bytes={1200};
+    for(bool unsupported:{false,true}) {
+        PrepareApi api(std::make_shared<MockCluster>(MockClusterConfig{}));
+        api.gpu_unsupported=unsupported;
+        if(!unsupported) {
+            // CPU preparation cannot fit the Host budget. Auto's preflight must
+            // check the supported GPU path instead of demanding CPU feasibility.
+            api.cpu_extra_host_bytes=500;
+        }
+        SequentialRuntime<PrepareApi> runtime(0,1,1,api,DeviceExecutionMode::PerDeviceWorkers);
+        auto artifact=runtime.run({plan,"sha256:"+std::string(64,'1')},{spec,std::nullopt,false},
+            {{0,make_cipher(input,spec.spec.context_id,spec.spec.poly_degree,3,30)}});
+        const auto result=artifact.values.at(plan.final_outputs.front()).value.materialize();
+        require(std::abs(result.slots[0]-11)<1e-9 && std::abs(result.slots[1]+22)<1e-9 &&
+                (unsupported?(api.cpu==20 && api.gpu==0):(api.gpu==20 && api.cpu==0)),
+                "Auto used CPU for temporary GPU pressure or rejected the only supported path");
+    }
+    std::cout<<"PASS Auto prefers legal GPU preparation, waits through pressure, and selects CPU for unsupported GPU\n";
+}
+
+void test_continuous_preparation(RuntimePlan plan,const LoadedOperatorSpec &spec) {
+    class BatchPrepareApi : public PrepareApi {
+    public:
+        using PrepareApi::PrepareApi;
+        std::mutex submitted_mutex;
+        std::condition_variable submitted_condition;
+        Value prepare_plaintext_async(const ValueDesc &desc,const std::vector<double> &slots,PrepareBackend backend) {
+            auto value=PrepareApi::prepare_plaintext_async(desc,slots,backend);
+            {std::lock_guard<std::mutex> lock(submitted_mutex);submitted_condition.notify_one();}
+            return value;
+        }
+        bool is_ready(Value &value) {
+            if(preparation_attempts.load()) {
+                std::unique_lock<std::mutex> lock(submitted_mutex);
+                require(submitted_condition.wait_for(lock,std::chrono::seconds(2),[&] {return preparation_attempts==4;}),
+                        "preparation lane needs dispatcher acknowledgement between admitted preparations");
+            }
+            return PrepareApi::is_ready(value);
+        }
+    };
+    auto desc=*std::find_if(plan.values.begin(),plan.values.end(),[](const auto &value) {
+        return value.kind==ValueKind::Plaintext;
+    });
+    plan.values.clear();plan.initialization.clear();plan.execution.clear();plan.finalization.clear();
+    plan.external_inputs.clear();plan.final_outputs.clear();
+    plan.waterline->backend=PrepareBackend::Gpu;plan.waterline->device_capacity_bytes={10000};
+    for(ValueId id=0;id<4;++id) {
+        desc.id=id;plan.values.push_back(desc);plan.final_outputs.push_back(id);
+        plan.execution.push_back({0,PreparePlaintextOp{InlineEncodePayload{{double(id)}},id}});
+    }
+    number_instructions(plan);
+    BatchPrepareApi api(std::make_shared<MockCluster>(MockClusterConfig{}));
+    SequentialRuntime<BatchPrepareApi> runtime(0,1,1,api,DeviceExecutionMode::PerDeviceWorkers);
+    auto artifact=runtime.run({plan,"sha256:"+std::string(64,'1')},{spec,std::nullopt,false},{});
+    require(api.gpu==4 && api.cpu==0 && api.peak_preparations==1,
+            "continuous preparation reused staging before Ready or switched backend");
+    for(auto id:plan.final_outputs)
+        require(artifact.values.at(id).value.materialize().slots[0]==double(id),
+                "continuous preparation changed returned plaintext");
+    std::cout<<"PASS admitted preparations continue without dispatcher acknowledgement and remain exclusive through Ready\n";
+}
+
+void test_wait_only_for_staging_reuse(RuntimePlan plan,const LoadedOperatorSpec &spec,
+                                     const std::vector<double> &input) {
+    class WaitApi : public PrepareApi {
+    public:
+        using PrepareApi::PrepareApi;
+        std::atomic<unsigned> plaintext_waits{0};
+        void synchronize(Value &value) {
+            if(value.kind()==ValueKind::Plaintext)++plaintext_waits;
+            PrepareApi::synchronize(value);
+        }
+    };
+    plan.waterline->backend=PrepareBackend::Gpu;
+    plan.waterline->device_capacity_bytes={10000};
+    for(bool single:{true,false}) {
+        plan.waterline->device_fractions={single?.016:.5}; // 160 bytes: one complete GPU Prepare.
+        WaitApi api(std::make_shared<MockCluster>(MockClusterConfig{}));
+        SequentialRuntime<WaitApi> runtime(0,1,1,api,DeviceExecutionMode::PerDeviceWorkers);
+        const auto artifact=runtime.run({plan,"sha256:"+std::string(64,'1')},{spec,std::nullopt,false},
+            {{0,make_cipher(input,spec.spec.context_id,spec.spec.poly_degree,3,30)}});
+        const auto result=artifact.values.at(plan.final_outputs.front()).value.materialize();
+        require(std::abs(result.slots[0]-11)<1e-9 && std::abs(result.slots[1]+22)<1e-9 &&
+                api.gpu==20 && api.peak_preparations==1,
+                "deferred staging wait changed arithmetic or overlapped unfinished preparations");
+        require(single?api.plaintext_waits==0:api.plaintext_waits>0,
+                "single-Prepare batches must publish without a blocking wait; reuse must still wait");
+    }
+    std::cout<<"PASS preparation waits only for staging reuse, not at the end of a single-Prepare batch\n";
+}
+
+void test_release_before_prepare_publication(RuntimePlan plan,const LoadedOperatorSpec &spec,
+                                             const std::vector<double> &input) {
+    class ReleasedPrepareApi : public BundleFailurePrepareApi {
+    public:
+        std::optional<ValueId> previous;
+        Value prepare_plaintext_async(const ValueDesc &desc,const std::vector<double> &slots,PrepareBackend backend) {
+            if(previous)require(expired(*previous),"released unused plaintext remained resident after preparation completed");
+            auto value=BundleFailurePrepareApi::prepare_plaintext_async(desc,slots,backend);
+            // Release has no data consumer to wait for. Give the independent
+            // foreground lane time to submit it before publication.
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            previous=desc.id;return value;
+        }
+    };
+    auto plain=*std::find_if(plan.values.begin(),plan.values.end(),[](const auto &v) {return v.kind==ValueKind::Plaintext;});
+    plan.values.resize(1);plan.initialization.clear();plan.execution.clear();plan.finalization.clear();
+    plan.final_outputs={0};plan.waterline->backend=PrepareBackend::Gpu;
+    plan.waterline->device_fractions={.16};
+    for(ValueId id=100;id<120;++id) {
+        plain.id=id;plan.values.push_back(plain);
+        plan.execution.push_back({0,PreparePlaintextOp{InlineEncodePayload{{1.0}},id}});
+        plan.execution.push_back({0,ReleaseOp{id}});
+    }
+    number_instructions(plan);
+    ReleasedPrepareApi api;api.expect_failed_cleanup=false;
+    SequentialRuntime<ReleasedPrepareApi> runtime(0,1,1,api,DeviceExecutionMode::PerDeviceWorkers);
+    const auto artifact=runtime.run({plan,"sha256:"+std::string(64,'1')},{spec,std::nullopt,false},
+        {{0,std::make_shared<VecValue>(make_cipher(input,spec.spec.context_id,spec.spec.poly_degree,3,30))}});
+    require(api.inner.gpu==20 && api.expired(119) && artifact.values.at(0).value->materialize().slots==input,
+            "early Release resurrected unused plaintext storage or changed the returned input");
+    std::cout<<"PASS early Release cannot resurrect unused plaintext storage after asynchronous publication\n";
+}
 int main() {
  try {
     WaterlineConfig c; c.device_capacity_bytes={1000};c.device_reserve_bytes={0};c.device_fractions={.4};
@@ -924,6 +1100,11 @@ int main() {
     test_allocator_capacity(parsed,spec,input);
     test_fixed_prepare_buffers(parsed,spec,input);
     test_parallel_encode_timing(parsed,spec,input);
+    test_continuous_submission(parsed,spec,input);
+    test_auto_gpu_preference(parsed,spec,input);
+    test_continuous_preparation(parsed,spec);
+    test_wait_only_for_staging_reuse(parsed,spec,input);
+    test_release_before_prepare_publication(parsed,spec,input);
     for(auto backend:{PrepareBackend::Cpu,PrepareBackend::Gpu,PrepareBackend::Auto}) {
         parsed.waterline->backend=backend;
         // Auto needs room for two groups including GPU's extra 50-byte workspace.
@@ -936,7 +1117,7 @@ int main() {
         require(api.cpu+api.gpu==20 && artifact.timing.fence_calls==0,"Prepare repeated or inserted Fence");
         require(backend!=PrepareBackend::Cpu || (api.cpu==20 && api.gpu==0), "CPU-only selected a GPU Prepare");
         require(backend!=PrepareBackend::Gpu || (api.gpu==20 && api.cpu==0), "GPU-only selected a CPU Prepare");
-        require(backend!=PrepareBackend::Auto || (api.cpu>0 && api.gpu>0), "Auto rolling test did not exercise both backends");
+        require(backend!=PrepareBackend::Auto || (api.cpu==0 && api.gpu==20), "Auto switched to CPU while legal GPU work was in flight");
         std::cout<<"PASS rolling backend="<<int(backend)<<" cpu="<<api.cpu<<" gpu="<<api.gpu<<"\n";
     }
     parsed.waterline->device_capacity_bytes={1000};
