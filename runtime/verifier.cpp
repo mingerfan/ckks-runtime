@@ -63,9 +63,11 @@ const ValueDesc &lookup(const DescMap &descs, ValueId id, std::string_view where
     return descs.lookup(id, where);
 }
 
+bool same_scale(double a, double b) { return std::isfinite(a) && std::isfinite(b) && std::abs(a-b) <= 1e-8; }
+
 bool same_metadata(const ValueDesc &a, const ValueDesc &b) {
     return a.kind == b.kind && a.context == b.context && a.level == b.level &&
-           a.scale_log2 == b.scale_log2 && a.ntt == b.ntt && a.components == b.components;
+           same_scale(a.scale_log2, b.scale_log2) && a.ntt == b.ntt && a.components == b.components;
 }
 
 void require_same_base(const ValueDesc &input, const ValueDesc &output, ComputeKind op) {
@@ -112,27 +114,27 @@ void verify_compute_metadata(const ComputeOp &op, const DescMap &descs) {
     switch (op.kind) {
     case ComputeKind::AddCC: case ComputeKind::SubCC:
         if (!no_attrs) fail(to_string(op.kind) + " does not accept attrs");
-        if (inputs[0]->scale_log2 != inputs[1]->scale_log2 || inputs[0]->components != inputs[1]->components ||
+        if (!same_scale(inputs[0]->scale_log2, inputs[1]->scale_log2) || inputs[0]->components != inputs[1]->components ||
             !same_metadata(*inputs[0], output)) fail(to_string(op.kind) + " metadata rule failed");
         break;
     case ComputeKind::AddCP: case ComputeKind::SubCP:
         if (!no_attrs) fail(to_string(op.kind) + " does not accept attrs");
-        if (inputs[0]->scale_log2 != inputs[1]->scale_log2 ||
-            output.level != inputs[0]->level || output.scale_log2 != inputs[0]->scale_log2 ||
+        if (!same_scale(inputs[0]->scale_log2, inputs[1]->scale_log2) ||
+            output.level != inputs[0]->level || !same_scale(output.scale_log2, inputs[0]->scale_log2) ||
             output.components != inputs[0]->components)
             fail(to_string(op.kind) + " metadata rule failed");
         break;
     case ComputeKind::MulCC:
         if (!no_attrs) fail("MulCC does not accept attrs");
         if (output.level != inputs[0]->level ||
-            static_cast<long long>(output.scale_log2) != static_cast<long long>(inputs[0]->scale_log2) + inputs[1]->scale_log2 ||
+            !same_scale(output.scale_log2, inputs[0]->scale_log2 + inputs[1]->scale_log2) ||
             static_cast<long long>(output.components) != static_cast<long long>(inputs[0]->components) + inputs[1]->components - 1)
             fail("MulCC metadata rule failed");
         break;
     case ComputeKind::MulCP:
         if (!no_attrs) fail("MulCP does not accept attrs");
         if (output.level != inputs[0]->level ||
-            static_cast<long long>(output.scale_log2) != static_cast<long long>(inputs[0]->scale_log2) + inputs[1]->scale_log2 ||
+            !same_scale(output.scale_log2, inputs[0]->scale_log2 + inputs[1]->scale_log2) ||
             output.components != inputs[0]->components)
             fail("MulCP metadata rule failed");
         break;
@@ -148,26 +150,26 @@ void verify_compute_metadata(const ComputeOp &op, const DescMap &descs) {
     case ComputeKind::Rescale: {
         const auto *attrs = std::get_if<RescaleAttrs>(&op.attrs);
         if (!attrs || attrs->target_level >= inputs[0]->level || output.level != attrs->target_level ||
-            output.scale_log2 != attrs->target_scale_log2 || output.components != inputs[0]->components)
+            !same_scale(output.scale_log2, attrs->target_scale_log2) || output.components != inputs[0]->components)
             fail("Rescale metadata rule failed");
         break;
     }
     case ComputeKind::ModSwitch: {
         const auto *attrs = std::get_if<ModSwitchAttrs>(&op.attrs);
         if (!attrs || attrs->target_level >= inputs[0]->level || output.level != attrs->target_level ||
-            output.scale_log2 != inputs[0]->scale_log2 || output.components != inputs[0]->components)
+            !same_scale(output.scale_log2, inputs[0]->scale_log2) || output.components != inputs[0]->components)
             fail("ModSwitch metadata rule failed");
         break;
     }
     case ComputeKind::Relinearize:
         if (!no_attrs || inputs[0]->components != 3 || output.level != inputs[0]->level ||
-            output.scale_log2 != inputs[0]->scale_log2 || output.components != 2)
+            !same_scale(output.scale_log2, inputs[0]->scale_log2) || output.components != 2)
             fail("Relinearize metadata rule failed");
         break;
     case ComputeKind::Boot: {
         const auto *attrs = std::get_if<BootAttrs>(&op.attrs);
         if (!attrs || attrs->operator_profile.empty() || output.level != attrs->target_level ||
-            output.scale_log2 != attrs->target_scale_log2 || output.components != attrs->target_components)
+            !same_scale(output.scale_log2, attrs->target_scale_log2) || output.components != attrs->target_components)
             fail("Boot metadata rule failed");
         if (attrs->implementation == BootImplementation::DecryptReencrypt && op.place.kind != PlaceKind::Host)
             fail("decrypt_reencrypt Boot must execute on Host");
@@ -197,12 +199,12 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                                       const LoadedOperatorSpec &loaded_spec,
                                       bool skip_artifact_digest_checks) {
     const auto &spec = loaded_spec.spec;
-    if (plan.format_version != 1 && plan.format_version != 2 && plan.format_version != 3 && plan.format_version != 4) fail("unsupported format version");
+    if (plan.format_version != 1 && plan.format_version != 2 && plan.format_version != 3 && plan.format_version != 4 && plan.format_version != 5) fail("unsupported format version");
     if (plan.format_version == 3 && plan.target.world_size != 1)
         fail("RuntimePlan V3 supports one rank only");
     if (plan.waterline) {
         const auto &c = *plan.waterline;
-        if (plan.format_version != 4 || plan.target.world_size != 1 || plan.target.device_counts.size() != 1)
+        if (plan.format_version < 4 || plan.target.world_size != 1 || plan.target.device_counts.size() != 1)
             fail("Waterline requires V4 and one rank");
         if (c.device_capacity_bytes.size() != static_cast<std::size_t>(plan.target.device_counts[0]) ||
             c.device_reserve_bytes.size() != c.device_capacity_bytes.size() || c.device_fractions.size() != c.device_capacity_bytes.size()) fail("Waterline device budget table mismatch");
@@ -239,6 +241,9 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
         if (value.context != spec.context_id) fail("value context does not match OperatorSpec");
         if (value.level < spec.level_lower_bound || value.level > spec.level_upper_bound)
             fail("value level is outside OperatorSpec range");
+        if (!std::isfinite(value.scale_log2) || value.scale_log2 < 0 ||
+            (plan.format_version < 5 && std::floor(value.scale_log2) != value.scale_log2))
+            fail("invalid scale or fractional scale without plan V5");
         if (value.scale_log2 >= modulus_budgets.at(static_cast<std::size_t>(value.level)))
             fail("value scale exceeds modulus budget");
         if (value.kind == ValueKind::Plaintext && value.components != 1)
@@ -331,7 +336,7 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                     fail("unknown Encode payload");
                 }
             } else if (const auto *prepare = std::get_if<PreparePlaintextOp>(&instruction.body)) {
-                if (plan.format_version != 4 || !plan.waterline || phase != Phase::Execution)
+                if (plan.format_version < 4 || !plan.waterline || phase != Phase::Execution)
                     fail("PreparePlaintext requires V4 execution with Waterline config");
                 const auto &output = lookup(descs, prepare->output, "PreparePlaintext output");
                 auto &s = state(output.id, "PreparePlaintext output");
@@ -400,6 +405,14 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                 } else if (op->kind == ComputeKind::Rescale) {
                     const auto attrs = std::get<RescaleAttrs>(op->attrs);
                     const auto &input = lookup(descs, op->inputs[0], "Rescale input");
+                    if (spec.rescale_mode == RescaleMode::Native) {
+                        if (plan.format_version < 5) fail("native Rescale requires plan V5");
+                        double predicted = input.scale_log2;
+                        for (int level = input.level; level > attrs.target_level; --level)
+                            predicted -= std::log2(static_cast<double>(spec.rns_moduli.at(level)));
+                        if (!same_scale(predicted, attrs.target_scale_log2))
+                            fail("native Rescale scale does not match the actual dropped moduli");
+                    }
                     if (!support->second.max_levels_per_op || input.level - attrs.target_level > *support->second.max_levels_per_op)
                         fail("Rescale level drop exceeds OperatorSpec max_levels_per_op");
                 } else if (op->kind == ComputeKind::Boot) {

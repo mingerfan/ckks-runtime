@@ -81,7 +81,7 @@ std::size_t first_execution_offset(const std::string &bytes) {
     std::uint64_t count = 0; a.number(count); a.skip(count * 35);
     binary_io::skip_sequence(a, 8);
     a.number(count);
-    for (std::uint64_t index = 0; index < count; ++index) binary_io::skip_instruction(a);
+    for (std::uint64_t index = 0; index < count; ++index) binary_io::skip_instruction(a, 4);
     a.number(count);
     require(count > 0, "test fixture has no execution records");
     return static_cast<std::size_t>(a.cursor() - bytes.data());
@@ -124,6 +124,17 @@ void unit_tests() {
         write_file(path, bad);
         expect_read_error(path, position, "nonfinite binary float64");
     }
+    auto fractional = fixture(2);
+    fractional.format_version = 5;
+    for (auto &value : fractional.values) value.scale_log2 += 0.125;
+    fractional.execution.push_back({fractional.execution.back().ordinal + 1,
+        ComputeOp{ComputeKind::Rescale, {0}, 0, {PlaceKind::Device, 0, 0}, RescaleAttrs{1, 40.125}}});
+    auto bytes = wire(fractional);
+    auto path = temp.path / "fractional.bin";
+    write_file(path, bytes);
+    for (unsigned threads : {1U, 4U})
+        require(wire(RuntimePlanReader::read_file(path.string(), {threads}).plan) == bytes,
+                "V5 fractional scales or Rescale attrs changed in sequential/parallel decoding");
     std::cout << "PASS production V4 binary file reader: inline/bundle Prepare, 1/4 threads, "
                  "16384-record blocks, scan/decode corruption positions\n";
 }

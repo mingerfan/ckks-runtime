@@ -76,7 +76,7 @@ void VecValue::fail(std::exception_ptr error) const {
 const void *VecValue::identity() const { return state_.get(); }
 
 static VecValue make_value(ValueKind kind, std::vector<double> slots, std::string context,
-                           std::uint64_t degree, int level, int scale_log2, bool ntt, int components) {
+                           std::uint64_t degree, int level, double scale_log2, bool ntt, int components) {
     if (slots.empty()) throw std::runtime_error("VecValue requires at least one slot");
     if (context.empty() || degree == 0 || level < 0 || scale_log2 < 0)
         throw std::runtime_error("invalid VecValue metadata");
@@ -86,11 +86,11 @@ static VecValue make_value(ValueKind kind, std::vector<double> slots, std::strin
 }
 
 VecValue make_plain(std::vector<double> slots, std::string context, std::uint64_t degree,
-                    int level, int scale_log2, bool ntt) {
+                    int level, double scale_log2, bool ntt) {
     return make_value(ValueKind::Plaintext, std::move(slots), std::move(context), degree, level, scale_log2, ntt, 1);
 }
 VecValue make_cipher(std::vector<double> slots, std::string context, std::uint64_t degree,
-                     int level, int scale_log2, bool ntt, int components) {
+                     int level, double scale_log2, bool ntt, int components) {
     return make_value(ValueKind::Ciphertext, std::move(slots), std::move(context), degree, level, scale_log2, ntt, components);
 }
 

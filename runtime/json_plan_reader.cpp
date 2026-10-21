@@ -13,6 +13,11 @@ namespace {
 
 using namespace json_utils;
 constexpr const char *doc = "runtime plan";
+double read_scale(const Json &value, const std::string &path) {
+    double result = read_finite_double(value, doc, path);
+    if (result < 0 || result > 1023) fail(doc, path, "scale_log2 outside supported range");
+    return result;
+}
 
 Place read_place(const Json &value, const std::string &path) {
     if (!value.is_object()) fail(doc, path, "expected object");
@@ -121,7 +126,7 @@ ValueDesc read_value_desc(const Json &value, const std::string &path) {
             read_place(value.at("place"), path + ".place"),
             read_string(value.at("context"), doc, path + ".context"),
             read_nonnegative_int(value.at("level"), doc, path + ".level"),
-            read_nonnegative_int(value.at("scale_log2"), doc, path + ".scale_log2"),
+            read_scale(value.at("scale_log2"), path + ".scale_log2"),
             read_bool(value.at("ntt"), doc, path + ".ntt"),
             read_positive_int(value.at("components"), doc, path + ".components")};
 }
@@ -167,7 +172,7 @@ ComputeAttrs read_compute_attrs(ComputeKind kind, const Json &value, const std::
     case ComputeKind::Rescale:
         require_members(value, doc, path, {"target_level", "target_scale_log2"});
         return RescaleAttrs{read_nonnegative_int(value.at("target_level"), doc, path + ".target_level"),
-                            read_nonnegative_int(value.at("target_scale_log2"), doc, path + ".target_scale_log2")};
+                            read_scale(value.at("target_scale_log2"), path + ".target_scale_log2")};
     case ComputeKind::ModSwitch:
         require_members(value, doc, path, {"target_level"});
         return ModSwitchAttrs{read_nonnegative_int(value.at("target_level"), doc, path + ".target_level")};
@@ -283,10 +288,10 @@ void read_metadata(const Json &root, RuntimePlan &plan) {
                      "initialization", "execution", "finalization", "final_outputs"},
                     {"plaintext_bundle", "waterline"});
     plan.format_version = static_cast<std::uint32_t>(read_nonnegative_int(root.at("format_version"), doc, "$.format_version"));
-    if (plan.format_version != 1 && plan.format_version != 2 && plan.format_version != 3 && plan.format_version != 4)
+    if (plan.format_version != 1 && plan.format_version != 2 && plan.format_version != 3 && plan.format_version != 4 && plan.format_version != 5)
         fail(doc, "$.format_version", "unsupported format version");
     if (root.contains("waterline")) {
-        if (plan.format_version != 4) fail(doc, "$.waterline", "waterline requires V4");
+        if (plan.format_version < 4) fail(doc, "$.waterline", "waterline requires V4 or newer");
         const auto &v = root.at("waterline");
         require_members(v, doc, "$.waterline", {"device_capacity_bytes", "device_reserve_bytes", "device_fractions",
             "host_budget_bytes", "pinned_budget_bytes", "raw_budget_bytes", "backend", "lookahead_groups"});
@@ -324,16 +329,25 @@ LoadedRuntimePlan read_stream(std::istream &input, const std::string &document, 
     // The version may be the last root field. Parse records using V4's schema
     // and retain only the first use of each version-dependent feature.
     std::array<std::string, 3> v1_errors, v2_errors, v3_errors;
+    std::string v4_scale_error;
     StrictJsonSax sax(document,
         {"values", "external_inputs", "initialization", "execution", "finalization", "final_outputs"},
         [&](const std::string &field, std::size_t index, Json &&record) {
             try {
-                if (field == "values") plan.values.push_back(read_value_desc(record, "$"));
+                if (field == "values") {
+                    plan.values.push_back(read_value_desc(record, "$"));
+                    if (!record.at("scale_log2").is_number_integer() && v4_scale_error.empty())
+                        v4_scale_error = item_path("$.values", index) + ".scale_log2: expected integer; floating scales require V5";
+                }
                 else if (field == "external_inputs" || field == "final_outputs") {
                     auto &ids = field == "external_inputs" ? plan.external_inputs : plan.final_outputs;
                     ids.push_back(read_id(record, doc, "$"));
                 } else {
                     auto instruction = read_instruction(record, "$", 4);
+                    if (const auto *compute = std::get_if<ComputeOp>(&instruction.body);
+                        compute && compute->kind == ComputeKind::Rescale &&
+                        !record.at("attrs").at("target_scale_log2").is_number_integer() && v4_scale_error.empty())
+                        v4_scale_error = item_path("$." + field, index) + ".attrs.target_scale_log2: expected integer; floating scales require V5";
                     const auto phase_index = field == "initialization" ? 0 : field == "execution" ? 1 : 2;
                     const char *message = nullptr;
                     if (std::holds_alternative<PreparePlaintextOp>(instruction.body)) {
@@ -371,6 +385,8 @@ LoadedRuntimePlan read_stream(std::istream &input, const std::string &document, 
     if (plan.format_version < 4)
         for (const auto &error : v3_errors)
             if (!error.empty()) fail(document, "$", error);
+    if (plan.format_version < 5 && !v4_scale_error.empty())
+        fail(document, "$", v4_scale_error);
     auto digest = buffer.source_sha256();
     if (stats) stats->parse_build_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()
                                           - stats->read_seconds - stats->hash_seconds;

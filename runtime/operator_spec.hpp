@@ -53,6 +53,7 @@ struct OperatorSpec {
     std::string context_id;
     std::uint64_t poly_degree = 0;
     std::vector<int> rns_moduli_log2;
+    std::vector<std::uint64_t> rns_moduli;
     int max_modulus_log2 = 0;
     int default_scale_log2 = 0;
     int level_lower_bound = 0;

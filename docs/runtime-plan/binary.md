@@ -1,6 +1,6 @@
 # RuntimePlan binary format
 
-This is the current binary file contract. Container V1 is independent of semantic RuntimePlan V1/V2/V3; see the [RuntimePlan contract](README.md). The compiler generates binary plans by default. Select JSON when inspecting instructions:
+This is the current binary file contract. Container V1 is independent of semantic RuntimePlan V1–V5; see the [RuntimePlan contract](README.md). The compiler generates binary plans by default. Select JSON when inspecting instructions:
 
 ```sh
 hecate-opt ... --runtime-plan-format=binary
@@ -22,7 +22,7 @@ Both files start with the following fields. All integers, signed fields, and IEE
 | 12 | u32 | Metadata byte length |
 | 16 | UTF-8 JSON bytes | Small metadata object, at most 1 MiB |
 
-There is no literal `METADATA` marker. The header gives its position and length. Unknown magic, version, tags, enums, malformed metadata, invalid counts, truncated records, and trailing bytes are errors. The binary container version is independent of RuntimePlan semantic `format_version` (V1, V2, V3) and bundle storage version (V2 pack). A binary file does not become JSON when decoding fails.
+There is no literal `METADATA` marker. The header gives its position and length. Unknown magic, version, tags, enums, malformed metadata, invalid counts, truncated records, and trailing bytes are errors. The binary container version is independent of RuntimePlan semantic `format_version` (V1–V5) and bundle storage version (V2 pack). A binary file does not become JSON when decoding fails.
 
 Plan metadata uses the existing JSON root schema with empty arrays for the six record sections. It carries `format_version`, decimal `plan_id`, `target` (including OperatorSpec reference), and optional bundle reference. A binary bundle reference is:
 
@@ -38,7 +38,9 @@ Binary loading does not compute a whole-file SHA-256 or rehash blob payloads. It
 
 After the header: `u64 string_count`, then strings encoded as `u32 byte_length` plus UTF-8 bytes. Context names, bundle content IDs, and Boot profiles refer to this table by u32 index.
 
-Six arrays follow in order: values, external inputs, initialization, execution, finalization, final outputs. Each starts with u64 record count. Input/output arrays contain u64 ValueIds. A descriptor is exactly 35 bytes: u64 ID, u8 kind, place (u8 kind, i32 rank, i32 index), u32 context index, i32 level, i32 scale_log2, u8 NTT boolean, i32 components.
+Six arrays follow in order: values, external inputs, initialization, execution, finalization, final outputs. Each starts with u64 record count. Input/output arrays contain u64 ValueIds. A V1–V4 descriptor is exactly 35 bytes: u64 ID, u8 kind, place (u8 kind, i32 rank, i32 index), u32 context index, i32 level, i32 scale_log2, u8 NTT boolean, i32 components.
+
+V5 descriptors are 39 bytes: `scale_log2` is IEEE float64 instead of i32.
 
 Instructions start with u64 ordinal and u8 tag:
 
@@ -50,7 +52,7 @@ Instructions start with u64 ordinal and u8 tag:
 | 3 Release | u64 ValueId |
 | 4 Fence | no additional fields |
 
-Compute operator codes 0–11: AddCC, AddCP, SubCC, SubCP, MulCC, MulCP, Negate, Rotate, Rescale, ModSwitch, Relinearize, Boot. Attribute tags 0–4: none, Rotate (i32 steps), Rescale (two i32 targets), ModSwitch (i32 level), Boot (three i32 targets, u32 profile index, u8 implementation). Communication kind codes: Transfer 0, Replicate 1. Hint codes: Auto, PointToPoint, Broadcast, Tree, Ring, HostStaged. Value kinds: Plaintext 0, Ciphertext 1; places: Host 0, Device 1; Boot implementation: Native 0, DecryptReencrypt 1. Boolean values must be 0 or 1. Strings are bounded to 1 MiB and individual typed arrays and plan files to 8 GiB.
+Compute operator codes 0–11: AddCC, AddCP, SubCC, SubCP, MulCC, MulCP, Negate, Rotate, Rescale, ModSwitch, Relinearize, Boot. Attribute tags 0–4: none, Rotate (i32 steps), Rescale (two i32 targets), ModSwitch (i32 level), Boot (three i32 targets, u32 profile index, u8 implementation). For V5, Rescale attributes are i32 target level followed by float64 target scale; Boot attributes keep their integer targets. Communication kind codes: Transfer 0, Replicate 1. Hint codes: Auto, PointToPoint, Broadcast, Tree, Ring, HostStaged. Value kinds: Plaintext 0, Ciphertext 1; places: Host 0, Device 1; Boot implementation: Native 0, DecryptReencrypt 1. Boolean values must be 0 or 1. Strings are bounded to 1 MiB and individual typed arrays and plan files to 8 GiB.
 
 ## Manifest records
 

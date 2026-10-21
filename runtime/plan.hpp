@@ -34,7 +34,7 @@ enum class ComputeKind {
 enum class CommKind { Transfer, Replicate };
 enum class CommHint { Auto, PointToPoint, Broadcast, Tree, Ring, HostStaged };
 enum class Phase { Initialization, Execution, Finalization };
-enum class RescaleMode { Eager, Lazy };
+enum class RescaleMode { Eager, Lazy, Native };
 enum class BootImplementation { Native, DecryptReencrypt };
 enum class RequiredCapability {
     Encode, Transfer, Replicate, HostCompute, BootNative, BootDecryptReencrypt
@@ -42,7 +42,7 @@ enum class RequiredCapability {
 enum class KeyKind { Secret, Relin, Galois };
 
 struct RotateAttrs { int steps = 0; };
-struct RescaleAttrs { int target_level = 0; int target_scale_log2 = 0; };
+struct RescaleAttrs { int target_level = 0; double target_scale_log2 = 0; };
 struct ModSwitchAttrs { int target_level = 0; };
 struct BootAttrs {
     int target_level = 0;
@@ -121,7 +121,7 @@ struct ValueDesc {
     Place place;
     std::string context;
     int level = 0;
-    int scale_log2 = 0;
+    double scale_log2 = 0;
     bool ntt = true;
     int components = 2;
 };

@@ -38,6 +38,20 @@ inline Json metadata(const RuntimePlan &p) {
     return result;
 }
 
+template <bool R> void scale_record(Archive<R> &a, double &scale, std::uint32_t version) {
+    if (version >= 5) a.real(scale);
+    else {
+        if constexpr (!R)
+            if (!std::isfinite(scale) || scale < 0 || scale > std::numeric_limits<int>::max() || std::floor(scale) != scale)
+                throw std::runtime_error("fractional scales require plan V5");
+        int nominal = static_cast<int>(scale);
+        a.number(nominal);
+        scale = nominal;
+    }
+    if (!std::isfinite(scale) || scale < 0 || scale > 1023)
+        throw std::runtime_error("invalid binary scale");
+}
+
 template <bool R> void place(Archive<R> &a, Place &p) {
     a.enumeration(p.kind, 1);
     a.number(p.rank);
@@ -135,7 +149,7 @@ template <bool R> void instruction(Archive<R> &a, Instruction &i, std::uint32_t 
                 op.attrs = RescaleAttrs{};
             auto &v = std::get<RescaleAttrs>(op.attrs);
             a.number(v.target_level);
-            a.number(v.target_scale_log2);
+            scale_record(a, v.target_scale_log2, version);
             if (v.target_level < 0 || v.target_scale_log2 < 0)
                 throw std::runtime_error("invalid binary rescale attrs");
             break;
@@ -209,13 +223,13 @@ template <bool R> void instruction(Archive<R> &a, Instruction &i, std::uint32_t 
     }
 }
 
-template <bool R> void value_record(Archive<R> &a, ValueDesc &v) {
+template <bool R> void value_record(Archive<R> &a, ValueDesc &v, std::uint32_t version) {
         a.number(v.id);
         a.enumeration(v.kind, 1);
         place(a, v.place);
         a.string_ref(v.context);
         a.number(v.level);
-        a.number(v.scale_log2);
+        scale_record(a, v.scale_log2, version);
         a.boolean(v.ntt);
         a.number(v.components);
         if (v.level < 0 || v.scale_log2 < 0 || v.components < 1)
@@ -223,7 +237,7 @@ template <bool R> void value_record(Archive<R> &a, ValueDesc &v) {
 }
 
 template <bool R> void plan_records(Archive<R> &a, RuntimePlan &p) {
-    a.sequence(p.values, 35, [&](ValueDesc &v) { value_record(a, v); });
+    a.sequence(p.values, p.format_version >= 5 ? 39 : 35, [&](ValueDesc &v) { value_record(a, v, p.format_version); });
     a.sequence(p.external_inputs, 8, [&](ValueId &v) { a.number(v); });
     for (auto *phase : {&p.initialization, &p.execution, &p.finalization})
         a.sequence(*phase, 9, [&](Instruction &i) { instruction(a, i, p.format_version); });

@@ -32,7 +32,7 @@ RuntimePlan 的语义版本不限制 OperatorSpec 必须是同号版本。未知
 
 V1 的 `status` 是 `placeholder` 或 `validated`。`v1/profiles/` 中两份 poseidon profile 是协议测试占位数据，不能作为真实 Poseidon 参数或性能测量。真实后端是否接受某种 status，由其 preflight 检查。
 
-`rescale_mode` 是 `eager` 或 `lazy`，只在 OperatorSpec 中声明。RuntimePlan 不重复保存它。
+`rescale_mode` 是 `eager`、`lazy` 或 `native`，只在 OperatorSpec 中声明。`native` 表示按显式指令逐 Q 执行真实除模，保留实际 scale，不做整数校正；要求 RuntimePlan V5 和 `context.rns_moduli`。RuntimePlan 不重复保存它。
 
 ## context 和 levels
 
@@ -47,6 +47,7 @@ V1 的 `status` 是 `placeholder` 或 `validated`。`v1/profiles/` 中两份 pos
 ```
 
 - `poly_degree` 必须是 2 的幂，slot 容量为 `poly_degree / 2`。
+- `rns_moduli` 是可选的真实 Q 整数数组；`native` 模式必须提供，其长度和各项位宽须与 `rns_moduli_log2` 一致，且须与后端实际上下文完全匹配。
 - `rns_moduli_log2` 下标就是 level；每项为正整数且不超过 `max_modulus_log2`。
 - `levels.lower_bound <= levels.upper_bound`，上下界都必须落在模数链内。
 - RuntimePlan 中每个 value 的 level 必须落在该区间，且 `scale_log2 < sum(rns_moduli_log2[0..level])`。

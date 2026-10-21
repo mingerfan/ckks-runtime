@@ -8,6 +8,7 @@
 | 2 | V1 加 Release、Compute `reuse_input` | [V2](v2/schema.json) |
 | 3 | V2 加 execution Encode 和 Fence；仅支持 `world_size=1` | [V3](v3/schema.json) |
 | 4 | V3 加 execution Device Prepare 和 Waterline 预算；Waterline 仅支持单 rank 的设备工作线程 | [V4 规范](v4.md) |
+| 5 | V4 指令；ValueDesc 和 Rescale 的 scale_log2 可为实际浮点对数，支持原生逐 Q 除模 | 本文与[二进制格式](binary.md) |
 
 计划语义版本与文件表示分开：二进制容器版本和 bundle 存储版本见[二进制格式](binary.md)与[明文数据包](plaintext-bundle.md)。编译器默认导出二进制；下面用 JSON 展示字段，二进制记录具有相同的计划语义。
 
@@ -18,7 +19,7 @@ RuntimePlan 是编译器交给 Runtime 的最终执行文件。它写清楚 SSA 
 - UTF-8，无 BOM；顶层必须是 object。
 - 未知字段、缺字段、同一 object 内的重复 key 都直接拒绝。
 - `plan_id`、ValueId、TransferId 使用十进制字符串，必须匹配 `^(0|[1-9][0-9]*)$`，范围是 uint64。
-- level、scale、rank、index、ordinal 等整数使用 JSON integer，受对应字段的 int32 范围约束，不接受 `40.0`、科学计数法、布尔值或字符串。
+- level、rank、index、ordinal 等整数使用 JSON integer，受对应字段的 int32 范围约束。V1–V4 的 scale 必须取非负整数值；V5 的 ValueDesc `scale_log2` 和 Rescale `target_scale_log2` 使用有限 float64，范围 `[0,1023]`。Boot profile 的固定输出 scale 仍为整数。
 - inline Encode/Prepare 的 `payload.values` 与 V4 `waterline.device_fractions` 可以出现浮点数。载荷必须能转换成有限 float64；正零和负零在交给 Api 前都转成正零。fraction 必须严格介于 0 和 1。
 - 所有枚举使用规范列出的固定小写字符串。
 
@@ -98,6 +99,15 @@ ValueDesc：
 - `context`、level 范围和 scale 的模数预算必须符合 OperatorSpec。
 - `values` 必须恰好覆盖所有实际出现的 ValueId，未使用的描述也拒绝。
 - external input 必须在 Host，由调用方提供完整 CKKS 值。进入 Device 必须经过显式通信。
+
+V5 的 `scale_log2` 是实际 `log2(Δ)`，不是模数位宽近似的名义账本。
+`rescale_mode=native` 要求 V5 和 OperatorSpec 中的真实 `context.rns_moduli`：
+删除 `qL` 后，`L'=L-1`、`scale_log2'=scale_log2-log2(qL)`。
+Verifier 独立校验实际模数和结果；Poseidon GPU 再校验该模数链与上下文完全一致。
+乘法的实际 scale 对数相加，ModSwitch/通信保持 scale，加法要求实际 scale 对齐。
+Boot 输出独立取所选 profile 的 level/scale/components，不继承输入 scale 或
+`rescalingFactor`。编译器的等位宽调度仍用名义 scale 判断 Rescale 阈值，最终
+导出前才物化实际 scale；插入的编码 1 和乘法均参与正常 placement 与内存规划。
 
 ## 5. 指令、阶段和 SSA
 

@@ -16,6 +16,7 @@ RescaleMode read_rescale_mode(const Json &value, const std::string &path) {
     const std::string mode = read_string(value, doc, path);
     if (mode == "eager") return RescaleMode::Eager;
     if (mode == "lazy") return RescaleMode::Lazy;
+    if (mode == "native") return RescaleMode::Native;
     fail(doc, path, "unknown rescale mode '" + mode + "'");
 }
 
@@ -159,7 +160,7 @@ OperatorSpec read_document(const Json &root) {
 
     const auto &context = root.at("context");
     require_members(context, doc, "$.context",
-                    {"context_id", "poly_degree", "rns_moduli_log2", "max_modulus_log2", "default_scale_log2"});
+                    {"context_id", "poly_degree", "rns_moduli_log2", "max_modulus_log2", "default_scale_log2"}, {"rns_moduli"});
     spec.context_id = read_string(context.at("context_id"), doc, "$.context.context_id");
     spec.poly_degree = read_safe_uint(context.at("poly_degree"), doc, "$.context.poly_degree", 2,
                                       static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()));
@@ -168,6 +169,21 @@ OperatorSpec read_document(const Json &root) {
     if (!moduli.is_array() || moduli.empty()) fail(doc, "$.context.rns_moduli_log2", "expected non-empty array");
     for (std::size_t i = 0; i < moduli.size(); ++i)
         spec.rns_moduli_log2.push_back(read_int(moduli[i], doc, item_path("$.context.rns_moduli_log2", i), 1, 64));
+    if (context.contains("rns_moduli")) {
+        const auto &actual = context.at("rns_moduli");
+        if (!actual.is_array() || actual.size() != moduli.size())
+            fail(doc, "$.context.rns_moduli", "must match the modulus bit-width array");
+        for (std::size_t i = 0; i < actual.size(); ++i) {
+            auto q = read_safe_uint(actual[i], doc, item_path("$.context.rns_moduli", i), 2,
+                                    (std::uint64_t{1} << 53) - 1);
+            int bits = 0;
+            for (auto n = q; n; n >>= 1) ++bits;
+            if (bits != spec.rns_moduli_log2[i]) fail(doc, "$.context.rns_moduli", "modulus bit width mismatch");
+            spec.rns_moduli.push_back(q);
+        }
+    }
+    if (spec.rescale_mode == RescaleMode::Native && spec.rns_moduli.empty())
+        fail(doc, "$.context.rns_moduli", "native Rescale requires the actual modulus chain");
     spec.max_modulus_log2 = read_int(context.at("max_modulus_log2"), doc, "$.context.max_modulus_log2", 1, 64);
     for (int bits : spec.rns_moduli_log2) if (bits > spec.max_modulus_log2)
         fail(doc, "$.context.rns_moduli_log2", "modulus exceeds max_modulus_log2");

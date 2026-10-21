@@ -17,7 +17,7 @@ inline void skip_sequence(Archive<true> &a, std::size_t width) {
     a.check_count(count, width);
     a.skip(count * width);
 }
-inline void skip_instruction(Archive<true> &a) {
+inline void skip_instruction(Archive<true> &a, std::uint32_t version) {
     a.skip(8); // ordinal
     std::uint8_t tag = 0;
     a.number(tag);
@@ -40,7 +40,7 @@ inline void skip_instruction(Archive<true> &a) {
         a.number(attrs);
         constexpr std::size_t widths[] = {0, 4, 8, 4, 17};
         if (attrs > 4) throw std::runtime_error("unknown binary compute attrs");
-        a.skip(widths[attrs]);
+        a.skip(widths[attrs] + (attrs == 2 && version >= 5 ? 4 : 0));
         bool reuse = false;
         a.boolean(reuse);
         if (reuse) a.skip(8);
@@ -87,13 +87,14 @@ inline RuntimePlan read_plan_parallel(std::string_view bytes, unsigned threads,
         if (count > (8ULL << 30) / typed_size) throw std::runtime_error("invalid binary array length");
         return static_cast<std::size_t>(count);
     };
-    const auto values_count = count_array(35, sizeof(ValueDesc));
+    const std::size_t value_width = p.format_version >= 5 ? 39 : 35;
+    const auto values_count = count_array(value_width, sizeof(ValueDesc));
     p.values.resize(values_count);
     for (std::size_t begin = 0; begin < values_count; begin += block_records) {
         const auto count = std::min(block_records, values_count - begin);
         const auto *start = a.cursor();
-        a.skip(count * 35);
-        jobs.push_back({begin, count, {start, count * 35}, nullptr, "values"});
+        a.skip(count * value_width);
+        jobs.push_back({begin, count, {start, count * value_width}, nullptr, "values"});
     }
     a.sequence(p.external_inputs, 8, [&](ValueId &id) { a.number(id); });
     std::size_t phase_index = 0;
@@ -107,7 +108,7 @@ inline RuntimePlan read_plan_parallel(std::string_view bytes, unsigned threads,
             const auto *start = a.cursor();
             for (std::size_t i = 0; i < count; ++i) {
                 const auto offset = static_cast<std::size_t>(a.cursor() - bytes.data());
-                try { skip_instruction(a); }
+                try { skip_instruction(a, p.format_version); }
                 catch (const std::exception &error) {
                     throw std::runtime_error(std::string("binary ") + section + " record #" +
                         std::to_string(begin + i) + " at byte offset " + std::to_string(offset) + ": " + error.what());
@@ -135,7 +136,7 @@ inline RuntimePlan read_plan_parallel(std::string_view bytes, unsigned threads,
                     const auto offset = static_cast<std::size_t>(block.cursor() - bytes.data());
                     try {
                         if (job.instructions) instruction(block, (*job.instructions)[i], p.format_version);
-                        else value_record(block, p.values[i]);
+                        else value_record(block, p.values[i], p.format_version);
                     } catch (const std::exception &error) {
                         throw std::runtime_error(std::string("binary ") + job.section + " record #" +
                             std::to_string(i) + " at byte offset " + std::to_string(offset) + ": " + error.what());

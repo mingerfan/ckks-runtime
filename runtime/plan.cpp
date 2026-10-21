@@ -62,7 +62,7 @@ std::string to_string(Phase p) {
     throw std::runtime_error("unknown phase");
 }
 std::string to_string(RescaleMode mode) {
-    switch (mode) { case RescaleMode::Eager: return "eager"; case RescaleMode::Lazy: return "lazy"; }
+    switch (mode) { case RescaleMode::Eager: return "eager"; case RescaleMode::Lazy: return "lazy"; case RescaleMode::Native: return "native"; }
     throw std::runtime_error("unknown rescale mode");
 }
 std::string to_string(BootImplementation implementation) {
