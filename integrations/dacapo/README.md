@@ -55,6 +55,10 @@ python3 integrations/dacapo/generate_model_artifacts.py resnet20 \
 
 `--boot-placement=optimized|greedy|depth-dp` 选择 Boot 规划算法，默认 optimized。lazy spec 自动在 Earth→CKKS 后、placement 前加入物理 level 换算；默认倍率 4，可用 `--lazy-rescale-level-factor` 修改。倍率必须与逻辑 scale 降幅和真实模数链匹配。
 
+native spec 使用一条逻辑 Rescale 对应一个物理 Q，并保留实际浮点 scale；当前要求等位宽 Q，且 compiler profile 的 `rescalingFactor` 与位宽一致。所有规划算法都从所选 Boot profile 传入输出 scale。optimized 的绕行、覆盖范围和延迟规划使用相同的阈值规则与逐值 Q 状态，不再使用旧 PARS 对齐假设；Boot 计划保留边界和目标，同一值可在不同边界多次刷新。预算不足直接报错，不切换算法。
+
+可用 `python3 tests/dacapo_native_artifact_tests.py --hecate-opt third_party/dacapo/build/nix/bin/hecate-opt` 检查三个规划算法的 native scale45 生成路径；该检查使用显式 trace 和合成 profile，无需运行模型前端或 GPU。
+
 重复调整 placement、通信或内存参数时，可以直接用 `hecate-opt --dacapo-precompile --emit-bytecode` 显式生成未分配设备的 CKKS 检查点，再用 `hecate-opt --ckks-to-runtime-plan` 显式读取它；前半段 Boot 规划只在生成检查点时执行。完整命令和重新生成条件见编译器的[手动检查点说明](../../third_party/dacapo/README.md#manual-compilation-checkpoints)。该接口不自动查找或更新缓存，当前模型生成脚本仍执行完整编译。
 
 `--device-counts=8` 表示一 rank 八卡，`8x8` 表示两 rank 各八卡，`0x0` 表示两个 Host-only CPU rank；零与正数不能混用。不传该参数时生成单 Host 计划。`--communication-profile` 选择[通信代价模型](communication-profile.md)，包括 V2 拓扑与设备对规则。

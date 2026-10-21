@@ -65,8 +65,8 @@ def read_operator_spec(path: Path) -> tuple[dict, str]:
     require_string(spec.get("spec_id"), "$.spec_id")
     require_positive_integer(spec.get("version"), "$.version")
     require_string(spec.get("target_id"), "$.target_id")
-    if spec.get("rescale_mode") not in {"eager", "lazy"}:
-        raise ValueError("$.rescale_mode must be eager or lazy")
+    if spec.get("rescale_mode") not in {"eager", "lazy", "native"}:
+        raise ValueError("$.rescale_mode must be eager, lazy or native")
 
     context = spec.get("context")
     if not isinstance(context, dict):
@@ -129,6 +129,7 @@ def select_boot_profile(spec: dict, profile_id: Optional[str]) -> dict:
     )
     if implementation not in {"native", "decrypt_reencrypt"}:
         raise ValueError("unsupported boot implementation")
+    require_positive_integer(boot.get("output_scale_log2"), "Boot output_scale_log2")
     return boot
 
 
@@ -175,6 +176,7 @@ def build_optimizer_command(args, traced: Path, spec: dict,
         f"--boot-placement={args.boot_placement}",
         f"--ckks-config={compiler_profile}",
         f"--waterline={args.waterline}",
+        f"--bootstrap-scale={boot['output_scale_log2']}",
         "--enable-debug-printer",
         "--mlir-print-debuginfo",
         "--mlir-pretty-debuginfo",
@@ -200,12 +202,12 @@ def build_optimizer_command(args, traced: Path, spec: dict,
     if args.runtime_plan_memory_report:
         command.extend(["--runtime-plan-memory-report",
                         f"--runtime-plan-operator-spec-path={args.placement_operator_spec if args.device_counts else args.operator_spec}"])
-    if spec["rescale_mode"] == "lazy":
+    if spec["rescale_mode"] in {"lazy", "native"}:
         command.extend([
             "--runtime-plan-physical-level-operator-spec-path="
             f"{args.operator_spec}",
             "--runtime-plan-levels-per-logical-level="
-            f"{args.lazy_rescale_level_factor}",
+            f"{1 if spec['rescale_mode'] == 'native' else args.lazy_rescale_level_factor}",
         ])
     if args.device_counts:
         if not args.runtime_plan_memory_report:
@@ -330,6 +332,12 @@ def main() -> None:
     if not compiler_profile.is_file():
         raise FileNotFoundError(f"Dacapo compiler profile not found: {compiler_profile}")
     boot = select_boot_profile(spec, args.boot_profile)
+    if spec["rescale_mode"] == "native":
+        widths = spec["context"].get("rns_moduli_log2", [])
+        parameters = json.loads(compiler_profile.read_text())
+        if (not widths or len(set(widths)) != 1 or
+                parameters.get("rescalingFactor") != widths[0]):
+            raise ValueError("native Rescale requires equal-width Q and matching compiler rescalingFactor")
     if args.device_counts:
         placement_spec, _ = read_operator_spec(args.placement_operator_spec)
         if (args.runtime_plan_memory_report and
