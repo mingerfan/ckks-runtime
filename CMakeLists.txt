@@ -134,6 +134,12 @@ if(CKKS_RUNTIME_BUILD_TESTS)
     ckks_runtime_enable_warnings(runtime_release_tests)
     add_test(NAME runtime_release_tests COMMAND runtime_release_tests)
 
+    add_executable(runtime_host_worker_tests tests/runtime_host_worker_tests.cpp)
+    target_link_libraries(runtime_host_worker_tests PRIVATE ckks_runtime_test_support)
+    ckks_runtime_enable_warnings(runtime_host_worker_tests)
+    add_test(NAME runtime_host_worker_tests COMMAND runtime_host_worker_tests)
+    set_tests_properties(runtime_host_worker_tests PROPERTIES TIMEOUT 30)
+
     add_executable(thread_trace_tests tests/thread_trace_tests.cpp)
     target_link_libraries(thread_trace_tests PRIVATE ckks_runtime_core)
     ckks_runtime_enable_warnings(thread_trace_tests)

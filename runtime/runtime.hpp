@@ -213,7 +213,7 @@ public:
             const auto initialization_start = std::chrono::steady_clock::now();
             timing_.setup_nanoseconds = elapsed_nanoseconds(
                 setup_start, initialization_start);
-            if (!plan_->waterline) {
+            if (!worker_initialization()) {
                 execute_phase(plan_->initialization);
                 finish_all_groups();
             }
@@ -232,7 +232,7 @@ public:
             api_.drain();
             timing_.online_execution_nanoseconds = elapsed_nanoseconds(
                 online_execution_start, std::chrono::steady_clock::now());
-            if (plan_->waterline) timing_.online_execution_nanoseconds -= timing_.initialization_nanoseconds;
+            if (worker_initialization()) timing_.online_execution_nanoseconds -= timing_.initialization_nanoseconds;
             auto artifact = make_artifact(diff_mode);
             store_ = ValueStore<Api>{};
             groups_.clear();
@@ -268,6 +268,11 @@ public:
     }
 
 private:
+    bool worker_initialization() const {
+        return plan_->waterline.has_value() ||
+            (device_execution_mode_ == DeviceExecutionMode::PerDeviceWorkers && local_devices_ == 0);
+    }
+
     void check_memory_instruction_support(DiffMode mode) {
         const auto check_phase = [&](const std::vector<Instruction> &instructions) {
             for (const auto &instruction : instructions) {
@@ -427,7 +432,7 @@ private:
                 }
             }
         };
-        count_phase(plan_->initialization, plan_->waterline.has_value());
+        count_phase(plan_->initialization, worker_initialization());
         const bool parallel = device_execution_mode_ == DeviceExecutionMode::PerDeviceWorkers;
         count_phase(plan_->execution, parallel);
         count_phase(plan_->finalization, parallel);
@@ -792,10 +797,6 @@ private:
         if (return_all_values_)
             throw std::runtime_error(
                 "per-device worker execution does not support AllValuesAfterRun");
-        if (local_devices_ <= 0)
-            throw std::runtime_error(
-                "per-device worker execution requires at least one local device");
-
         for (const auto &item : store_.entries()) {
             const auto *ready =
                 std::get_if<typename ValueStore<Api>::Ready>(&item.second);
@@ -839,8 +840,12 @@ private:
             parallel_failure_ = std::move(failure);
             parallel_failed_.store(true);
         }
-        for (const auto &item : parallel_values_)
+        for (const auto &item : parallel_values_) {
+            // Pair cancellation with the waiter's mutex so a notification
+            // cannot be lost between checking the predicate and sleeping.
+            ThreadTraceLockGuard lock(item.second->mutex, "runtime.parallel_value");
             item.second->condition.notify_all();
+        }
     }
 
     void finish_parallel_group(
@@ -1178,7 +1183,7 @@ private:
             const auto &instruction = instructions[i];
             if (const auto *op = std::get_if<ComputeOp>(&instruction.body)) {
                 if (op->place.rank != rank_) continue;
-                if (op->place.kind == PlaceKind::Host && plan_->format_version < 3)
+                if (local_devices_ > 0 && op->place.kind == PlaceKind::Host && plan_->format_version < 3)
                     throw std::runtime_error("per-device worker Host compute requires V3");
                 if (op->place.kind == PlaceKind::Device &&
                     (op->place.index < 0 || op->place.index >= local_devices_))
@@ -1230,15 +1235,15 @@ private:
             const bool has_cross_rank_destination =
                 is_cross_rank_action(action);
             if (has_cross_rank_destination) {
-                const auto device_endpoint = [](const Place &place) {
-                    return place.kind == PlaceKind::Device;
+                const auto same_backend = [&](const Place &place) {
+                    return place.kind == action.sources.front().kind;
                 };
                 if (!std::all_of(action.sources.begin(), action.sources.end(),
-                                 device_endpoint) ||
+                                 same_backend) ||
                     !std::all_of(action.destinations.begin(),
-                                 action.destinations.end(), device_endpoint))
+                                 action.destinations.end(), same_backend))
                     throw std::runtime_error(
-                        "multi-rank device workers require Device-only online communication");
+                        "cross-rank workers require Host-to-Host or Device-to-Device communication");
                 auto cross_rank_action =
                     cross_rank_communication_slice(action);
                 coordinator_groups_.push_back(make_parallel_group(
@@ -1286,16 +1291,15 @@ private:
                 for (const auto &[id, uses] : uses_) waterline_remaining_[id] = uses.remaining;
             }
         }
-        const std::size_t worker_count =
+        const std::size_t device_workers =
             device_worker_count_ == 0
                 ? static_cast<std::size_t>(local_devices_)
                 : device_worker_count_;
-        if (worker_count == 0 ||
-            worker_count > static_cast<std::size_t>(local_devices_))
+        if (device_workers > static_cast<std::size_t>(local_devices_))
             throw std::runtime_error(
-                "device worker count must be between one and local device count");
+                "device worker count cannot exceed local device count");
         std::vector<const std::vector<Instruction> *> phases;
-        if (plan_->waterline) phases.push_back(&plan_->initialization);
+        if (worker_initialization()) phases.push_back(&plan_->initialization);
         phases.push_back(&plan_->execution);phases.push_back(&plan_->finalization);
         std::unordered_map<ValueId,const Instruction *> preparation_instructions;
         if(waterline_)for(const auto *phase:phases)for(const auto &instruction:*phase)
@@ -1342,7 +1346,8 @@ private:
             std::size_t begin = 0;
             for (std::size_t end = 0; end <= phase->size(); ++end) {
                 if (end != phase->size() && !std::holds_alternative<FenceOp>((*phase)[end].body)) continue;
-                std::vector<std::vector<ParallelTask>> tasks(worker_count + 1);
+                // The last queue is always Host; zero GPUs needs no fake device.
+                std::vector<std::vector<ParallelTask>> tasks(device_workers + 1);
                 compile_parallel_phase(*phase, tasks, begin, end);
                 if (phase == &plan_->finalization && end == phase->size())
                     add_final_output_demands(tasks);
