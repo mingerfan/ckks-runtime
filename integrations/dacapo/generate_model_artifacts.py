@@ -333,11 +333,16 @@ def main() -> None:
         raise FileNotFoundError(f"Dacapo compiler profile not found: {compiler_profile}")
     boot = select_boot_profile(spec, args.boot_profile)
     if spec["rescale_mode"] == "native":
-        widths = spec["context"].get("rns_moduli_log2", [])
-        parameters = json.loads(compiler_profile.read_text())
-        if (not widths or len(set(widths)) != 1 or
-                parameters.get("rescalingFactor") != widths[0]):
-            raise ValueError("native Rescale requires equal-width Q and matching compiler rescalingFactor")
+        context = spec["context"]
+        moduli = context.get("rns_moduli")
+        widths = context.get("rns_moduli_log2")
+        if (not isinstance(moduli, list) or not moduli or
+                not isinstance(widths, list) or len(moduli) != len(widths)):
+            raise ValueError("native Rescale requires an actual Q array matching rns_moduli_log2")
+        for q, bits in zip(moduli, widths):
+            if (type(q) is not int or not 1 < q < (1 << 53) or
+                    type(bits) is not int or q.bit_length() != bits):
+                raise ValueError("native Rescale modulus value does not match its declared bit width")
     if args.device_counts:
         placement_spec, _ = read_operator_spec(args.placement_operator_spec)
         if (args.runtime_plan_memory_report and

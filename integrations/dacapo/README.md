@@ -55,15 +55,15 @@ python3 integrations/dacapo/generate_model_artifacts.py resnet20 \
 
 `--boot-placement=optimized|greedy|depth-dp` 选择 Boot 规划算法，默认 optimized。lazy spec 自动在 Earth→CKKS 后、placement 前加入物理 level 换算；默认倍率 4，可用 `--lazy-rescale-level-factor` 修改。倍率必须与逻辑 scale 降幅和真实模数链匹配。
 
-native spec 使用一条逻辑 Rescale 对应一个物理 Q，并保留实际浮点 scale；当前要求等位宽 Q，且 compiler profile 的 `rescalingFactor` 与位宽一致。所有规划算法都从所选 Boot profile 传入输出 scale。optimized 的绕行、覆盖范围和延迟规划使用相同的阈值规则与逐值 Q 状态，不再使用旧 PARS 对齐假设；Boot 计划保留边界和目标，同一值可在不同边界多次刷新。预算不足直接报错，不切换算法。
+native spec 使用一条逻辑 Rescale 对应一个物理 Q，并保留实际浮点 scale。`context.rns_moduli` 必须给出完整的实际 Q 数组，`rns_moduli_log2` 必须逐项匹配其位宽；支持等位宽和混合位宽链。数组从底部保留素数向上排列，Rescale 从当前有效前缀的末端删除素数。compiler profile 的正值 `rescalingFactor` 保留为兼容字段，不用于 native 的降 scale 计算。所有规划算法都从所选 Boot profile 传入输出 scale。optimized 的绕行、覆盖范围和延迟规划使用相同的阈值规则与逐值 Q 状态；Boot 计划保留边界和目标，同一值可在不同边界多次刷新。预算不足直接报错，不切换算法。
 
-native 的 rescale 时机由当前位置的实际素数决定：只有 `s - log2(q_last) >= waterline` 才继续删除一个 Q。greedy、depth-dp 和 optimized 使用相同的状态推导；分段候选保留实际浮点 scale。整数 IR 类型只承载运算结构，Rescale 结果类型取实际指数的向上取整；计划和运行时使用精确浮点指数。物理转换重新计算并核对出口 scale、实际模数容量和规划所用的 Q 链。native 路径不允许 EarlyModswitch 越过 Rescale，也不执行用固定步长抵消 Rescale 的改写。
+native 的 rescale 时机由当前位置的实际素数决定：只有 `s - log2(q_last) >= waterline` 才继续删除一个 Q。greedy、depth-dp 和 optimized 使用相同的状态推导；分段候选保留实际浮点 scale。整数 IR 类型用于类型检查和编码、对齐的整数部分，Rescale 结果类型取实际指数的向上取整；计划和运行时保留实际浮点指数。物理转换重新计算并核对出口 scale、实际模数容量和规划所用的 Q 链。native 路径不允许 EarlyModswitch 越过 Rescale，也不执行用固定步长抵消 Rescale 的改写。
 
-手动运行 native `--dacapo-precompile` 时，必须同时传入 `--runtime-plan-physical-level-operator-spec-path` 和 `--runtime-plan-boot-profile`，使 Boot 规划阶段就能读取实际 Q 链和出口位置；完整模型生成命令自动传入这两项。未指定 native OperatorSpec 的逻辑预编译继续使用 compiler profile 的固定步长。生成的 native 检查点保留规划 Q 链、Boot 出口位置和实际 scale，后续导出必须匹配。
+手动运行 native `--dacapo-precompile` 时，必须同时传入 `--runtime-plan-physical-level-operator-spec-path`、`--runtime-plan-boot-profile` 和匹配 profile 的 `--bootstrap-scale`，使 Boot 规划阶段就能读取实际 Q 链和出口约定；完整模型生成命令自动传入这三项。未指定 native OperatorSpec 的逻辑预编译继续使用 compiler profile 的固定步长。生成的 native 检查点保留规划 Q 链、Boot 出口位置和实际 scale，后续导出必须匹配。
 
-可用 `python3 third_party/dacapo/test/runtime-plan/check-native-planning.py --hecate-opt third_party/dacapo/build/nix/bin/hecate-opt --source-dir third_party/dacapo` 检查实际素数对 rescale 次数和 Boot 候选可行性的影响。该测试中的混合位宽样例只执行逻辑预编译；标准生成入口和物理转换仍拒绝混合位宽链。
+可用 `python3 third_party/dacapo/test/runtime-plan/check-native-planning.py --hecate-opt third_party/dacapo/build/nix/bin/hecate-opt --source-dir third_party/dacapo` 检查实际素数对 rescale 次数和 Boot 候选可行性的影响，以及混合链的物理转换和错误位宽拒绝行为。
 
-可用 `python3 tests/dacapo_native_artifact_tests.py --hecate-opt third_party/dacapo/build/nix/bin/hecate-opt` 检查三个规划算法的 native scale45 生成路径；该检查使用显式 trace 和合成 profile，无需运行模型前端或 GPU。
+可用 `python3 tests/dacapo_native_artifact_tests.py --hecate-opt third_party/dacapo/build/nix/bin/hecate-opt` 检查三个规划算法在全 30 位、30/31/32 位混合链和手动 ResNet20 Q50 链上的标准生成路径，并验证旧标量因子不影响 native 计划。手动 Q50 链来自 `tests/fixtures/resnet20-manual-q50.json`，该用例只编译普通算子，要求不出现 Boot；这里的输入锚点 profile 不用于验证真实 Boot 的输出层数或精度。测试使用显式 trace，无需运行模型前端或 GPU。
 
 重复调整 placement、通信或内存参数时，可以直接用 `hecate-opt --dacapo-precompile --emit-bytecode` 显式生成未分配设备的 CKKS 检查点，再用 `hecate-opt --ckks-to-runtime-plan` 显式读取它；前半段 Boot 规划只在生成检查点时执行。完整命令和重新生成条件见编译器的[手动检查点说明](../../third_party/dacapo/README.md#manual-compilation-checkpoints)。该接口不自动查找或更新缓存，当前模型生成脚本仍执行完整编译。
 
