@@ -65,6 +65,21 @@ native 的 rescale 时机由当前位置的实际素数决定：只有 `s - log2
 
 可用 `python3 tests/dacapo_native_artifact_tests.py --hecate-opt third_party/dacapo/build/nix/bin/hecate-opt` 检查三个规划算法在全 30 位、30/31/32 位混合链和手动 ResNet20 Q50 链上的标准生成路径，并验证旧标量因子不影响 native 计划。手动 Q50 链来自 `tests/fixtures/resnet20-manual-q50.json`，该用例只编译普通算子，要求不出现 Boot；这里的输入锚点 profile 不用于验证真实 Boot 的输出层数或精度。测试使用显式 trace，无需运行模型前端或 GPU。
 
+手动 ResNet20 Boot 可用 `python3 integrations/dacapo/generate_resnet20_manual_profiles.py /tmp/manual-q50` 生成编译参数和 OperatorSpec。真实入口是 Q6（Runtime level 5）、`input_scale_log2=40`，出口是 Q31（level 30）、scale40。代价表是测试占位数，不是性能测量。GPU 资源必须由 Poseidon 的 `GpuBootstrapProfileBuilder::build_resnet20_manual()` 按同一 Q50/P25 fixture 创建；它执行 S2C-first、degree59/DA2 和系数折叠后的 scale40 出口。
+
+对于声明输入 scale 的 native profile，规划先保守预留两个 Q 供入口对齐。物理转换在 Boot 前插入必要的 ModSwitch，以及编码值为 1 的明文乘法和实际除 Q 的 Rescale；编码 scale 至少保留 30 位。已对齐时不插入乘法/Rescale，精度足够时只消耗一个 Q。若 Q 或模数容量不足则拒绝，不能到运行时才额外扣 Q。可用 `python3 tests/dacapo_manual_boot_tests.py --hecate-opt PATH --output-dir /tmp/manual-boot-check` 检查三种规划算法和入口对齐边界。
+
+上述测试还生成 `scaled-depth-dp` 用例：保留非零的 `0.5*x` 支路，使它在 Boot 前确实需要 scale 对齐。可用 Poseidon 的 GPU 测试程序执行该计划：
+
+```bash
+POSEIDON_RUNTIME_BOOTSTRAP_MANUAL_Q50="$PWD/tests/fixtures/resnet20-manual-q50.json" \
+  /path/to/poseidon_runtime_gpu_plan_e2e \
+  /tmp/manual-boot-check/scaled-depth-dp/mlp.optimized.squares.runtime-plan.json \
+  /tmp/manual-boot-check/operator-spec.json /tmp/manual-gpu-report.json
+```
+
+手动 profile 保留 `arcsine_degree=0`，其输出是正弦近似。测试使用独立的实数运算参考，分别报告相对该映射的执行误差和相对恒等 Boot 的近似误差；前者阈值为 `1e-4`。对齐 scale40 不代表消除了这项正弦近似误差，也不等于已经通过完整 ResNet20 的密态精度验证。
+
 重复调整 placement、通信或内存参数时，可以直接用 `hecate-opt --dacapo-precompile --emit-bytecode` 显式生成未分配设备的 CKKS 检查点，再用 `hecate-opt --ckks-to-runtime-plan` 显式读取它；前半段 Boot 规划只在生成检查点时执行。完整命令和重新生成条件见编译器的[手动检查点说明](../../third_party/dacapo/README.md#manual-compilation-checkpoints)。该接口不自动查找或更新缓存，当前模型生成脚本仍执行完整编译。
 
 `--device-counts=8` 表示一 rank 八卡，`8x8` 表示两 rank 各八卡，`0x0` 表示两个 Host-only CPU rank；零与正数不能混用。不传该参数时生成单 Host 计划。`--communication-profile` 选择[通信代价模型](communication-profile.md)，包括 V2 拓扑与设备对规则。

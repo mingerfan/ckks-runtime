@@ -419,6 +419,9 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                     const auto attrs = std::get<BootAttrs>(op->attrs);
                     const auto &profile = find_boot_profile(spec, attrs.operator_profile);
                     const auto &input = lookup(descs, op->inputs[0], "Boot input");
+                    if (profile.input_scale_log2 &&
+                        !same_scale(input.scale_log2, *profile.input_scale_log2))
+                        fail("Boot input scale does not match OperatorSpec profile");
                     if (profile.implementation != attrs.implementation || input.level < profile.input_level_min ||
                         input.level > profile.input_level_max || input.components != profile.input_components ||
                         attrs.target_level != profile.output_level || attrs.target_scale_log2 != profile.output_scale_log2 ||

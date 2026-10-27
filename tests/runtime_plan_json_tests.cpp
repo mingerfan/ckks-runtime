@@ -10,6 +10,7 @@
 #include "runtime/verifier.hpp"
 
 #include <filesystem>
+#include <algorithm>
 #include <fstream>
 #include <future>
 #include <cmath>
@@ -672,6 +673,33 @@ void test_packed_bundle() {
     std::filesystem::remove_all(temp);
 }
 
+void test_boot_input_scale_contract() {
+    auto loaded = RuntimePlanReader::read_file(testdata("valid", "v006_native_boot_device.json").string());
+    auto spec = load_spec(loaded.plan);
+    const ComputeOp *boot = nullptr;
+    for (const auto &instruction : loaded.plan.execution)
+        if (const auto *op = std::get_if<ComputeOp>(&instruction.body);
+            op && op->kind == ComputeKind::Boot) boot = op;
+    require(boot != nullptr, "native Boot fixture is missing Boot");
+    const auto &attrs = std::get<BootAttrs>(boot->attrs);
+    const auto input = std::find_if(loaded.plan.values.begin(), loaded.plan.values.end(),
+        [&](const ValueDesc &value) { return value.id == boot->inputs[0]; });
+    auto profile = std::find_if(spec.spec.boot_profiles.begin(), spec.spec.boot_profiles.end(),
+        [&](const BootProfile &value) { return value.profile_id == attrs.operator_profile; });
+    require(input != loaded.plan.values.end() && profile != spec.spec.boot_profiles.end(), "Boot fixture metadata is missing");
+    profile->input_scale_log2 = static_cast<int>(input->scale_log2);
+    PlanVerifier::verify(loaded.plan, spec);
+    ++*profile->input_scale_log2;
+    expect_throw([&] { PlanVerifier::verify(loaded.plan, spec); }, "Boot input scale");
+    std::ifstream stream(source_dir / "docs/operator-spec/v1/profiles/poseidon-ckks-gpu.v1.json");
+    auto json = json_utils::Json::parse(stream);
+    json["boot_profiles"][0]["input_scale_log2"] = 40;
+    require(OperatorSpecReader::read_text(json.dump()).spec.boot_profiles[0].input_scale_log2 == 40,
+        "Boot input scale was not read");
+    json["boot_profiles"][0]["input_scale_log2"] = true;
+    expect_throw([&] { OperatorSpecReader::read_text(json.dump()); }, "integer");
+}
+
 } // namespace
 
 int main() {
@@ -683,6 +711,7 @@ int main() {
         run_test("strict JSON and OperatorSpec constraints", test_strict_json_and_operator_spec);
         run_test("strict SAX container parsing", test_strict_sax_containers);
         run_test("Dacapo OperatorSpec V2 profiles", test_dacapo_operator_spec_v2_profiles);
+        run_test("Boot input scale contract", test_boot_input_scale_contract);
         run_test("rank-local bundle loading", test_rank_local_bundle_loading);
         run_test("packed bundle offsets, residency and V3 execution", test_packed_bundle);
         std::cout << "ALL " << tests_run << " JSON TEST GROUPS PASSED\n";

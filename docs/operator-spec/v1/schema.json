@@ -168,6 +168,7 @@
         "input_level_min": { "type": "integer", "minimum": 0 },
         "input_level_max": { "type": "integer", "minimum": 0 },
         "input_components": { "type": "integer", "minimum": 1 },
+        "input_scale_log2": { "type": "integer", "minimum": 1 },
         "output_level": { "type": "integer", "minimum": 0 },
         "output_scale_log2": { "type": "integer", "minimum": 0 },
         "output_components": { "type": "integer", "minimum": 1 },

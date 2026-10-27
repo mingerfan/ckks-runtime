@@ -93,6 +93,7 @@ V1 的 `status` 是 `placeholder` 或 `validated`。`v1/profiles/` 中两份 pos
 
 - `profile_id` 在一份 spec 内唯一。
 - 输入和输出 level 必须落在 `levels` 范围内，输入区间不能反向。
+- 可选的正整数 `input_scale_log2` 声明 Boot 要求的输入 scale 指数；提供时，计划校验器检查输入实际指数与其一致（容差 `1e-8`）。省略表示该 profile 没有额外声明输入 scale 约束。
 - `decrypt_reencrypt` 必须声明需要 secret key 和 Host compute；`native` 两项都必须为 false。
 - `operators.boot.supported` 必须与 `boot_profiles` 是否非空一致。
 - RuntimePlan 的 Boot 必须逐项匹配 implementation、输入范围和输出元信息。

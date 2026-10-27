@@ -31,6 +31,7 @@ struct BootProfile {
     int input_level_min = 0;
     int input_level_max = 0;
     int input_components = 2;
+    std::optional<int> input_scale_log2;
     int output_level = 0;
     int output_scale_log2 = 0;
     int output_components = 2;

@@ -85,12 +85,12 @@ BootProfile read_boot_profile(const Json &value, const std::string &path,
         require_members(value, doc, path,
                         {"profile_id", "implementation", "input_level_min", "input_level_max",
                          "input_components", "output_level", "output_scale_log2", "output_components",
-                         "latency_us", "host_requirements"});
+                         "latency_us", "host_requirements"}, {"input_scale_log2"});
     else
         require_members(value, doc, path,
                         {"profile_id", "implementation", "input_level_min", "input_level_max",
                          "input_components", "output_level", "output_scale_log2", "output_components",
-                         "latency_us_by_input_level", "noise_by_input_level", "host_requirements"});
+                         "latency_us_by_input_level", "noise_by_input_level", "host_requirements"}, {"input_scale_log2"});
     const auto &host = value.at("host_requirements");
     require_members(host, doc, path + ".host_requirements",
                     {"needs_secret_key", "needs_host_compute"});
@@ -100,6 +100,8 @@ BootProfile read_boot_profile(const Json &value, const std::string &path,
     result.input_level_min = read_nonnegative_int(value.at("input_level_min"), doc, path + ".input_level_min");
     result.input_level_max = read_nonnegative_int(value.at("input_level_max"), doc, path + ".input_level_max");
     result.input_components = read_positive_int(value.at("input_components"), doc, path + ".input_components");
+    if (value.contains("input_scale_log2"))
+        result.input_scale_log2 = read_positive_int(value.at("input_scale_log2"), doc, path + ".input_scale_log2");
     result.output_level = read_nonnegative_int(value.at("output_level"), doc, path + ".output_level");
     result.output_scale_log2 = read_nonnegative_int(value.at("output_scale_log2"), doc, path + ".output_scale_log2");
     result.output_components = read_positive_int(value.at("output_components"), doc, path + ".output_components");
@@ -236,6 +238,13 @@ OperatorSpec read_document(const Json &root) {
             output_budget += spec.rns_moduli_log2.at(static_cast<std::size_t>(level));
         if (profile.output_scale_log2 >= output_budget)
             fail(doc, item_path("$.boot_profiles", i), "Boot output scale exceeds modulus budget");
+        if (profile.input_scale_log2) {
+            long long input_budget = 0;
+            for (int level = 0; level <= profile.input_level_min; ++level)
+                input_budget += spec.rns_moduli_log2.at(level);
+            if (*profile.input_scale_log2 >= input_budget)
+                fail(doc, item_path("$.boot_profiles", i), "Boot input scale exceeds modulus budget");
+        }
         if (profile.implementation == BootImplementation::DecryptReencrypt &&
             (!profile.needs_secret_key || !profile.needs_host_compute))
             fail(doc, item_path("$.boot_profiles", i), "decrypt_reencrypt must require secret key and host compute");
