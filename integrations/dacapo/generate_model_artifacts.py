@@ -197,6 +197,10 @@ def build_optimizer_command(args, traced: Path, spec: dict,
     ]
     if args.runtime_plan_memory:
         command.append("--runtime-plan-memory")
+    if args.scale_strategy == "target":
+        command.append("--native-target-scale-planning")
+    if getattr(args, "input_level", None) is not None:
+        command.append(f"--native-input-level={args.input_level}")
     if args.runtime_plan_memory_no_reuse:
         command.append("--runtime-plan-memory-reuse=false")
     if args.runtime_plan_memory_report:
@@ -254,6 +258,10 @@ def main() -> None:
                         default=DACAPO / "build" / "nix" / "bin" / "hecate-opt")
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument("--waterline", type=int, default=40)
+    parser.add_argument("--input-level", type=int,
+                        help="Native initial level, at least the selected Boot output level")
+    parser.add_argument("--scale-strategy", choices=("threshold", "target"), default="threshold",
+                        help="target: experimental backwards native scale planning with greedy or specified Boot boundaries")
     parser.add_argument("--boot-placement", choices=("optimized", "greedy", "depth-dp"),
                         default="optimized",
                         help="Use greedy for lazy refresh or depth-dp for fast depth-boundary planning")
@@ -326,12 +334,19 @@ def main() -> None:
     output_dir = (args.output_dir or
                   (DACAPO / "review_artifacts" / args.model)).resolve()
     spec, spec_digest = read_operator_spec(args.operator_spec)
+    if args.scale_strategy == "target" and (args.boot_placement != "greedy" or spec["rescale_mode"] != "native"):
+        parser.error("target scale strategy requires native moduli and greedy placement")
     compiler_profile = (
         args.compiler_profile or compiler_profile_from_provenance(spec)
     )
     if not compiler_profile.is_file():
         raise FileNotFoundError(f"Dacapo compiler profile not found: {compiler_profile}")
     boot = select_boot_profile(spec, args.boot_profile)
+    if args.input_level is not None and (
+            spec["rescale_mode"] != "native" or
+            args.input_level < boot["output_level"] or
+            args.input_level > spec["levels"]["upper_bound"]):
+        parser.error("input-level must be native, cover the Boot output, and fit the Q chain")
     if spec["rescale_mode"] == "native":
         context = spec["context"]
         moduli = context.get("rns_moduli")
