@@ -61,13 +61,13 @@ optimized 对每个候选切分点只保留累计估算延迟最低的一份方�
 
 默认 `threshold` 策略的 native rescale 时机由当前位置的实际素数决定：只有 `s - log2(q_last) >= waterline` 才继续删除一个 Q。greedy、depth-dp 和 optimized 使用相同的状态推导；分段候选保留实际浮点 scale。整数 IR 类型用于类型检查和编码、对齐的整数部分，Rescale 结果类型取实际指数的向上取整；计划和运行时保留实际浮点指数。物理转换重新计算并核对出口 scale、实际模数容量和规划所用的 Q 链。native 路径不允许 EarlyModswitch 越过 Rescale，也不执行用固定步长抵消 Rescale 的改写。
 
-实验分支增加 `--scale-strategy=target`，默认仍是 `threshold`。target 目前只接受 native 和 `--boot-placement=greedy`，在共享值之间规划算术片段。输入图可用显式 `earth.bootstrap` 连接这些片段；该模式保留显式 Boot，按所选 profile 重置出口 level/scale，并由物理转换对齐 Boot 输入。算术树不能放入当前预算时，局部 greedy 按已消耗 Q 从多到少刷新其共享输入并重新规划；全部刷新后仍不能容纳时直接报错。这个局部插入规则没有全网最优保证。明文操作数须来自片段内的 Constant 编码；可倒推的密文乘法须至少有一侧的 scale 已确定。它在共享值之间倒推输出 level/scale，选择系数明文的实际编码 scale，优先在加法树合并后 rescale，并在下一次乘法前处理尚未归一化的基底。刷新旋转、取负或 `x+x` 分支时，优先刷新其共享源，再重建这些线性操作，避免同一输入的多个线性分支分别 Boot。最后的输出允许使用 Boot 输入层以下、OperatorSpec 仍支持的剩余 Q。后者及实际 scale 跟踪参考 [OpenFHE FLEXIBLEAUTO 示例](https://github.com/openfheorg/openfhe-development/blob/main/src/pke/examples/advanced-real-numbers.cpp)，编译期管理也参考 [EVA](https://github.com/microsoft/EVA)。当前使用有限候选搜索，不保证全局最优。
+规划、物理转换和 RuntimePlan 导出共用 `hecate/Support/ModulusChain.h` 的实际素数计算。每条链预计算一次 `log2(q)` 和前缀和，耗时、内存均为 O(L)；容量和指定区间的 Rescale 降幅查询为 O(1)。阈值归约按实际插入顺序逐次推导，耗时为 O(1 + RS 次数)。Boot 入口对齐共用 `BootstrapInputAlignment.h`，用 O(log L) 找到满足编码精度的最小 Q 前缀，并统一检查容量；已对齐的输入也必须满足目标 Q 的容量要求。`DacapoModulusChain` 测试用逐项计算和穷举核对这些结果。
 
-target 算术片段内的系数和非零 ×1 对齐编码精度至少为 waterline；Boot 输入对齐沿用现有 profile 的至少30 bit单位明文精度。编码 scale=1 的精确常数1可用于兼容整数类型，不产生小数编码误差。实际浮点编码 scale 与整数类型分开传递，规范化及系数吸收不得改写已规划结构。该模式支持上述局部 greedy 自动插入，尚未接入 DaCapo optimized/depth-dp 的联合规划，全网 Boot 次数须直接编译验证。可运行 `python3 tests/dacapo_target_scale_tests.py --hecate-opt PATH --output-dir /tmp/target-scale-check` 检查真实素数方程、系数、共享基底、连续明文乘法、自动 Boot、编码精度和明确拒绝行为；密态精度仍需真实后端测试。
+native 导出在物理 Q 和实际 scale 确定后、设备分配前，默认运行 `coalesce-reduction-rescales`。对于相同来源 Q、实际 scale、类型和 Rescale 序列的 MulCP 乘积，识别直接的 AddCC 归约，把各分支的 Rescale 合并到归约出口。k 个乘积、每支 r 次 RS，可从 k×r 次变为 r 次；出口 Q、实际 scale 和加法顺序保留，路径上的 Q 消耗不因此减少。Boot 位置规划在这之前完成，这个 pass 不与 Boot 联合搜索；逻辑 CKKS 检查点仍保留前面 scale 管理阶段生成的 RS 布局。
 
-可直接向 hecate-opt 传入 `--native-target-bootstrap-schedule=PATH`，验证指定的 JSON Boot 切分，例如 `[[14,14]]` 表示在原始 opid 14 后刷新该值，`[[cut,target1,target2]]` 可刷新该边界的多个值。该模式复用 BootstrapPlacement，并禁止添加额外 Boot；空数组表示验证无 Boot 路径。opid 按删除死分支及多项式优化后的图编号。预算不足直接报错，后续物理转换仍校验每个 Boot 输入的实际 level/scale。
+该 pass 处理逐 Q 的 RS 链，不越过旋转、ModSwitch、Boot、其他乘法或 `sm_fixed` 操作。共享的 RS 支路保持原样；共享加法子树可以在自身出口归约，再供多个用户使用。每个部分和检查实际模数容量，并额外为 k 个归约项预留 `log2(k)` 位；这项检查沿用当前 scale 容量模型，不替代输入值域和完整误差分析。只有省下的 RS 估算延迟大于高 Q 加法增加的延迟，才按 OperatorSpec 代价表合并。更少的 RS 不保证任意多 GPU 调度的总耗时或峰值内存都下降；RS 的舍入位置改变，密态结果也不要求逐位相同。
 
-可直接向 hecate-opt 传入 `--native-target-scale-goals=PATH`，读取原始密文结果 opid 到目标 `log2(scale)` 的 JSON 对象，例如 `{"43":40.1,"85":44}`。这些结果成为算术片段边界；文件由调用方提供，不是编译器自动推导的全网最优 scale。图或前端优化改变时必须重新核对 opid。
+可用 `--runtime-plan-coalesce-rescales=false` 做对照；独立运行时使用 `coalesce-reduction-rescales{operator-spec=PATH}`，输入必须是未分配设备的物理 native CKKS。扫描缓存每个节点的固定大小摘要，修改归约树时使用显式栈，不展开所有前缀或递归遍历长加法链；时间和额外内存为 O(V+E+L)。`DacapoReductionRescales` 覆盖兼容性、容量、共享用户及三种 Boot 策略的完整导出；`test/runtime-plan/benchmark-reduction-rescales.py --hecate-opt PATH --source-dir third_party/dacapo --output-dir /tmp/reduction-bench` 可单独测约一万、十万和百万条已管理指令，耗时包含解析、验证和输出，pass 自身耗时另见生成的 timing 日志。
 
 手动运行 native `--dacapo-precompile` 时，必须同时传入 `--runtime-plan-physical-level-operator-spec-path`、`--runtime-plan-boot-profile` 和匹配 profile 的 `--bootstrap-scale`，使 Boot 规划阶段就能读取实际 Q 链和出口约定；完整模型生成命令自动传入这三项。未指定 native OperatorSpec 的逻辑预编译继续使用 compiler profile 的固定步长。生成的 native 检查点保留规划 Q 链、Boot 出口位置和实际 scale，后续导出必须匹配。
 
@@ -79,7 +79,7 @@ target 算术片段内的系数和非零 ×1 对齐编码精度至少为 waterli
 
 对于声明输入 scale 的 native profile，规划按每个值的实际 level/scale 检查对齐可行性，不固定预留两个 Q。Q31 到 Q6 因而最多可用于 25 次逐 Q Rescale；只有末端 scale 已对齐时才能用满。物理转换与规划共用入口对齐计算，在 Boot 前插入必要的 ModSwitch，以及编码值为 1 的明文乘法和实际除 Q 的 Rescale；编码 scale 至少保留 30 位。已对齐时不插入乘法/Rescale，否则按实际需要消耗一个或更多 Q。若 Q 或模数容量不足则拒绝。可用 `python3 tests/dacapo_manual_boot_tests.py --hecate-opt PATH --output-dir /tmp/manual-boot-check` 检查三种规划算法和入口对齐边界。
 
-默认初始密文与 Boot 出口使用相同 Q 前缀。`generate_model_artifacts.py --input-level=33`（或 hecate-opt 的 `--native-input-level=33`）可让初始密文使用同一实际链的 Q34，Boot 出口仍按 profile 使用 Q31。该值不得低于 Boot 出口或超过 OperatorSpec 上界，实际加密输入必须匹配。检查点独立保存初始锚点和 Boot 出口；此选项不会延长每次 Boot 后的 25Q 预算。可运行 `python3 tests/dacapo_boot_budget_tests.py --hecate-opt PATH --output-dir /tmp/boot-budget-check` 检查满 25Q、按需入口对齐、共享分支和不同初始前缀。
+默认初始密文与 Boot 出口使用相同 Q 前缀。`generate_model_artifacts.py --input-level=33`（或 hecate-opt 的 `--native-input-level=33`）可让初始密文使用同一实际链的 Q34，Boot 出口仍按 profile 使用 Q31。该值不得低于 Boot 出口或超过 OperatorSpec 上界，实际加密输入必须匹配。检查点独立保存初始锚点和 Boot 出口；此选项不会延长每次 Boot 后的 25Q 预算。可运行 `python3 tests/dacapo_boot_budget_tests.py --hecate-opt PATH --output-dir /tmp/boot-budget-check` 检查满 25Q、按需入口对齐、不同初始前缀和已删除选项的明确拒绝。
 
 上述测试还生成 `scaled-depth-dp` 用例：保留非零的 `0.5*x` 支路，使它在 Boot 前确实需要 scale 对齐。可用 Poseidon 的 GPU 测试程序执行该计划：
 
