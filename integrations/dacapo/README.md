@@ -163,10 +163,14 @@ Boot 另按 greedy 规则处理：Q 不足时回到已验证可刷新的存活�
 的边界，同数量时优先较晚边界；已处于 Boot 输出状态的值不重复刷新。Boot 输入
 继续通过公共对齐器满足 profile 的固定 scale。`--regional-scale-report=PATH` 可导出
 选中的区域出口和 Boot 状态；一个文件记录一个函数。
+当前区域 scale 搜索与 greedy 刷新在同一个 Planner 中交替运行，共享存活值的
+Q/scale 状态；尚未拆成可供不同 Boot 规划器复用的独立算术评估接口。
 
 最终输出默认只检查合法性，不强制降到 waterline；末尾没有乘法或 Boot 时，可以
 保留较高 scale，避免额外刷新。若消费者明确要求固定出口，直接调用 `hecate-opt`
 时使用 `--regional-output-scale=40`。该选项与 profile 的固定 Boot 输入要求分开。
+区域算术使用 OperatorSpec 的 `levels.lower_bound`，不受 Boot 入口最低 Q 限制；
+例如手动 Q50 profile 允许计算和输出到 Q5，但 Boot 仍须对齐到 Q6/s40。
 
 固定候选数不等于任意 DAG 上固定成本：运行开销还取决于模数链长度、私有片段内
 的反推查询以及存活边界宽度。编码下限和模数容量检查也不等于全程序密态误差
