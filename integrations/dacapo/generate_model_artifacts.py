@@ -266,7 +266,7 @@ def main() -> None:
                         help="binary for execution; json for readable instructions")
     parser.add_argument("--native-scale-policy", choices=("threshold", "regional"),
                         default="threshold",
-                        help="Use regional with native primes and greedy Boot placement")
+                        help="Use regional with native primes and greedy or optimized Boot placement")
     parser.add_argument("--plan-id", type=int, default=1)
     parser.add_argument("--inline-payload-max-bytes", type=int, default=4096)
     parser.add_argument(
@@ -341,8 +341,8 @@ def main() -> None:
         raise FileNotFoundError(f"Dacapo compiler profile not found: {compiler_profile}")
     boot = select_boot_profile(spec, args.boot_profile)
     if args.native_scale_policy == "regional" and (
-            spec["rescale_mode"] != "native" or args.boot_placement != "greedy"):
-        parser.error("regional scale planning requires native moduli and --boot-placement=greedy")
+            spec["rescale_mode"] != "native" or args.boot_placement == "depth-dp"):
+        parser.error("regional scale planning requires native moduli and greedy or optimized Boot placement")
     if args.input_level is not None and (
             spec["rescale_mode"] != "native" or
             args.input_level < boot["output_level"] or
