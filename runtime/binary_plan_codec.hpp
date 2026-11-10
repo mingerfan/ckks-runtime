@@ -120,7 +120,9 @@ template <bool R> void instruction(Archive<R> &a, Instruction &i, std::uint32_t 
         if constexpr (R)
             i.body = ComputeOp{};
         auto &op = std::get<ComputeOp>(i.body);
-        a.enumeration(op.kind, 11);
+        a.enumeration(op.kind, 12);
+        if (op.kind == ComputeKind::BootStep && version < 6)
+            throw std::runtime_error("binary BootStep requires plan V6");
         a.sequence(op.inputs, 8, [&](ValueId &id) { a.number(id); });
         a.number(op.output);
         place(a, op.place);
@@ -130,6 +132,7 @@ template <bool R> void instruction(Archive<R> &a, Instruction &i, std::uint32_t 
                                       : op.kind == ComputeKind::Rescale   ? 2
                                       : op.kind == ComputeKind::ModSwitch ? 3
                                       : op.kind == ComputeKind::Boot      ? 4
+                                      : op.kind == ComputeKind::BootStep  ? 5
                                                                           : 0;
         if (attrs != expected)
             throw std::runtime_error("binary compute attrs mismatch");
@@ -174,6 +177,26 @@ template <bool R> void instruction(Archive<R> &a, Instruction &i, std::uint32_t 
             a.enumeration(v.implementation, 1);
             if (v.target_level < 0 || v.target_scale_log2 < 0 || v.target_components < 1)
                 throw std::runtime_error("invalid binary boot attrs");
+            break;
+        }
+        case 5: {
+            if constexpr (R)
+                op.attrs = BootStepAttrs{};
+            auto &v = std::get<BootStepAttrs>(op.attrs);
+            a.string_ref(v.operator_profile);
+            a.enumeration(v.step, 11);
+            a.number(v.target_level);
+            a.real(v.target_scale_log2);
+            a.number(v.steps);
+            a.string_ref(v.key);
+            a.number(v.multiplier);
+            a.number(v.count);
+            a.enumeration(v.transform, 2);
+            a.number(v.layer);
+            a.number(v.group);
+            if (v.operator_profile.empty() || v.count < 0 || v.layer < -1 || v.group < -1 ||
+                v.target_level < 0 || v.target_scale_log2 < 0 || v.target_scale_log2 > 1023)
+                throw std::runtime_error("invalid binary boot step attrs");
             break;
         }
         }
@@ -258,6 +281,10 @@ inline Strings collect_strings(const RuntimePlan &p) {
             } else if (const auto *op = std::get_if<ComputeOp>(&i.body)) {
                 if (const auto *attrs = std::get_if<BootAttrs>(&op->attrs))
                     strings.add(attrs->operator_profile);
+                if (const auto *attrs = std::get_if<BootStepAttrs>(&op->attrs)) {
+                    strings.add(attrs->operator_profile);
+                    strings.add(attrs->key);
+                }
             }
         }
     return strings;

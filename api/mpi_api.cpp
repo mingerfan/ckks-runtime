@@ -198,7 +198,7 @@ void MpiVecApi::validate_value(const Value &value, const ValueDesc &expected) co
     const VecMetadata metadata = value.metadata();
     if (value.kind() != expected.kind || metadata.context != expected.context ||
         metadata.degree != poly_degree_ || metadata.level != expected.level ||
-        metadata.scale_log2 != expected.scale_log2 || metadata.ntt != expected.ntt ||
+        !same_scale_log2(metadata.scale_log2, expected.scale_log2) || metadata.ntt != expected.ntt ||
         metadata.components != expected.components)
         throw std::runtime_error("Api value metadata does not match ValueDesc " + std::to_string(expected.id));
 }

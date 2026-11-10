@@ -10,7 +10,7 @@ JSON manifest 使用 UTF-8、严格字段规则，计划通过 `manifest_sha256`
 
 所有载荷必须为非空、有限的 IEEE 754 float64 小端数组，长度是 8 的倍数，解码后的 slot 数不超过 OperatorSpec 的 `poly_degree / 2`。传给 Api 前将负零归一化为正零。
 
-JSON manifest 路径在读取载荷时检查 content SHA-256；二进制 manifest 路径使用 content 作为标识，不重算 payload 哈希。`skip_artifact_digest_checks` 只跳过 JSON manifest 原始字节摘要比较，不跳过其 blob content 校验，也不关闭结构、长度、有限值或容量检查。
+JSON manifest 路径在 open 时按 pack 顺序对本 rank 需要的每个 content 检查一次 SHA-256，之后读取载荷不再重算（不在 required contents 里的 content 仍在读取时检查）；耗时记在 `RuntimeTiming.bundle_verify_nanoseconds`，属于初始化。二进制 manifest 路径使用 content 作为标识，不重算 payload 哈希。`skip_artifact_digest_checks` 只跳过 JSON manifest 原始字节摘要比较，不跳过其 blob content 校验，也不关闭结构、长度、有限值或容量检查。
 
 ## 存储 V1：逐 blob 文件
 
@@ -94,7 +94,7 @@ fhegpu::RuntimeResources resources{
     fhegpu::BundleReadOptions{16ULL * 1024 * 1024 * 1024}};
 ```
 
-预算 0 表示按范围读取文件；正值是 raw 字节驻留上限。超预算、分配失败或对 V1 逐文件布局请求驻留均报错，不自动换模式。预载只读取 raw pack，不进行全量 blob 哈希遍历；随后按需从不可变范围转换为 slots，并按所选 manifest 路径检查载荷。
+预算 0 表示按范围读取文件；正值是 raw 字节驻留上限。超预算、分配失败或对 V1 逐文件布局请求驻留均报错，不自动换模式。预载读取 raw pack；JSON manifest 随后在内存里对本 rank 需要的 blob 做一次哈希检查（见上文），二进制 manifest 不做。之后按需从不可变范围转换为 slots。
 
 V3 在运行期间保留 raw pack，slots 和 RNS 明文仍按 Encode/Release/Fence 生命周期管理。`RuntimeTiming.bundle_resident_bytes` 和 `bundle_resident_load_nanoseconds` 记录驻留量和加载时间。V1/V2 eager load 后保留解码 slots，raw 预载缓冲随 loader 销毁而释放。
 

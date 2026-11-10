@@ -1,5 +1,6 @@
 #pragma once
 
+#include "runtime/execution_config.hpp"
 #include "runtime/plaintext_bundle.hpp"
 #include "runtime/thread_trace.hpp"
 #include "runtime/verifier.hpp"
@@ -21,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <queue>
 #include <sstream>
 #include <set>
 #include <stdexcept>
@@ -63,12 +65,27 @@ struct HasComputeReuse<Api, std::void_t<
         std::declval<typename Api::Value>(),
         std::declval<const std::vector<typename Api::Value> &>()))>> : std::true_type {};
 
+// Whether the Api can say that waiting on a posted handle may be put off: its
+// outputs already carry the completion event consumers wait on, on the device,
+// and nothing is left for the wait to reclaim.  An Api without the method
+// keeps the wait where it has always been.
+template <class Api, class = void>
+struct CanDeferCommunicationWait : std::false_type {};
+
+template <class Api>
+struct CanDeferCommunicationWait<
+    Api, std::void_t<decltype(std::declval<const Api &>().wait_can_be_deferred(
+             std::declval<const typename Api::CommHandle &>()))>>
+    : std::true_type {};
+
 } // namespace detail
 
 namespace detail {
 template<class Api, class = void> struct HasWaterlineApi : std::false_type {};
 template<class Api,class=void>struct HasWaterlineValidation:std::false_type{};
 template<class Api>struct HasWaterlineValidation<Api,std::void_t<decltype(std::declval<Api &>().validate_waterline_resources(std::declval<const RuntimePlan &>()))>>:std::true_type{};
+template<class Api,class=void>struct HasObservePlan:std::false_type{};
+template<class Api>struct HasObservePlan<Api,std::void_t<decltype(std::declval<Api &>().observe_plan(std::declval<const RuntimePlan &>()))>>:std::true_type{};
 template<class Api,class=void>struct HasWaterlineAllocatorCapacity:std::false_type{};
 template<class Api>struct HasWaterlineAllocatorCapacity<Api,std::void_t<decltype(std::declval<Api &>().waterline_allocator_capacity())>>:std::true_type{};
 template<class Api,class=void>struct HasWaterlineFixedResources:std::false_type{};
@@ -82,13 +99,41 @@ template<class Api> struct HasWaterlineApi<Api, std::void_t<
     decltype(std::declval<Api &>().is_ready(std::declval<typename Api::Value &>()))>> : std::true_type {};
 }
 enum class DiffMode { FinalOnly, AllValuesAfterRun };
-enum class DeviceExecutionMode { Sequential, PerDeviceWorkers };
+enum class DeviceExecutionMode {
+    Sequential,
+    PerDeviceWorkers,
+    PerDeviceReadyWorkers,
+    PerDeviceDependencyWorkers
+};
+
+// The one place the file format's mode names are tied to this scheduler's
+// enum.  Kept here rather than in execution_config.cpp so the config header
+// does not have to know what the runtime's scheduler looks like today.
+inline DeviceExecutionMode device_execution_mode_of(const ExecutionConfig &config) {
+    switch (config.runtime.device_execution_mode) {
+        case ConfigDeviceExecutionMode::Sequential:
+            return DeviceExecutionMode::Sequential;
+        case ConfigDeviceExecutionMode::PerDevice:
+            return DeviceExecutionMode::PerDeviceWorkers;
+        case ConfigDeviceExecutionMode::ReadyBackfill:
+            return DeviceExecutionMode::PerDeviceReadyWorkers;
+        case ConfigDeviceExecutionMode::DependencyWorkers:
+            return DeviceExecutionMode::PerDeviceDependencyWorkers;
+    }
+    return DeviceExecutionMode::Sequential;
+}
 
 struct RuntimeResources {
     const LoadedOperatorSpec &operator_spec;
     std::optional<std::filesystem::path> plaintext_bundle_dir;
     bool skip_artifact_digest_checks = false;
     BundleReadOptions plaintext_bundle_options{};
+
+    // Optional sidecar.  When present its binding is checked against the plan
+    // before anything executes; when absent the runtime behaves exactly as it
+    // did before this file existed, which keeps every existing caller working
+    // and keeps "no configuration" a reachable baseline.
+    const LoadedExecutionConfig *execution_config = nullptr;
 };
 
 template <class Value>
@@ -100,10 +145,16 @@ struct RuntimeTiming {
     std::uint64_t encode_nanoseconds = 0, bundle_read_nanoseconds = 0;
     std::uint64_t bundle_read_bytes = 0, raw_peak_bytes = 0, fence_nanoseconds = 0;
     std::uint64_t bundle_resident_bytes = 0, bundle_resident_load_nanoseconds = 0;
+    // JSON manifest: hashing this rank's blobs once when the bundle is opened.
+    std::uint64_t bundle_verify_nanoseconds = 0;
     std::size_t compute_calls = 0;
     std::size_t boot_calls = 0;
     std::uint64_t compute_including_boot_nanoseconds = 0;
     std::uint64_t boot_nanoseconds = 0;
+    // Steps of compiler-expanded Boots (V6). Counted apart from boot_calls,
+    // which stays the number of whole Boot instructions.
+    std::size_t boot_step_calls = 0;
+    std::uint64_t boot_step_nanoseconds = 0;
     std::uint64_t setup_nanoseconds = 0;
     std::uint64_t initialization_nanoseconds = 0;
     std::uint64_t online_execution_nanoseconds = 0;
@@ -111,6 +162,10 @@ struct RuntimeTiming {
     std::size_t communication_wait_calls = 0;
     std::uint64_t communication_post_nanoseconds = 0;
     std::uint64_t communication_wait_nanoseconds = 0;
+    std::size_t device_backfill_tasks = 0;
+    std::size_t device_ready_wait_calls = 0;
+    std::uint64_t device_ready_wait_nanoseconds = 0;
+
     std::uint64_t compute_excluding_boot_nanoseconds() const {
         return compute_including_boot_nanoseconds - boot_nanoseconds;
     }
@@ -183,6 +238,7 @@ public:
         timing_ = RuntimeTiming{};
         ThreadTrace::set_thread_name("rank-" + std::to_string(rank_) + "-main");
         open_trace();
+        open_wait_trace();
         try {
             const auto setup_start = std::chrono::steady_clock::now();
             if (resources.skip_artifact_digest_checks) {
@@ -193,6 +249,12 @@ public:
             const PlanRequirements requirements = PlanVerifier::verify(
                 *plan_, resources.operator_spec, resources.skip_artifact_digest_checks);
             PlanVerifier::verify_runtime_target(*plan_, rank_, world_size_, local_devices_);
+            // Before the bundle is loaded and before any input is bound: a
+            // configuration generated for another plan must not get as far as
+            // touching data.
+            if (resources.execution_config != nullptr)
+                verify_execution_config(*resources.execution_config, loaded_plan, rank_,
+                                        world_size_, local_devices_);
             if (plan_->waterline && device_execution_mode_ != DeviceExecutionMode::PerDeviceWorkers)
                 throw std::runtime_error("Waterline uses the per-device executor; select PerDeviceWorkers");
             if (plan_->waterline && !detail::HasWaterlineApi<Api>::value)
@@ -206,6 +268,9 @@ public:
                            plan_->target, resources.operator_spec.spec, requirements);
             if constexpr(detail::HasWaterlineValidation<Api>::value)
                 if(plan_->waterline)api_.validate_waterline_resources(*plan_);
+            // Optional: an Api may inspect the whole plan (e.g. to defer
+            // linear combinations) before any value is bound or encoded.
+            if constexpr(detail::HasObservePlan<Api>::value)api_.observe_plan(*plan_);
             if constexpr(detail::HasWaterlineAllocatorCapacity<Api>::value)
                 if(plan_->waterline)waterline_allocator_capacity_=api_.waterline_allocator_capacity();
             bind_inputs(local_inputs);
@@ -216,12 +281,20 @@ public:
             if (!worker_initialization()) {
                 execute_phase(plan_->initialization);
                 finish_all_groups();
+                drain_initialization_transfers();
             }
 
             const auto online_execution_start = std::chrono::steady_clock::now();
             timing_.initialization_nanoseconds = elapsed_nanoseconds(
                 initialization_start, online_execution_start);
-            if (device_execution_mode_ == DeviceExecutionMode::PerDeviceWorkers) {
+            trace_event("phase", 0, 0, std::nullopt, "online_start", 0);
+            if (device_execution_mode_ ==
+                DeviceExecutionMode::PerDeviceDependencyWorkers) {
+                execute_dependency_parallel_phases();
+            } else if (device_execution_mode_ ==
+                       DeviceExecutionMode::PerDeviceReadyWorkers) {
+                execute_ready_parallel_phases();
+            } else if (device_execution_mode_ == DeviceExecutionMode::PerDeviceWorkers) {
                 execute_device_parallel_phases();
             } else {
                 execute_phase(plan_->execution);
@@ -233,6 +306,8 @@ public:
             timing_.online_execution_nanoseconds = elapsed_nanoseconds(
                 online_execution_start, std::chrono::steady_clock::now());
             if (worker_initialization()) timing_.online_execution_nanoseconds -= timing_.initialization_nanoseconds;
+            trace_event("phase", 0, 0, std::nullopt, "online_end",
+                        timing_.online_execution_nanoseconds);
             auto artifact = make_artifact(diff_mode);
             store_ = ValueStore<Api>{};
             groups_.clear();
@@ -328,8 +403,13 @@ private:
             path, std::ios::out | std::ios::trunc);
         if (!*runtime_trace_)
             throw std::runtime_error("cannot open Poseidon Runtime trace file");
+        // end_ns is the steady clock the online timing uses, read when the
+        // event is written -- right after the operation returns -- so an
+        // event started at end_ns - duration_ns.  thread tells the submitting
+        // threads apart.  Both let the trace run give a timeline of its own,
+        // without the launch overhead a profiler adds.
         *runtime_trace_
-            << "rank,event,id,ordinal,consumer_ordinal,op,duration_ns\n";
+            << "rank,event,id,ordinal,consumer_ordinal,op,duration_ns,end_ns,thread\n";
         runtime_trace_->flush();
     }
 
@@ -339,11 +419,18 @@ private:
                      std::string_view op,
                      std::uint64_t duration_nanoseconds) {
         if (!runtime_trace_) return;
+        const auto end_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        const std::size_t thread =
+            std::hash<std::thread::id>{}(std::this_thread::get_id());
         ThreadTraceLockGuard lock(trace_mutex_, "runtime.trace");
         *runtime_trace_ << rank_ << ',' << event << ',' << id << ','
                         << ordinal << ',';
         if (consumer_ordinal) *runtime_trace_ << *consumer_ordinal;
-        *runtime_trace_ << ',' << op << ',' << duration_nanoseconds << '\n';
+        *runtime_trace_ << ',' << op << ',' << duration_nanoseconds << ','
+                        << end_ns << ',' << thread << '\n';
         runtime_trace_->flush();
     }
 
@@ -402,6 +489,291 @@ private:
         bool final_output = false;
     };
 
+    enum class ParallelTaskReadiness {
+        Blocked,
+        PendingCommunication,
+        Ready
+    };
+
+    struct DependencyTaskQueue;
+
+    struct DependencyTask {
+        std::uint64_t ordinal = 0;
+        std::vector<ValueId> input_ids;
+        std::function<void()> execute;
+        std::weak_ptr<DependencyTaskQueue> queue;
+        std::size_t queue_position = 0;
+        std::atomic<std::size_t> pending_inputs{0};
+        std::string op_label;
+        bool completed = false;
+    };
+
+    struct DependencyTaskCompare {
+        bool operator()(const std::shared_ptr<DependencyTask> &left,
+                        const std::shared_ptr<DependencyTask> &right) const {
+            return left->ordinal > right->ordinal;
+        }
+    };
+
+    struct DependencyTaskQueue {
+        std::mutex mutex;
+        std::condition_variable condition;
+        std::priority_queue<
+            std::shared_ptr<DependencyTask>,
+            std::vector<std::shared_ptr<DependencyTask>>,
+            DependencyTaskCompare> ready;
+        std::vector<std::shared_ptr<DependencyTask>> tasks;
+        std::size_t next_unfinished = 0;
+        std::size_t completed = 0;
+        bool compute_queue = false;
+        std::size_t index = 0;
+    };
+
+    // Optional dependency-wait tracing. When POSEIDON_RUNTIME_WAIT_TRACE is
+    // set, every worker queue wait is recorded with the instruction it is
+    // blocked on and the producers of its missing inputs, and written as
+    // JSON once parallel execution finishes.
+    struct ValueProducer {
+        std::string queue_kind;
+        std::size_t queue_index = 0;
+        std::uint64_t ordinal = 0;
+        std::string op;
+    };
+
+    struct WaitTraceProducer {
+        ValueId value = 0;
+        std::string queue_kind;
+        std::size_t queue_index = 0;
+        std::uint64_t ordinal = 0;
+        std::string op;
+    };
+
+    struct WaitTraceRecord {
+        std::uint64_t start_ns = 0;
+        std::uint64_t duration_ns = 0;
+        std::string queue_kind;
+        std::size_t queue_index = 0;
+        std::optional<std::uint64_t> waited_ordinal;
+        std::string waited_op;
+        std::vector<ValueId> missing_inputs;
+        std::vector<WaitTraceProducer> producers;
+        std::string wake_reason;
+    };
+
+    void open_wait_trace() {
+        wait_trace_enabled_ = false;
+        wait_trace_records_.clear();
+        const char *trace_path = std::getenv("POSEIDON_RUNTIME_WAIT_TRACE");
+        if (trace_path == nullptr || trace_path[0] == '\0' ||
+            std::string_view(trace_path) == "0")
+            return;
+        std::string path = std::string_view(trace_path) == "1"
+                               ? "/tmp/poseidon-runtime-waits"
+                               : std::string(trace_path);
+        const std::string rank_text = std::to_string(rank_);
+        std::size_t offset = 0;
+        bool replaced = false;
+        while ((offset = path.find("%r", offset)) != std::string::npos) {
+            path.replace(offset, 2, rank_text);
+            offset += rank_text.size();
+            replaced = true;
+        }
+        if (!replaced) path += ".rank" + rank_text + ".json";
+        wait_trace_path_ = std::move(path);
+        wait_trace_enabled_ = true;
+    }
+
+    const char *device_execution_mode_name() const {
+        switch (device_execution_mode_) {
+            case DeviceExecutionMode::Sequential:
+                return "Sequential";
+            case DeviceExecutionMode::PerDeviceWorkers:
+                return "PerDeviceWorkers";
+            case DeviceExecutionMode::PerDeviceReadyWorkers:
+                return "PerDeviceReadyWorkers";
+            case DeviceExecutionMode::PerDeviceDependencyWorkers:
+                return "PerDeviceDependencyWorkers";
+        }
+        return "Unknown";
+    }
+
+    static std::string json_escape(std::string_view text) {
+        std::string escaped;
+        escaped.reserve(text.size());
+        for (const char character : text) {
+            switch (character) {
+                case '"': escaped += "\\\""; break;
+                case '\\': escaped += "\\\\"; break;
+                case '\n': escaped += "\\n"; break;
+                case '\r': escaped += "\\r"; break;
+                case '\t': escaped += "\\t"; break;
+                default: escaped += character; break;
+            }
+        }
+        return escaped;
+    }
+
+    // Snapshot what this queue is blocked on before sleeping: the earliest
+    // unfinished task in program order and which of its inputs are still
+    // un-materialized. Sampled while holding the queue mutex.
+    std::optional<WaitTraceRecord> sample_wait_trace(
+        const std::shared_ptr<DependencyTaskQueue> &queue) {
+        WaitTraceRecord record;
+        record.start_ns = static_cast<std::uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        record.queue_kind = queue->compute_queue ? "compute" : "communication";
+        record.queue_index = queue->index;
+        if (queue->next_unfinished >= queue->tasks.size()) return record;
+        const auto &head = queue->tasks[queue->next_unfinished];
+        record.waited_ordinal = head->ordinal;
+        record.waited_op = head->op_label;
+        for (ValueId id : head->input_ids) {
+            const auto found = parallel_values_.find(id);
+            if (found == parallel_values_.end()) continue;
+            bool materialized = false;
+            {
+                std::lock_guard<std::mutex> lock(found->second->mutex);
+                materialized = found->second->value.has_value();
+            }
+            if (materialized) continue;
+            record.missing_inputs.push_back(id);
+            const auto producer = value_producers_.find(id);
+            if (producer == value_producers_.end()) continue;
+            record.producers.push_back(WaitTraceProducer{
+                id, producer->second.queue_kind, producer->second.queue_index,
+                producer->second.ordinal, producer->second.op});
+        }
+        return record;
+    }
+
+    void record_wait_trace(WaitTraceRecord record) {
+        std::lock_guard<std::mutex> lock(wait_trace_mutex_);
+        wait_trace_records_.push_back(std::move(record));
+    }
+
+    static void write_json_array(std::ostream &out,
+                                 const std::vector<ValueId> &ids) {
+        out << '[';
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            if (i != 0) out << ',';
+            out << ids[i];
+        }
+        out << ']';
+    }
+
+    static void write_json_waited_for(std::ostream &out,
+                                      const WaitTraceRecord &record) {
+        out << "\"waited_for\": ";
+        if (!record.waited_ordinal) {
+            out << "null";
+            return;
+        }
+        out << "{\"ordinal\": " << *record.waited_ordinal
+            << ", \"op\": \"" << json_escape(record.waited_op) << "\"}";
+    }
+
+    static void write_json_producers(std::ostream &out,
+                                     const WaitTraceRecord &record) {
+        out << "\"producers\": [";
+        for (std::size_t i = 0; i < record.producers.size(); ++i) {
+            if (i != 0) out << ',';
+            const auto &producer = record.producers[i];
+            out << "{\"value\": " << producer.value
+                << ", \"queue\": {\"kind\": \"" << producer.queue_kind
+                << "\", \"index\": " << producer.queue_index
+                << "}, \"ordinal\": " << producer.ordinal
+                << ", \"op\": \"" << json_escape(producer.op) << "\"}";
+        }
+        out << ']';
+    }
+
+    void write_wait_trace() {
+        if (!wait_trace_enabled_) return;
+        std::sort(wait_trace_records_.begin(), wait_trace_records_.end(),
+                  [](const WaitTraceRecord &left,
+                     const WaitTraceRecord &right) {
+                      return left.start_ns < right.start_ns;
+                  });
+        std::uint64_t total_ns = 0;
+        std::uint64_t max_ns = 0;
+        std::map<std::pair<std::string, std::size_t>,
+                 std::pair<std::size_t, std::uint64_t>>
+            per_queue;
+        std::map<std::string, std::pair<std::size_t, std::uint64_t>>
+            per_op;
+        for (const auto &record : wait_trace_records_) {
+            total_ns += record.duration_ns;
+            max_ns = std::max(max_ns, record.duration_ns);
+            auto &queue_stats =
+                per_queue[{record.queue_kind, record.queue_index}];
+            ++queue_stats.first;
+            queue_stats.second += record.duration_ns;
+            auto &op_stats = per_op[record.waited_op];
+            ++op_stats.first;
+            op_stats.second += record.duration_ns;
+        }
+        std::ofstream out(wait_trace_path_, std::ios::out | std::ios::trunc);
+        if (!out)
+            throw std::runtime_error(
+                "cannot open Poseidon Runtime wait trace file: " +
+                wait_trace_path_);
+        out << "{\n  \"format_version\": 1,\n";
+        out << "  \"mode\": \"" << device_execution_mode_name() << "\",\n";
+        out << "  \"worker_count\": " << wait_trace_worker_count_ << ",\n";
+        out << "  \"waits\": [\n";
+        for (std::size_t i = 0; i < wait_trace_records_.size(); ++i) {
+            const auto &record = wait_trace_records_[i];
+            out << "    {\"start_ns\": " << record.start_ns
+                << ", \"duration_ns\": " << record.duration_ns
+                << ", \"queue\": {\"kind\": \"" << record.queue_kind
+                << "\", \"index\": " << record.queue_index << "}, ";
+            write_json_waited_for(out, record);
+            out << ", \"missing_inputs\": ";
+            write_json_array(out, record.missing_inputs);
+            out << ", ";
+            write_json_producers(out, record);
+            out << ", \"wake_reason\": \"" << record.wake_reason << "\"}";
+            if (i + 1 != wait_trace_records_.size()) out << ',';
+            out << '\n';
+        }
+        out << "  ],\n  \"summary\": {\n";
+        out << "    \"wait_count\": " << wait_trace_records_.size() << ",\n";
+        out << "    \"total_ns\": " << total_ns << ",\n";
+        out << "    \"max_ns\": " << max_ns << ",\n";
+        out << "    \"mean_ns\": "
+            << (wait_trace_records_.empty()
+                    ? 0
+                    : total_ns / wait_trace_records_.size())
+            << ",\n";
+        out << "    \"per_queue\": [\n";
+        std::size_t queue_count = 0;
+        for (const auto &entry : per_queue) {
+            out << "      {\"kind\": \"" << entry.first.first
+                << "\", \"index\": " << entry.first.second
+                << ", \"count\": " << entry.second.first
+                << ", \"total_ns\": " << entry.second.second << "}";
+            if (++queue_count != per_queue.size()) out << ',';
+            out << '\n';
+        }
+        out << "    ],\n    \"top_stalled_ops\": [\n";
+        std::vector<std::pair<std::string,
+                              std::pair<std::size_t, std::uint64_t>>>
+            ops(per_op.begin(), per_op.end());
+        std::sort(ops.begin(), ops.end(),
+                  [](const auto &left, const auto &right) {
+                      return left.second.second > right.second.second;
+                  });
+        const std::size_t op_count = std::min<std::size_t>(ops.size(), 20);
+        for (std::size_t i = 0; i < op_count; ++i) {
+            out << "      {\"op\": \"" << json_escape(ops[i].first)
+                << "\", \"count\": " << ops[i].second.first
+                << ", \"total_ns\": " << ops[i].second.second << "}";
+            if (i + 1 != op_count) out << ',';
+            out << '\n';
+        }
+        out << "    ]\n  }\n}\n";
+    }
+
     const ValueDesc &desc(ValueId id) const {
         auto found = descriptors_.find(id);
         if (found != descriptors_.end()) return *found->second;
@@ -433,7 +805,9 @@ private:
             }
         };
         count_phase(plan_->initialization, worker_initialization());
-        const bool parallel = device_execution_mode_ == DeviceExecutionMode::PerDeviceWorkers;
+        // Every parallel executor slices a communication per local destination
+        // and submits each slice on its own.
+        const bool parallel = device_execution_mode_ != DeviceExecutionMode::Sequential;
         count_phase(plan_->execution, parallel);
         count_phase(plan_->finalization, parallel);
     }
@@ -472,6 +846,7 @@ private:
                 if (can_clear(value->uses)) value->value.reset();
             }
             value->condition.notify_all();
+            notify_parallel_progress();
         } else {
             uses_.at(id).release_requested = true;
             clear_sequential_value(id);
@@ -538,6 +913,7 @@ private:
                 resources.skip_artifact_digest_checks, resources.plaintext_bundle_options);
             timing_.bundle_resident_bytes = bundle_index_->resident_bytes();
             timing_.bundle_resident_load_nanoseconds = static_cast<std::uint64_t>(bundle_index_->resident_load_seconds() * 1e9);
+            timing_.bundle_verify_nanoseconds = static_cast<std::uint64_t>(bundle_index_->verify_seconds() * 1e9);
             return;
         }
         auto bundle = PlaintextBundleLoader::load(*resources.plaintext_bundle_dir,
@@ -669,6 +1045,9 @@ private:
         if (op.kind == ComputeKind::Boot) {
             ++timing_.boot_calls;
             timing_.boot_nanoseconds += elapsed_nanoseconds;
+        } else if (op.kind == ComputeKind::BootStep) {
+            ++timing_.boot_step_calls;
+            timing_.boot_step_nanoseconds += elapsed_nanoseconds;
         }
         const auto &output_desc = desc(op.output);
         api_.validate_value(output, output_desc);
@@ -829,8 +1208,14 @@ private:
         parallel_values_.clear();
         parallel_groups_.clear();
         coordinator_groups_.clear();
+        parallel_dependency_dependents_.clear();
+        parallel_dependency_queues_.clear();
         parallel_failed_.store(false);
         parallel_failure_ = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(parallel_progress_mutex_);
+            parallel_progress_epoch_ = 0;
+        }
     }
 
     void record_parallel_failure(std::exception_ptr failure) {
@@ -846,6 +1231,64 @@ private:
             ThreadTraceLockGuard lock(item.second->mutex, "runtime.parallel_value");
             item.second->condition.notify_all();
         }
+        notify_parallel_progress();
+        for (const auto &queue : parallel_dependency_queues_)
+            queue->condition.notify_all();
+    }
+
+    void notify_parallel_progress() {
+        if (device_execution_mode_ !=
+            DeviceExecutionMode::PerDeviceReadyWorkers)
+            return;
+        {
+            std::lock_guard<std::mutex> lock(parallel_progress_mutex_);
+            ++parallel_progress_epoch_;
+        }
+        parallel_progress_condition_.notify_all();
+    }
+
+    void enqueue_dependency_task(
+        const std::shared_ptr<DependencyTask> &task) {
+        auto queue = task->queue.lock();
+        if (!queue)
+            throw std::runtime_error(
+                "dependency task lost its execution queue");
+        {
+            std::lock_guard<std::mutex> lock(queue->mutex);
+            queue->ready.push(task);
+        }
+        queue->condition.notify_one();
+    }
+
+    // Called once a value has data.  The dependency workers queue a task when
+    // its last missing input arrives; the other executors have nothing to do.
+    void activate_parallel_dependents(ValueId id) {
+        if (device_execution_mode_ !=
+            DeviceExecutionMode::PerDeviceDependencyWorkers)
+            return;
+        const auto found = parallel_dependency_dependents_.find(id);
+        if (found == parallel_dependency_dependents_.end()) return;
+        for (const auto &task : found->second) {
+            const std::size_t previous =
+                task->pending_inputs.fetch_sub(1, std::memory_order_acq_rel);
+            if (previous == 0)
+                throw std::runtime_error(
+                    "dependency task input was activated twice");
+            if (previous == 1) enqueue_dependency_task(task);
+        }
+    }
+
+    ParallelTaskReadiness parallel_task_readiness(
+        const ParallelTask &task) const {
+        ParallelTaskReadiness readiness = ParallelTaskReadiness::Ready;
+        for (ValueId id : task.inputs) {
+            auto value = parallel_value(id);
+            std::lock_guard<std::mutex> lock(value->mutex);
+            if (!value->defined) return ParallelTaskReadiness::Blocked;
+            if (!value->value)
+                readiness = ParallelTaskReadiness::PendingCommunication;
+        }
+        return readiness;
     }
 
     void finish_parallel_group(
@@ -883,6 +1326,7 @@ private:
             if (group->action.destinations[slot].rank != rank_ && outputs[slot])
                 throw std::runtime_error("Api wait returned a remote parallel output");
 
+        std::vector<ValueId> published;
         for (const auto &local_output : group->local_outputs) {
             const ValueId id = local_output.id;
             if (local_output.action_slot >= group->action.outputs.size() ||
@@ -913,11 +1357,15 @@ private:
                         value->value.emplace(std::move(*output));
                     output.reset();
                     value->group.reset();
+                    published.push_back(id);
                 }
             }
             value->condition.notify_all();
         }
         group->completed = true;
+        lock.unlock();
+        for (ValueId id : published) activate_parallel_dependents(id);
+        notify_parallel_progress();
     }
 
     Value resolve_parallel_value(
@@ -1000,6 +1448,9 @@ private:
             if (op.kind == ComputeKind::Boot) {
                 ++timing_.boot_calls;
                 timing_.boot_nanoseconds += elapsed;
+            } else if (op.kind == ComputeKind::BootStep) {
+                ++timing_.boot_step_calls;
+                timing_.boot_step_nanoseconds += elapsed;
             }
         }
 
@@ -1014,6 +1465,8 @@ private:
             output_value->defined = true;
         }
         output_value->condition.notify_all();
+        activate_parallel_dependents(op.output);
+        notify_parallel_progress();
     }
 
     void execute_parallel_communication(
@@ -1048,6 +1501,8 @@ private:
             group->posted = true;
         }
 
+        bool all_posted = true;
+        std::vector<ValueId> published;
         for (const auto &local_output : group->local_outputs) {
             const auto &value = local_output.value;
             auto &output = posted.at(local_output.action_slot);
@@ -1066,8 +1521,10 @@ private:
                     if (!can_clear(value->uses))
                         value->value.emplace(std::move(*output));
                     output.reset();
+                    published.push_back(local_output.id);
                 } else {
                     value->group = group;
+                    all_posted = false;
                 }
                 value->defined = true;
             }
@@ -1075,6 +1532,26 @@ private:
         }
         local_inputs.clear();
         submitted_parallel_uses(group->local_input_ids);
+        for (ValueId id : published) activate_parallel_dependents(id);
+        if (device_execution_mode_ ==
+            DeviceExecutionMode::PerDeviceDependencyWorkers) {
+            // Waiting here holds this communication worker until the copy has
+            // landed, and holds the consumers until then too, although their
+            // kernels already wait on the copy's completion event on the
+            // device.  Where the wait has nothing to reclaim -- a peer or
+            // same-device copy -- the consumers already have their outputs and
+            // the wait moves to the end of the phase.  A Host-staged copy is
+            // still waited at once, so its pinned buffer is freed as soon as
+            // it can be.
+            bool defer = false;
+            if constexpr (detail::CanDeferCommunicationWait<Api>::value) {
+                ThreadTraceLockGuard lock(
+                    group->mutex, "runtime.parallel_communication_group");
+                defer = all_posted && api_.wait_can_be_deferred(group->handle);
+            }
+            if (!defer) finish_parallel_group(group, std::nullopt);
+        }
+        notify_parallel_progress();
     }
 
     bool is_cross_rank_action(const CommAction &action) const {
@@ -1126,6 +1603,36 @@ private:
             throw std::runtime_error(
                 "local parallel communication has no available device worker");
         return device_place->index;
+    }
+
+    // Destination-following selector kept for PerDeviceDependencyWorkers.
+    //
+    // local_communication_worker() above follows the *source* for D2D copies,
+    // which is what the multi-rank ready path wants: the destination worker
+    // stays free until it consumes the value.  The dependency-driven path
+    // schedules on the consumer instead, so it wants the destination, and it
+    // accepts multi-output actions rather than one pre-sliced slot.  The two
+    // modes genuinely differ here; sharing one selector would silently change
+    // whichever mode did not pick the policy.
+    int parallel_communication_worker(const CommAction &action) const {
+        std::optional<int> worker;
+        const auto select = [&](const Place &place) {
+            if (place.rank != rank_ || place.kind != PlaceKind::Device) return;
+            if (place.index < 0 || place.index >= local_devices_)
+                throw std::runtime_error(
+                    "parallel communication uses an unavailable device");
+            if (worker && *worker != place.index)
+                throw std::runtime_error(
+                    "parallel communication cannot own outputs on multiple devices");
+            worker = place.index;
+        };
+        for (const Place &destination : action.destinations) select(destination);
+        if (!worker)
+            for (const Place &source : action.sources) select(source);
+        if (!worker)
+            throw std::runtime_error(
+                "parallel communication has no local device worker");
+        return *worker;
     }
 
     CommAction local_communication_slice(const CommAction &action,
@@ -1269,6 +1776,444 @@ private:
                     }, &instruction, group->action.inputs, group->action.outputs});
             }
         }
+    }
+
+    // The two executors carried over from the measured search backend run the
+    // online phases as they are: Compute, Transfer and Release.  An online
+    // Encode, a lazy Prepare, a Fence or a Host compute needs the shared
+    // dispatcher of PerDeviceWorkers; refusing them here is cheaper than a
+    // value that is never produced.
+    void require_worker_executable(const char *mode) const {
+        if (plan_->waterline)
+            throw std::runtime_error(std::string(mode) + " does not run Waterline plans");
+        for (const auto *phase : {&plan_->execution, &plan_->finalization})
+            for (const auto &instruction : *phase) {
+                const char *what = nullptr;
+                if (std::holds_alternative<EncodeOp>(instruction.body)) what = "online Encode";
+                else if (std::holds_alternative<PreparePlaintextOp>(instruction.body)) what = "PreparePlaintext";
+                else if (std::holds_alternative<FenceOp>(instruction.body)) what = "Fence";
+                else if (const auto *op = std::get_if<ComputeOp>(&instruction.body);
+                         op && op->place.rank == rank_ && op->place.kind != PlaceKind::Device)
+                    what = "Host compute";
+                if (what)
+                    throw std::runtime_error(std::string(mode) + " does not support " + what +
+                                             " (instruction #" +
+                                             std::to_string(instruction.ordinal) + ")");
+            }
+    }
+
+    std::size_t parallel_worker_count() const {
+        const std::size_t worker_count =
+            device_worker_count_ == 0
+                ? static_cast<std::size_t>(local_devices_)
+                : device_worker_count_;
+        if (worker_count == 0 ||
+            worker_count > static_cast<std::size_t>(local_devices_))
+            throw std::runtime_error(
+                "device worker count must be between one and local device count");
+        return worker_count;
+    }
+
+    void append_dependency_task(
+        const std::shared_ptr<DependencyTaskQueue> &queue,
+        std::uint64_t ordinal, std::vector<ValueId> input_ids,
+        std::string op_label, std::function<void()> execute) {
+        auto task = std::make_shared<DependencyTask>();
+        task->ordinal = ordinal;
+        task->input_ids = std::move(input_ids);
+        task->execute = std::move(execute);
+        task->queue = queue;
+        task->queue_position = queue->tasks.size();
+        task->op_label = std::move(op_label);
+        queue->tasks.push_back(std::move(task));
+    }
+
+    void compile_dependency_phase(
+        const std::vector<Instruction> &instructions,
+        const std::vector<std::shared_ptr<DependencyTaskQueue>> &compute_queues,
+        const std::vector<std::shared_ptr<DependencyTaskQueue>> &communication_queues) {
+        for (const auto &instruction : instructions) {
+            if (const auto *op = std::get_if<ComputeOp>(&instruction.body)) {
+                if (op->place.rank != rank_) continue;
+                if (op->place.kind != PlaceKind::Device ||
+                    op->place.index < 0 || op->place.index >= local_devices_)
+                    throw std::runtime_error(
+                        "dependency worker execution requires Device compute operations");
+                auto output = define_parallel_value(
+                    op->output, desc(op->output).place);
+                const std::size_t worker =
+                    static_cast<std::size_t>(op->place.index) %
+                    compute_queues.size();
+                append_dependency_task(
+                    compute_queues[worker], instruction.ordinal, op->inputs,
+                    to_string(op->kind),
+                    [this, op = *op, ordinal = instruction.ordinal, output] {
+                        execute_parallel_compute(op, ordinal, output);
+                    });
+                value_producers_[op->output] = ValueProducer{
+                    "compute", worker, instruction.ordinal, to_string(op->kind)};
+                continue;
+            }
+            if (const auto *release = std::get_if<ReleaseOp>(&instruction.body)) {
+                // Bookkeeping only: it marks the value releasable once it has
+                // data, and the last submitted consumer drops it.  It runs on
+                // the queue of the device that holds the value.
+                const auto &place = desc(release->value).place;
+                if (place.rank != rank_) continue;
+                const std::size_t worker =
+                    place.kind == PlaceKind::Device
+                        ? static_cast<std::size_t>(place.index) % compute_queues.size()
+                        : 0;
+                append_dependency_task(
+                    compute_queues[worker], instruction.ordinal, {release->value},
+                    "Release",
+                    [this, id = release->value, ordinal = instruction.ordinal] {
+                        execute_release(id, ordinal, true);
+                    });
+                continue;
+            }
+            const auto *found = std::get_if<CommAction>(&instruction.body);
+            if (found == nullptr)
+                throw std::runtime_error(
+                    "dependency worker execution met an unsupported instruction #" +
+                    std::to_string(instruction.ordinal));
+            const auto &action = *found;
+            if (action.sources.empty() || action.sources.front().rank != rank_ ||
+                is_cross_rank_action(action))
+                throw std::runtime_error(
+                    "dependency worker execution supports single-rank communication only");
+            // One task per destination, as the other parallel executors do: a
+            // Replicate to several devices lands each copy on the queue of the
+            // device that consumes it.
+            for (std::size_t slot = 0; slot < action.outputs.size(); ++slot) {
+                CommAction local = local_communication_slice(action, slot);
+                // Built by the factory rather than by hand: local_outputs is a
+                // vector<ParallelOutput>, and the factory is what registers
+                // the group in parallel_groups_.
+                auto group =
+                    make_parallel_group(local, instruction.ordinal, false);
+                const int device = parallel_communication_worker(local);
+                const std::size_t worker =
+                    static_cast<std::size_t>(device) % communication_queues.size();
+                value_producers_[local.outputs.front()] = ValueProducer{
+                    "communication", worker, instruction.ordinal,
+                    to_string(action.kind)};
+                append_dependency_task(
+                    communication_queues[worker], instruction.ordinal,
+                    group->local_input_ids, to_string(action.kind),
+                    [this, local = std::move(local), ordinal = instruction.ordinal, group] {
+                        execute_parallel_communication(local, ordinal, group);
+                    });
+            }
+        }
+    }
+
+    void initialize_dependency_tasks() {
+        for (const auto &queue : parallel_dependency_queues_) {
+            for (const auto &task : queue->tasks) {
+                std::size_t pending = 0;
+                for (ValueId id : task->input_ids) {
+                    auto value = parallel_value(id);
+                    bool materialized = false;
+                    {
+                        std::lock_guard<std::mutex> lock(value->mutex);
+                        materialized = value->value.has_value();
+                    }
+                    if (materialized) continue;
+                    ++pending;
+                    parallel_dependency_dependents_[id].push_back(task);
+                }
+                task->pending_inputs.store(pending, std::memory_order_release);
+            }
+        }
+        for (const auto &queue : parallel_dependency_queues_)
+            for (const auto &task : queue->tasks)
+                if (task->pending_inputs.load(std::memory_order_acquire) == 0)
+                    enqueue_dependency_task(task);
+    }
+
+    void execute_dependency_task_queue(
+        const std::shared_ptr<DependencyTaskQueue> &queue) {
+        for (;;) {
+            std::shared_ptr<DependencyTask> task;
+            bool backfilled = false;
+            std::uint64_t wait_elapsed = 0;
+            std::optional<WaitTraceRecord> wait_trace;
+            {
+                std::unique_lock<std::mutex> lock(queue->mutex);
+                if (queue->ready.empty() &&
+                    queue->completed != queue->tasks.size() &&
+                    !parallel_failed_.load()) {
+                    if (wait_trace_enabled_)
+                        wait_trace = sample_wait_trace(queue);
+                    const auto wait_start = std::chrono::steady_clock::now();
+                    queue->condition.wait(lock, [&] {
+                        return parallel_failed_.load() ||
+                               !queue->ready.empty() ||
+                               queue->completed == queue->tasks.size();
+                    });
+                    wait_elapsed = elapsed_nanoseconds(
+                        wait_start, std::chrono::steady_clock::now());
+                    if (wait_trace) {
+                        wait_trace->duration_ns = wait_elapsed;
+                        wait_trace->wake_reason =
+                            queue->completed == queue->tasks.size()
+                                ? "completed"
+                                : (parallel_failed_.load() ? "failed"
+                                                           : "task_enqueued");
+                        record_wait_trace(std::move(*wait_trace));
+                    }
+                }
+                if (parallel_failed_.load()) return;
+                if (queue->completed == queue->tasks.size()) return;
+                if (queue->ready.empty())
+                    throw std::runtime_error(
+                        "dependency task queue woke without a ready task");
+
+                task = queue->ready.top();
+                queue->ready.pop();
+                backfilled = task->queue_position != queue->next_unfinished;
+                task->completed = true;
+                ++queue->completed;
+                while (queue->next_unfinished < queue->tasks.size() &&
+                       queue->tasks[queue->next_unfinished]->completed)
+                    ++queue->next_unfinished;
+            }
+
+            if (wait_elapsed != 0) {
+                // Count both compute and communication queue waits so the
+                // metric matches the total time workers spent blocked.
+                std::lock_guard<std::mutex> lock(parallel_timing_mutex_);
+                ++timing_.device_ready_wait_calls;
+                timing_.device_ready_wait_nanoseconds += wait_elapsed;
+            }
+            if (backfilled) {
+                std::lock_guard<std::mutex> lock(parallel_timing_mutex_);
+                ++timing_.device_backfill_tasks;
+            }
+            task->execute();
+        }
+    }
+
+    void execute_dependency_parallel_phases() {
+        prepare_parallel_values();
+        require_worker_executable("PerDeviceDependencyWorkers");
+        const std::size_t worker_count = parallel_worker_count();
+
+        std::vector<std::shared_ptr<DependencyTaskQueue>> compute_queues;
+        std::vector<std::shared_ptr<DependencyTaskQueue>> communication_queues;
+        compute_queues.reserve(worker_count);
+        communication_queues.reserve(worker_count);
+        parallel_dependency_queues_.reserve(worker_count * 2);
+        for (std::size_t worker = 0; worker < worker_count; ++worker) {
+            auto compute_queue = std::make_shared<DependencyTaskQueue>();
+            compute_queue->compute_queue = true;
+            compute_queue->index = worker;
+            compute_queues.push_back(compute_queue);
+            parallel_dependency_queues_.push_back(std::move(compute_queue));
+
+            auto communication_queue = std::make_shared<DependencyTaskQueue>();
+            communication_queue->index = worker;
+            communication_queues.push_back(communication_queue);
+            parallel_dependency_queues_.push_back(
+                std::move(communication_queue));
+        }
+
+        wait_trace_worker_count_ = worker_count;
+        value_producers_.clear();
+        compile_dependency_phase(
+            plan_->execution, compute_queues, communication_queues);
+        compile_dependency_phase(
+            plan_->finalization, compute_queues, communication_queues);
+        initialize_dependency_tasks();
+
+        std::vector<std::thread> workers;
+        workers.reserve(parallel_dependency_queues_.size());
+        for (const auto &queue : parallel_dependency_queues_) {
+            workers.emplace_back([this, queue] {
+                ThreadTrace::set_thread_name(
+                    "rank-" + std::to_string(rank_) +
+                    (queue->compute_queue ? "-compute-worker-" : "-communication-worker-") +
+                    std::to_string(queue->index));
+                try {
+                    execute_dependency_task_queue(queue);
+                } catch (...) {
+                    record_parallel_failure(std::current_exception());
+                }
+            });
+        }
+        for (auto &worker : workers) worker.join();
+        write_wait_trace();
+        if (parallel_failed_.load()) {
+            std::lock_guard<std::mutex> lock(parallel_failure_mutex_);
+            std::rethrow_exception(parallel_failure_);
+        }
+
+        for (ValueId id : plan_->final_outputs) {
+            const auto &output_desc = desc(id);
+            if (output_desc.place.rank != rank_) continue;
+            Value output = resolve_parallel_value(
+                id, output_desc.place, std::nullopt);
+            store_.define_ready(id, output_desc.place, std::move(output));
+        }
+        // The waits put off at post time.  Every copy has long landed by now,
+        // so this only confirms completion.
+        for (const auto &group : parallel_groups_)
+            if (!group->completed) finish_parallel_group(group, std::nullopt);
+        for (const auto &group : parallel_groups_)
+            if (!group->completed)
+                throw std::runtime_error(
+                    "dependency communication did not complete");
+        parallel_groups_.clear();
+        parallel_dependency_queues_.clear();
+        parallel_dependency_dependents_.clear();
+    }
+
+    void execute_ready_parallel_tasks(std::vector<ParallelTask> &tasks) {
+        std::vector<bool> completed(tasks.size(), false);
+        std::size_t remaining = tasks.size();
+        while (remaining != 0) {
+            if (parallel_failed_.load()) return;
+
+            std::uint64_t observed_epoch = 0;
+            {
+                std::lock_guard<std::mutex> lock(parallel_progress_mutex_);
+                observed_epoch = parallel_progress_epoch_;
+            }
+
+            std::optional<std::size_t> first_unfinished;
+            std::optional<std::size_t> pending_communication;
+            std::optional<std::size_t> selected;
+            for (std::size_t index = 0; index < tasks.size(); ++index) {
+                if (completed[index]) continue;
+                if (!first_unfinished) first_unfinished = index;
+                const auto readiness = parallel_task_readiness(tasks[index]);
+                if (readiness == ParallelTaskReadiness::Ready) {
+                    selected = index;
+                    break;
+                }
+                if (readiness == ParallelTaskReadiness::PendingCommunication &&
+                    !pending_communication)
+                    pending_communication = index;
+            }
+            if (!selected) selected = pending_communication;
+
+            if (selected) {
+                if (first_unfinished && *selected != *first_unfinished) {
+                    std::lock_guard<std::mutex> lock(parallel_timing_mutex_);
+                    ++timing_.device_backfill_tasks;
+                }
+                completed[*selected] = true;
+                tasks[*selected].execute();
+                --remaining;
+                continue;
+            }
+
+            const auto wait_start = std::chrono::steady_clock::now();
+            {
+                std::unique_lock<std::mutex> lock(parallel_progress_mutex_);
+                parallel_progress_condition_.wait(lock, [&] {
+                    return parallel_failed_.load() ||
+                           parallel_progress_epoch_ != observed_epoch;
+                });
+            }
+            const auto wait_elapsed = elapsed_nanoseconds(
+                wait_start, std::chrono::steady_clock::now());
+            {
+                std::lock_guard<std::mutex> lock(parallel_timing_mutex_);
+                ++timing_.device_ready_wait_calls;
+                timing_.device_ready_wait_nanoseconds += wait_elapsed;
+            }
+        }
+    }
+
+    // Per-device lists, as PerDeviceWorkers ran them before the shared
+    // dispatcher: each worker takes the earliest task whose inputs are ready,
+    // and only waits when none is.
+    void execute_ready_parallel_phases() {
+        prepare_parallel_values();
+        require_worker_executable("PerDeviceReadyWorkers");
+        const std::size_t worker_count = parallel_worker_count();
+        // compile_parallel_phase keeps its last queue for the CPU worker.  The
+        // check above leaves only Releases of Host values there; they are
+        // bookkeeping, so worker 0 takes them in program order.
+        std::vector<std::vector<ParallelTask>> tasks(worker_count + 1);
+        compile_parallel_phase(plan_->execution, tasks, 0, plan_->execution.size());
+        compile_parallel_phase(plan_->finalization, tasks, 0, plan_->finalization.size());
+        for (auto &task : tasks.back()) {
+            if (!std::holds_alternative<ReleaseOp>(task.instruction->body))
+                throw std::runtime_error("PerDeviceReadyWorkers produced Host-side tasks");
+            tasks.front().push_back(std::move(task));
+        }
+        tasks.pop_back();
+        std::stable_sort(tasks.front().begin(), tasks.front().end(),
+                         [](const ParallelTask &left, const ParallelTask &right) {
+                             return left.instruction->ordinal < right.instruction->ordinal;
+                         });
+
+        std::vector<std::thread> workers;
+        workers.reserve(tasks.size());
+        for (std::size_t device = 0; device < tasks.size(); ++device) {
+            workers.emplace_back([this, &tasks, device] {
+                ThreadTrace::set_thread_name(
+                    "rank-" + std::to_string(rank_) + "-device-worker-" +
+                    std::to_string(device));
+                try {
+                    execute_ready_parallel_tasks(tasks[device]);
+                } catch (...) {
+                    record_parallel_failure(std::current_exception());
+                }
+            });
+        }
+        std::thread communication_issuer;
+        if constexpr (detail::UsesBackgroundCommunicationIssuer<Api>::value) {
+            communication_issuer = std::thread([this] {
+                ThreadTrace::set_thread_name(
+                    "rank-" + std::to_string(rank_) +
+                    "-communication-issuer");
+                try {
+                    for (const auto &group : coordinator_groups_) {
+                        if (parallel_failed_.load()) return;
+                        execute_parallel_communication(
+                            group->action, group->instruction_ordinal, group);
+                    }
+                } catch (...) {
+                    record_parallel_failure(std::current_exception());
+                }
+            });
+        } else {
+            try {
+                for (const auto &group : coordinator_groups_) {
+                    if (parallel_failed_.load()) break;
+                    execute_parallel_communication(
+                        group->action, group->instruction_ordinal, group);
+                    finish_parallel_group(group, std::nullopt);
+                }
+            } catch (...) {
+                record_parallel_failure(std::current_exception());
+            }
+        }
+        for (auto &worker : workers) worker.join();
+        if (communication_issuer.joinable()) communication_issuer.join();
+        if (parallel_failed_.load()) {
+            ThreadTraceLockGuard lock(
+                parallel_failure_mutex_, "runtime.parallel_failure");
+            std::rethrow_exception(parallel_failure_);
+        }
+
+        for (const auto &group : parallel_groups_)
+            if (!group->completed)
+                finish_parallel_group(group, std::nullopt);
+
+        for (ValueId id : plan_->final_outputs) {
+            const auto &output_desc = desc(id);
+            if (output_desc.place.rank != rank_) continue;
+            Value output = resolve_parallel_value(
+                id, output_desc.place, std::nullopt);
+            store_.define_ready(id, output_desc.place, std::move(output));
+        }
+        parallel_groups_.clear();
+        coordinator_groups_.clear();
     }
 
     void execute_device_parallel_phases() {
@@ -1770,9 +2715,17 @@ private:
                         throw std::runtime_error("executor has no runnable producer: dependency/order invariant violated");
                     }
                     // Host submissions wake the dispatcher immediately. Only
-                    // GPU completions (without a host notifier) need timed polls.
+                    // GPU completions (without a host notifier) need timed polls;
+                    // the interval bounds how late a completion-gated admission
+                    // starts (POSEIDON_RUNTIME_DISPATCH_POLL_US, default 100;
+                    // 20 measured no different on the 4090).
+                    static const auto poll_interval = [] {
+                        const char *raw = std::getenv("POSEIDON_RUNTIME_DISPATCH_POLL_US");
+                        long value = raw == nullptr || *raw == '\0' ? 100 : std::strtol(raw, nullptr, 10);
+                        return std::chrono::microseconds(value > 0 ? value : 100);
+                    }();
                     std::unique_lock<std::mutex> lock(dispatcher_mutex);
-                    dispatcher_condition.wait_for(lock,std::chrono::microseconds(100),[&] {
+                    dispatcher_condition.wait_for(lock,poll_interval,[&] {
                         return submission_changed || parallel_failed_.load();
                     });
                 }
@@ -1790,6 +2743,26 @@ private:
         for (std::size_t i = 0; i < groups_.size(); ++i) finish_group(i);
         // finish_group replaces every Pending entry before indices are reused.
         groups_.clear();
+    }
+
+    // An upload publishes its output as soon as the copy is submitted, so when
+    // the initialization phase ends its transfers can still be in flight: the
+    // CUDA events are unsynchronized and the pinned staging buffers are still
+    // allocated.  Whoever drops the last reference pays for both, and that was
+    // the end of the online phase -- 122 cudaFreeHost calls, ~170 ms of a
+    // 1,470 ms single-card measurement, none of it computation.  Draining the
+    // transfers here charges them to initialization, where the work belongs.
+    // The ids are collected first because ensure_ready() may touch the store;
+    // a value already released has nothing left to drain.
+    void drain_initialization_transfers() {
+        std::vector<std::pair<ValueId, Place>> initialized;
+        initialized.reserve(store_.entries().size());
+        for (const auto &item : store_.entries())
+            if (const auto *ready =
+                    std::get_if<typename ValueStore<Api>::Ready>(&item.second))
+                initialized.emplace_back(item.first, ready->place);
+        for (const auto &item : initialized)
+            api_.synchronize(ensure_ready(item.first, item.second));
     }
 
     void synchronize_final_outputs() {
@@ -1837,6 +2810,8 @@ private:
                 out << " op=Fence";
             else if (const auto *release = std::get_if<ReleaseOp>(&current_->body))
                 out << " op=Release value_id=" << release->value;
+            else if (const auto *prepare = std::get_if<PreparePlaintextOp>(&current_->body))
+                out << " op=PreparePlaintext output=" << prepare->output;
             else {
                 const auto &action = std::get<CommAction>(current_->body);
                 out << " op=" << to_string(action.kind) << " transfer_id=" << action.id;
@@ -1864,13 +2839,27 @@ private:
     std::unordered_map<ValueId, std::shared_ptr<ParallelValue>> parallel_values_;
     std::vector<std::shared_ptr<ParallelGroup>> parallel_groups_;
     std::vector<std::shared_ptr<ParallelGroup>> coordinator_groups_;
+    std::unordered_map<
+        ValueId, std::vector<std::shared_ptr<DependencyTask>>>
+        parallel_dependency_dependents_;
+    std::vector<std::shared_ptr<DependencyTaskQueue>>
+        parallel_dependency_queues_;
     RuntimeTiming timing_;
     std::unique_ptr<std::ofstream> runtime_trace_;
     std::mutex trace_mutex_;
+    bool wait_trace_enabled_ = false;
+    std::string wait_trace_path_;
+    std::size_t wait_trace_worker_count_ = 0;
+    std::vector<WaitTraceRecord> wait_trace_records_;
+    std::mutex wait_trace_mutex_;
+    std::unordered_map<ValueId, ValueProducer> value_producers_;
     std::mutex parallel_timing_mutex_;
     std::atomic<bool> parallel_failed_{false};
     std::mutex parallel_failure_mutex_;
     std::exception_ptr parallel_failure_;
+    std::mutex parallel_progress_mutex_;
+    std::condition_variable parallel_progress_condition_;
+    std::uint64_t parallel_progress_epoch_ = 0;
     bool return_all_values_ = false;
 };
 

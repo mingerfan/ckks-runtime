@@ -166,6 +166,7 @@ PlaintextBundleLoader PlaintextBundleLoader::open(
         data->resident_load_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     }
     result.packed_ = std::move(data);
+    result.verify_contents(required_contents);
     return result;
 }
 
@@ -177,46 +178,80 @@ double PlaintextBundleLoader::resident_load_seconds() const {
     return packed_ ? packed_->resident_load_seconds : 0;
 }
 
+double PlaintextBundleLoader::verify_seconds() const { return verify_seconds_; }
+
+// A JSON manifest names each blob by the SHA-256 of its bytes. For a pack,
+// open() checks every blob this rank needs once, in pack order, so that the
+// reads during the online phase -- a waterline plan streams its plaintexts
+// there -- do not each hash their blob again. A content outside
+// required_contents, and every blob of a per-file (format 1) bundle, whose
+// files are only opened when read, is still checked when it is read.
+void PlaintextBundleLoader::verify_contents(const std::vector<std::string> &contents) {
+    if (!verify_blob_digest_ || !packed_ || contents.empty()) return;
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<const std::pair<const std::string, Entry> *> pending;
+    pending.reserve(contents.size());
+    for (const auto &content : contents) pending.push_back(&*entries_.find(content));
+    std::sort(pending.begin(), pending.end(), [](const auto *left, const auto *right) {
+        return left->second.offset != right->second.offset ? left->second.offset < right->second.offset
+                                                           : left->first < right->first;
+    });
+    pending.erase(std::unique(pending.begin(), pending.end()), pending.end());
+    auto verified = std::make_shared<std::unordered_set<std::string>>();
+    verified->reserve(pending.size());
+    std::string storage;
+    for (const auto *item : pending) {
+        if (json_utils::source_sha256(raw_bytes(item->first, item->second, storage)) != item->first)
+            throw std::runtime_error("bundle blob content SHA-256 mismatch: " + item->first);
+        verified->insert(item->first);
+    }
+    verified_ = std::move(verified);
+    verify_seconds_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+}
+
+std::string_view PlaintextBundleLoader::raw_bytes(const std::string &content, const Entry &entry,
+                                                  std::string &storage) const {
+    if (entry.length > std::numeric_limits<std::size_t>::max() ||
+        entry.length > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max()))
+        throw std::runtime_error("bundle blob is too large for this platform");
+    if (packed_ && packed_->resident)
+        return std::string_view(packed_->resident.get() + entry.offset, static_cast<std::size_t>(entry.length));
+    if (!packed_) {
+        const auto path = directory_ / "data" / (content.substr(7) + ".bin");
+        std::error_code error;
+        const auto length = std::filesystem::file_size(path, error);
+        if (error) throw std::runtime_error("cannot open file: " + path.string() + ": " + error.message());
+        if (length != entry.length) throw std::runtime_error("bundle blob byte length mismatch: " + content);
+    }
+    storage.resize(static_cast<std::size_t>(entry.length));
+    if (packed_) {
+        // Copies of the loader share one open file. Seeking is serialized;
+        // resident reads access immutable ranges without this lock.
+        std::lock_guard<std::mutex> lock(packed_->mutex);
+        packed_->input.clear();
+        packed_->input.seekg(static_cast<std::streamoff>(entry.offset));
+        packed_->input.read(storage.data(), static_cast<std::streamsize>(storage.size()));
+        if (!packed_->input) throw std::runtime_error("failed to read bundle pack range: " + content);
+    } else {
+        const auto path = directory_ / "data" / (content.substr(7) + ".bin");
+        std::ifstream input(path, std::ios::binary);
+        if (!input) throw std::runtime_error("cannot open file: " + path.string());
+        input.read(storage.data(), static_cast<std::streamsize>(storage.size()));
+        if (!input || input.peek() != std::char_traits<char>::eof())
+            throw std::runtime_error("bundle blob byte length mismatch: " + content);
+    }
+    return storage;
+}
+
 std::vector<double> PlaintextBundleLoader::read(const std::string &content) const {
     auto found = entries_.find(content);
     if (found == entries_.end()) throw std::runtime_error("bundle content is absent from manifest: " + content);
     const auto &entry = found->second;
     if (entry.length / 8 > slot_capacity_) throw std::runtime_error("bundle blob exceeds CKKS slot capacity: " + content);
-    if (entry.length > std::numeric_limits<std::size_t>::max() ||
-        entry.length > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max()))
-        throw std::runtime_error("bundle blob is too large for this platform");
     std::string storage;
-    std::string_view bytes;
-    if (packed_ && packed_->resident) {
-        bytes = std::string_view(packed_->resident.get() + entry.offset, static_cast<std::size_t>(entry.length));
-    } else {
-        if (!packed_) {
-            const auto path = directory_ / "data" / (content.substr(7) + ".bin");
-            std::error_code error;
-            const auto length = std::filesystem::file_size(path, error);
-            if (error) throw std::runtime_error("cannot open file: " + path.string() + ": " + error.message());
-            if (length != entry.length) throw std::runtime_error("bundle blob byte length mismatch: " + content);
-        }
-        storage.resize(static_cast<std::size_t>(entry.length));
-        if (packed_) {
-            // Copies of the loader share one open file. Seeking is serialized;
-            // resident reads access immutable ranges without this lock.
-            std::lock_guard<std::mutex> lock(packed_->mutex);
-            packed_->input.clear();
-            packed_->input.seekg(static_cast<std::streamoff>(entry.offset));
-            packed_->input.read(storage.data(), static_cast<std::streamsize>(storage.size()));
-            if (!packed_->input) throw std::runtime_error("failed to read bundle pack range: " + content);
-        } else {
-            const auto path = directory_ / "data" / (content.substr(7) + ".bin");
-            std::ifstream input(path, std::ios::binary);
-            if (!input) throw std::runtime_error("cannot open file: " + path.string());
-            input.read(storage.data(), static_cast<std::streamsize>(storage.size()));
-            if (!input || input.peek() != std::char_traits<char>::eof())
-                throw std::runtime_error("bundle blob byte length mismatch: " + content);
-        }
-        bytes = storage;
-    }
-    if (verify_blob_digest_ && json_utils::source_sha256(bytes) != content)
+    const auto bytes = raw_bytes(content, entry, storage);
+    if (verify_blob_digest_ && !(verified_ && verified_->count(content)) &&
+        json_utils::source_sha256(bytes) != content)
         throw std::runtime_error("bundle blob content SHA-256 mismatch: " + content);
     return decode_slots(bytes, content);
 }

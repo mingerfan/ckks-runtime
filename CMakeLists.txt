@@ -29,6 +29,7 @@ add_library(ckks_runtime_core STATIC
     runtime/plan.cpp
     runtime/verifier.cpp
     runtime/plaintext_bundle.cpp
+    runtime/execution_config.cpp
     runtime/thread_trace.cpp
     runtime/utils/sha256.cpp
 )
@@ -51,6 +52,7 @@ add_library(ckks_runtime_plan_json STATIC
     runtime/json_plan_reader.cpp
     runtime/plan_reader.cpp
     runtime/operator_spec_reader.cpp
+    runtime/json_execution_config_reader.cpp
 )
 add_library(ckks_runtime::plan_json ALIAS ckks_runtime_plan_json)
 
@@ -121,6 +123,14 @@ if(CKKS_RUNTIME_BUILD_TESTS)
     ckks_runtime_enable_warnings(runtime_plan_json_tests)
     add_test(NAME runtime_plan_json_tests COMMAND runtime_plan_json_tests)
 
+    add_executable(execution_config_tests tests/execution_config_tests.cpp)
+    target_link_libraries(execution_config_tests
+        PRIVATE ckks_runtime_plan_json)
+    target_compile_definitions(execution_config_tests
+        PRIVATE CKKS_RUNTIME_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    ckks_runtime_enable_warnings(execution_config_tests)
+    add_test(NAME execution_config_tests COMMAND execution_config_tests)
+
     add_executable(runtime_plan_memory_tests tests/runtime_plan_memory_tests.cpp)
     target_link_libraries(runtime_plan_memory_tests
         PRIVATE ckks_runtime_plan_json ckks_runtime_test_support)
@@ -133,6 +143,11 @@ if(CKKS_RUNTIME_BUILD_TESTS)
     target_link_libraries(runtime_release_tests PRIVATE ckks_runtime_test_support)
     ckks_runtime_enable_warnings(runtime_release_tests)
     add_test(NAME runtime_release_tests COMMAND runtime_release_tests)
+
+    add_executable(runtime_worker_modes_tests tests/runtime_worker_modes_tests.cpp)
+    target_link_libraries(runtime_worker_modes_tests PRIVATE ckks_runtime_test_support)
+    ckks_runtime_enable_warnings(runtime_worker_modes_tests)
+    add_test(NAME runtime_worker_modes_tests COMMAND runtime_worker_modes_tests)
 
     add_executable(runtime_host_worker_tests tests/runtime_host_worker_tests.cpp)
     target_link_libraries(runtime_host_worker_tests PRIVATE ckks_runtime_test_support)

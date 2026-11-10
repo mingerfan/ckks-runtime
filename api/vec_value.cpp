@@ -1,12 +1,17 @@
 #include "api/vec_value.hpp"
 
+#include <cmath>
 #include <stdexcept>
 
 namespace fhegpu {
 
+bool same_scale_log2(double a, double b) {
+    return std::isfinite(a) && std::isfinite(b) && std::abs(a - b) <= 1e-8;
+}
+
 bool operator==(const VecMetadata &a, const VecMetadata &b) {
     return a.context == b.context && a.degree == b.degree && a.level == b.level &&
-           a.scale_log2 == b.scale_log2 && a.ntt == b.ntt && a.components == b.components;
+           same_scale_log2(a.scale_log2, b.scale_log2) && a.ntt == b.ntt && a.components == b.components;
 }
 
 VecValue VecValue::ready(VecPayload payload) {

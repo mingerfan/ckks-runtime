@@ -29,7 +29,7 @@ std::string to_string(const Place &place);
 
 enum class ComputeKind {
     AddCC, AddCP, SubCC, SubCP, MulCC, MulCP,
-    Negate, Rotate, Rescale, ModSwitch, Relinearize, Boot
+    Negate, Rotate, Rescale, ModSwitch, Relinearize, Boot, BootStep
 };
 enum class CommKind { Transfer, Replicate };
 enum class CommHint { Auto, PointToPoint, Broadcast, Tree, Ring, HostStaged };
@@ -37,7 +37,7 @@ enum class Phase { Initialization, Execution, Finalization };
 enum class RescaleMode { Eager, Lazy, Native };
 enum class BootImplementation { Native, DecryptReencrypt };
 enum class RequiredCapability {
-    Encode, Transfer, Replicate, HostCompute, BootNative, BootDecryptReencrypt
+    Encode, Transfer, Replicate, HostCompute, BootNative, BootDecryptReencrypt, BootSteps
 };
 enum class KeyKind { Secret, Relin, Galois };
 
@@ -51,8 +51,31 @@ struct BootAttrs {
     std::string operator_profile;
     BootImplementation implementation = BootImplementation::Native;
 };
+
+// One step of a native Boot that the compiler expanded (plan V6). Every step
+// runs on the Device that holds the named profile and uses that profile's
+// keys, plaintext constants and workspace, and states the level and scale it
+// produces, as Boot does. See docs/runtime-plan/v6.md.
+enum class BootStepKind {
+    Raise, Rotate, Conjugate, MulConst, MulScalar, SetScale, Rescale, Linear, BsgsGroup, EvalMod,
+    Add, Sub
+};
+enum class BootTransform { None, CoeffToSlot, SlotToCoeff };
+struct BootStepAttrs {
+    std::string operator_profile;
+    BootStepKind step = BootStepKind::Raise;
+    int target_level = 0;
+    double target_scale_log2 = 0;
+    int steps = 0;                  // Rotate
+    std::string key;                // MulConst: profile plaintext
+    std::uint64_t multiplier = 0;   // MulScalar
+    int count = 0;                  // Rescale: Q primes dropped
+    BootTransform transform = BootTransform::None;  // Linear, BsgsGroup
+    int layer = -1;                 // Linear, BsgsGroup
+    int group = -1;                 // BsgsGroup
+};
 using ComputeAttrs = std::variant<std::monostate, RotateAttrs, RescaleAttrs,
-                                  ModSwitchAttrs, BootAttrs>;
+                                  ModSwitchAttrs, BootAttrs, BootStepAttrs>;
 
 struct InlineEncodePayload { std::vector<double> values; };
 struct BundleEncodePayload { std::string content; };
@@ -193,6 +216,8 @@ std::string to_string(CommHint hint);
 std::string to_string(Phase phase);
 std::string to_string(RescaleMode mode);
 std::string to_string(BootImplementation implementation);
+std::string to_string(BootStepKind step);
+std::string to_string(BootTransform transform);
 std::string to_string(RequiredCapability capability);
 std::string to_string(KeyKind kind);
 

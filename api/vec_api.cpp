@@ -14,7 +14,7 @@ void require_compatible(const VecPayload &a, const VecPayload &b, bool check_sca
     if (a.metadata.context != b.metadata.context || a.metadata.degree != b.metadata.degree ||
         a.metadata.level != b.metadata.level || a.metadata.ntt != b.metadata.ntt)
         throw std::runtime_error("incompatible VecValue metadata");
-    if (check_scale && a.metadata.scale_log2 != b.metadata.scale_log2) throw std::runtime_error("scale mismatch");
+    if (check_scale && !same_scale_log2(a.metadata.scale_log2, b.metadata.scale_log2)) throw std::runtime_error("scale mismatch");
 }
 
 VecPayload unary_cipher(const std::vector<VecValue> &inputs) {
@@ -155,7 +155,7 @@ VecMetadata VecExecutor::compute_metadata(const ComputeOp &op, const std::vector
         const VecMetadata b = inputs[1].metadata();
         if (a.context != b.context || a.degree != b.degree || a.level != b.level || a.ntt != b.ntt)
             throw std::runtime_error("incompatible VecValue metadata");
-        if (!multiply && a.scale_log2 != b.scale_log2) throw std::runtime_error("scale mismatch");
+        if (!multiply && !same_scale_log2(a.scale_log2, b.scale_log2)) throw std::runtime_error("scale mismatch");
         if (multiply) {
             if (b.scale_log2 > std::numeric_limits<int>::max() - a.scale_log2)
                 throw std::runtime_error("multiplication scale overflow");
@@ -197,6 +197,19 @@ VecMetadata VecExecutor::compute_metadata(const ComputeOp &op, const std::vector
         metadata.level = attrs.target_level;
         metadata.scale_log2 = attrs.target_scale_log2;
         metadata.components = attrs.target_components;
+        return metadata;
+    }
+    case ComputeKind::BootStep: {
+        // Each step carries its Boot's input message on (see compute_now).
+        const auto &attrs = std::get<BootStepAttrs>(op.attrs);
+        const bool binary_step = attrs.step == BootStepKind::Add || attrs.step == BootStepKind::Sub;
+        if (inputs.size() != (binary_step ? 2U : 1U) || inputs[0].kind() != ValueKind::Ciphertext ||
+            (binary_step && inputs[1].kind() != ValueKind::Ciphertext))
+            throw std::runtime_error("BootStep operand mismatch");
+        auto metadata = inputs[0].metadata();
+        metadata.level = attrs.target_level;
+        metadata.scale_log2 = attrs.target_scale_log2;
+        metadata.components = 2;
         return metadata;
     }
     }
@@ -259,6 +272,18 @@ VecPayload VecExecutor::compute_now(const ComputeOp &op, const std::vector<VecVa
         a.metadata.level = attrs.target_level;
         a.metadata.scale_log2 = attrs.target_scale_log2;
         a.metadata.components = attrs.target_components;
+        return a;
+    }
+    case ComputeKind::BootStep: {
+        // A whole Boot is the identity on the message here. Its steps' own
+        // values (slot DFTs, EvalMod bases) have no message meaning, so every
+        // step passes its first input's slots on and the last step leaves
+        // the Boot's input, as the whole Boot does.
+        auto a = inputs.at(0).materialize();
+        const auto attrs = std::get<BootStepAttrs>(op.attrs);
+        a.metadata.level = attrs.target_level;
+        a.metadata.scale_log2 = attrs.target_scale_log2;
+        a.metadata.components = 2;
         return a;
     }
     }

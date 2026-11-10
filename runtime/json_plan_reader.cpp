@@ -64,7 +64,59 @@ ComputeKind read_compute_kind(const Json &value, const std::string &path) {
     if (kind == "mod_switch") return ComputeKind::ModSwitch;
     if (kind == "relinearize") return ComputeKind::Relinearize;
     if (kind == "boot") return ComputeKind::Boot;
+    if (kind == "boot_step") return ComputeKind::BootStep;
     fail(doc, path, "unknown compute operation '" + kind + "'");
+}
+
+BootStepKind read_boot_step_kind(const Json &value, const std::string &path) {
+    const std::string step = read_string(value, doc, path);
+    for (auto kind : {BootStepKind::Raise, BootStepKind::Rotate, BootStepKind::Conjugate,
+                      BootStepKind::MulConst, BootStepKind::MulScalar, BootStepKind::SetScale,
+                      BootStepKind::Rescale, BootStepKind::Linear, BootStepKind::BsgsGroup,
+                      BootStepKind::EvalMod, BootStepKind::Add, BootStepKind::Sub})
+        if (step == to_string(kind)) return kind;
+    fail(doc, path, "unknown boot step '" + step + "'");
+}
+
+BootTransform read_boot_transform(const Json &value, const std::string &path) {
+    const std::string transform = read_string(value, doc, path);
+    if (transform == "c2s") return BootTransform::CoeffToSlot;
+    if (transform == "s2c") return BootTransform::SlotToCoeff;
+    fail(doc, path, "boot transform must be c2s or s2c");
+}
+
+// Each step names exactly the fields it uses; see docs/runtime-plan/v6.md.
+BootStepAttrs read_boot_step_attrs(const Json &value, const std::string &path) {
+    if (!value.is_object() || !value.contains("step")) fail(doc, path, "missing required field 'step'");
+    BootStepAttrs attrs;
+    attrs.step = read_boot_step_kind(value.at("step"), path + ".step");
+#define BOOT_STEP_MEMBERS "operator_profile", "step", "target_level", "target_scale_log2"
+    switch (attrs.step) {
+    case BootStepKind::Rotate: require_members(value, doc, path, {BOOT_STEP_MEMBERS, "steps"}); break;
+    case BootStepKind::MulConst: require_members(value, doc, path, {BOOT_STEP_MEMBERS, "key"}); break;
+    case BootStepKind::MulScalar: require_members(value, doc, path, {BOOT_STEP_MEMBERS, "multiplier"}); break;
+    case BootStepKind::Rescale: require_members(value, doc, path, {BOOT_STEP_MEMBERS, "count"}); break;
+    case BootStepKind::Linear: require_members(value, doc, path, {BOOT_STEP_MEMBERS, "transform", "layer"}); break;
+    case BootStepKind::BsgsGroup:
+        require_members(value, doc, path, {BOOT_STEP_MEMBERS, "transform", "layer", "group"});
+        break;
+    default: require_members(value, doc, path, {BOOT_STEP_MEMBERS});
+    }
+#undef BOOT_STEP_MEMBERS
+    attrs.operator_profile = read_string(value.at("operator_profile"), doc, path + ".operator_profile");
+    attrs.target_level = read_nonnegative_int(value.at("target_level"), doc, path + ".target_level");
+    attrs.target_scale_log2 = read_scale(value.at("target_scale_log2"), path + ".target_scale_log2");
+    if (value.contains("steps"))
+        attrs.steps = read_int(value.at("steps"), doc, path + ".steps",
+                               std::numeric_limits<int>::min(), std::numeric_limits<int>::max());
+    if (value.contains("key")) attrs.key = read_string(value.at("key"), doc, path + ".key");
+    if (value.contains("multiplier"))
+        attrs.multiplier = read_safe_uint(value.at("multiplier"), doc, path + ".multiplier", 1, (1ULL << 53) - 1);
+    if (value.contains("count")) attrs.count = read_positive_int(value.at("count"), doc, path + ".count");
+    if (value.contains("transform")) attrs.transform = read_boot_transform(value.at("transform"), path + ".transform");
+    if (value.contains("layer")) attrs.layer = read_nonnegative_int(value.at("layer"), doc, path + ".layer");
+    if (value.contains("group")) attrs.group = read_nonnegative_int(value.at("group"), doc, path + ".group");
+    return attrs;
 }
 
 CommHint read_comm_hint(const Json &value, const std::string &path) {
@@ -160,7 +212,8 @@ std::vector<ValueKind> read_value_kinds(const Json &value, const std::string &pa
 
 bool compute_requires_attrs(ComputeKind kind) {
     return kind == ComputeKind::Rotate || kind == ComputeKind::Rescale ||
-           kind == ComputeKind::ModSwitch || kind == ComputeKind::Boot;
+           kind == ComputeKind::ModSwitch || kind == ComputeKind::Boot ||
+           kind == ComputeKind::BootStep;
 }
 
 ComputeAttrs read_compute_attrs(ComputeKind kind, const Json &value, const std::string &path) {
@@ -185,6 +238,8 @@ ComputeAttrs read_compute_attrs(ComputeKind kind, const Json &value, const std::
                          read_positive_int(value.at("target_components"), doc, path + ".target_components"),
                          read_string(value.at("operator_profile"), doc, path + ".operator_profile"),
                          read_boot_implementation(value.at("implementation"), path + ".implementation")};
+    case ComputeKind::BootStep:
+        return read_boot_step_attrs(value, path);
     default:
         fail(doc, path, "operation does not accept attrs");
     }
@@ -288,7 +343,7 @@ void read_metadata(const Json &root, RuntimePlan &plan) {
                      "initialization", "execution", "finalization", "final_outputs"},
                     {"plaintext_bundle", "waterline"});
     plan.format_version = static_cast<std::uint32_t>(read_nonnegative_int(root.at("format_version"), doc, "$.format_version"));
-    if (plan.format_version != 1 && plan.format_version != 2 && plan.format_version != 3 && plan.format_version != 4 && plan.format_version != 5)
+    if (plan.format_version < 1 || plan.format_version > 6)
         fail(doc, "$.format_version", "unsupported format version");
     if (root.contains("waterline")) {
         if (plan.format_version < 4) fail(doc, "$.waterline", "waterline requires V4 or newer");
@@ -329,7 +384,7 @@ LoadedRuntimePlan read_stream(std::istream &input, const std::string &document, 
     // The version may be the last root field. Parse records using V4's schema
     // and retain only the first use of each version-dependent feature.
     std::array<std::string, 3> v1_errors, v2_errors, v3_errors;
-    std::string v4_scale_error;
+    std::string v4_scale_error, v5_error;
     StrictJsonSax sax(document,
         {"values", "external_inputs", "initialization", "execution", "finalization", "final_outputs"},
         [&](const std::string &field, std::size_t index, Json &&record) {
@@ -348,6 +403,9 @@ LoadedRuntimePlan read_stream(std::istream &input, const std::string &document, 
                         compute && compute->kind == ComputeKind::Rescale &&
                         !record.at("attrs").at("target_scale_log2").is_number_integer() && v4_scale_error.empty())
                         v4_scale_error = item_path("$." + field, index) + ".attrs.target_scale_log2: expected integer; floating scales require V5";
+                    if (const auto *compute = std::get_if<ComputeOp>(&instruction.body);
+                        compute && compute->kind == ComputeKind::BootStep && v5_error.empty())
+                        v5_error = item_path("$." + field, index) + ": BootStep requires format version 6";
                     const auto phase_index = field == "initialization" ? 0 : field == "execution" ? 1 : 2;
                     const char *message = nullptr;
                     if (std::holds_alternative<PreparePlaintextOp>(instruction.body)) {
@@ -387,6 +445,8 @@ LoadedRuntimePlan read_stream(std::istream &input, const std::string &document, 
             if (!error.empty()) fail(document, "$", error);
     if (plan.format_version < 5 && !v4_scale_error.empty())
         fail(document, "$", v4_scale_error);
+    if (plan.format_version < 6 && !v5_error.empty())
+        fail(document, "$", v5_error);
     auto digest = buffer.source_sha256();
     if (stats) stats->parse_build_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()
                                           - stats->read_seconds - stats->hash_seconds;

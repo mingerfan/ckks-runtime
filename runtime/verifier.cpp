@@ -85,13 +85,62 @@ InputKinds expected_inputs(ComputeKind kind) {
         return {{V::Ciphertext, V::Plaintext}, 2};
     case ComputeKind::Negate: case ComputeKind::Rotate: case ComputeKind::Rescale:
     case ComputeKind::ModSwitch: case ComputeKind::Relinearize: case ComputeKind::Boot:
+    case ComputeKind::BootStep:
         return {{V::Ciphertext, V::Ciphertext}, 1};
     }
     fail("unknown compute operation");
 }
 
+// Which attrs a step uses is fixed by the step; the others must keep their
+// defaults, so one plan has one meaning. Like Boot, a step states the level
+// and scale it produces; the levels follow what the step does.
+void verify_boot_step(const ComputeOp &op, const std::array<const ValueDesc *, 2> &inputs,
+                      const ValueDesc &output) {
+    const auto *attrs = std::get_if<BootStepAttrs>(&op.attrs);
+    if (!attrs || attrs->operator_profile.empty()) fail("BootStep requires attrs with an operator_profile");
+    const auto where = "BootStep " + to_string(attrs->step);
+    if (op.place.kind != PlaceKind::Device) fail(where + " must execute on a Device");
+    for (const auto *input : inputs)
+        if (input && input->components != 2) fail(where + " requires two-component ciphertexts");
+    if (output.components != 2) fail(where + " requires two-component ciphertexts");
+    if (attrs->target_level != output.level || !same_scale(attrs->target_scale_log2, output.scale_log2))
+        fail(where + " states a level or scale its output descriptor does not have");
+    const bool rotate = attrs->step == BootStepKind::Rotate;
+    const bool constant = attrs->step == BootStepKind::MulConst;
+    const bool scalar = attrs->step == BootStepKind::MulScalar;
+    const bool rescale = attrs->step == BootStepKind::Rescale;
+    const bool transform = attrs->step == BootStepKind::Linear || attrs->step == BootStepKind::BsgsGroup;
+    const bool group = attrs->step == BootStepKind::BsgsGroup;
+    if ((attrs->steps != 0) != rotate || attrs->key.empty() == constant || (attrs->multiplier != 0) != scalar ||
+        (attrs->count != 0) != rescale || (attrs->transform != BootTransform::None) != transform ||
+        (attrs->layer >= 0) != transform || (attrs->group >= 0) != group || attrs->layer < -1 || attrs->group < -1)
+        fail(where + " has attrs that do not belong to it");
+    const auto &input = *inputs[0];
+    switch (attrs->step) {
+    case BootStepKind::Raise:
+        if (output.level < input.level) fail(where + " must not lower the level");
+        break;
+    case BootStepKind::Rescale:
+        if (output.level != input.level - attrs->count) fail(where + " must drop exactly count levels");
+        break;
+    case BootStepKind::Linear: case BootStepKind::EvalMod:
+        if (output.level >= input.level) fail(where + " must consume levels");
+        break;
+    case BootStepKind::Add: case BootStepKind::Sub:
+        if (!same_scale(input.scale_log2, inputs[1]->scale_log2) || !same_scale(input.scale_log2, output.scale_log2) ||
+            output.level != input.level)
+            fail(where + " requires operands and output with one level and scale");
+        break;
+    default:
+        if (output.level != input.level) fail(where + " must keep the level");
+    }
+}
+
 void verify_compute_metadata(const ComputeOp &op, const DescMap &descs) {
-    const auto types = expected_inputs(op.kind);
+    auto types = expected_inputs(op.kind);
+    if (const auto *step = std::get_if<BootStepAttrs>(&op.attrs);
+        step && (step->step == BootStepKind::Add || step->step == BootStepKind::Sub))
+        types = {{ValueKind::Ciphertext, ValueKind::Ciphertext}, 2};
     if (op.inputs.size() != types.count) fail(to_string(op.kind) + " has wrong input count");
     std::array<const ValueDesc *, 2> inputs{};
     for (std::size_t i = 0; i < op.inputs.size(); ++i) {
@@ -175,6 +224,9 @@ void verify_compute_metadata(const ComputeOp &op, const DescMap &descs) {
             fail("decrypt_reencrypt Boot must execute on Host");
         break;
     }
+    case ComputeKind::BootStep:
+        verify_boot_step(op, inputs, output);
+        break;
     }
 }
 
@@ -199,7 +251,7 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                                       const LoadedOperatorSpec &loaded_spec,
                                       bool skip_artifact_digest_checks) {
     const auto &spec = loaded_spec.spec;
-    if (plan.format_version != 1 && plan.format_version != 2 && plan.format_version != 3 && plan.format_version != 4 && plan.format_version != 5) fail("unsupported format version");
+    if (plan.format_version < 1 || plan.format_version > 6) fail("unsupported format version");
     if (plan.format_version == 3 && plan.target.world_size != 1)
         fail("RuntimePlan V3 supports one rank only");
     if (plan.waterline) {
@@ -236,10 +288,30 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
         modulus_budget += bits;
         modulus_budgets.push_back(modulus_budget);
     }
+    // The steps of an expanded Boot may pass below the OperatorSpec's range:
+    // an S2C-first Boot runs SlotToCoeff down to q0. The Boot profile, not the
+    // operator table, makes those levels legal, so they are allowed only for
+    // a value a boot_step produces -- or a transfer moves from such a value to
+    // another card -- and no ordinary compute reads (it can still be released).
+    std::unordered_set<ValueId> boot_internal;
+    for (const auto *phase : {&plan.initialization, &plan.execution, &plan.finalization})
+        for (const auto &instruction : *phase) {
+            if (const auto *op = std::get_if<ComputeOp>(&instruction.body); op && op->kind == ComputeKind::BootStep)
+                boot_internal.insert(op->output);
+            else if (const auto *action = std::get_if<CommAction>(&instruction.body))
+                if (std::all_of(action->inputs.begin(), action->inputs.end(),
+                                [&](ValueId input) { return boot_internal.count(input) != 0; }))
+                    boot_internal.insert(action->outputs.begin(), action->outputs.end());
+        }
+    for (const auto *phase : {&plan.initialization, &plan.execution, &plan.finalization})
+        for (const auto &instruction : *phase)
+            if (const auto *op = std::get_if<ComputeOp>(&instruction.body); op && op->kind != ComputeKind::BootStep)
+                for (ValueId input : op->inputs) boot_internal.erase(input);
     for (const auto &value : plan.values) {
         check_place(plan, value.place);
         if (value.context != spec.context_id) fail("value context does not match OperatorSpec");
-        if (value.level < spec.level_lower_bound || value.level > spec.level_upper_bound)
+        const int lower = boot_internal.count(value.id) ? 0 : spec.level_lower_bound;
+        if (value.level < lower || value.level > spec.level_upper_bound)
             fail("value level is outside OperatorSpec range");
         if (!std::isfinite(value.scale_log2) || value.scale_log2 < 0 ||
             (plan.format_version < 5 && std::floor(value.scale_log2) != value.scale_log2))
@@ -391,6 +463,18 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                 }
                 verify_compute_metadata(*op, descs);
                 output_state.flags |= Computed;
+                if (op->kind == ComputeKind::BootStep) {
+                    // Allowed by the profile it runs on, not by the operator table:
+                    // the keys and constants a step uses belong to that profile.
+                    if (plan.format_version < 6) fail("BootStep requires plan V6");
+                    const auto &attrs = std::get<BootStepAttrs>(op->attrs);
+                    if (find_boot_profile(spec, attrs.operator_profile).implementation != BootImplementation::Native)
+                        fail("BootStep requires a native Boot profile");
+                    if (attrs.step == BootStepKind::Rotate)
+                        normalized_rotation_step(attrs.steps, spec.poly_degree / 2);
+                    capabilities.insert(RequiredCapability::BootSteps);
+                    continue;
+                }
                 const auto support = spec.operators.find(op->kind);
                 if (support == spec.operators.end() || !support->second.supported)
                     fail(to_string(op->kind) + " is unsupported by OperatorSpec");

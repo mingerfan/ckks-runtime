@@ -38,8 +38,10 @@ inline void skip_instruction(Archive<true> &a, std::uint32_t version) {
         a.skip(8 + 9); // output, place
         std::uint8_t attrs = 0;
         a.number(attrs);
-        constexpr std::size_t widths[] = {0, 4, 8, 4, 17};
-        if (attrs > 4) throw std::runtime_error("unknown binary compute attrs");
+        // BootStep (5): profile u32, step u8, target level i32, target scale f64,
+        // steps i32, key u32, multiplier u64, count i32, transform u8, layer i32, group i32.
+        constexpr std::size_t widths[] = {0, 4, 8, 4, 17, 46};
+        if (attrs > 5) throw std::runtime_error("unknown binary compute attrs");
         a.skip(widths[attrs] + (attrs == 2 && version >= 5 ? 4 : 0));
         bool reuse = false;
         a.boolean(reuse);

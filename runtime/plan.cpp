@@ -41,6 +41,7 @@ std::string to_string(ComputeKind k) {
     case ComputeKind::Negate: return "Negate"; case ComputeKind::Rotate: return "Rotate";
     case ComputeKind::Rescale: return "Rescale"; case ComputeKind::ModSwitch: return "ModSwitch";
     case ComputeKind::Relinearize: return "Relinearize"; case ComputeKind::Boot: return "Boot";
+    case ComputeKind::BootStep: return "BootStep";
     }
     throw std::runtime_error("unknown compute kind");
 }
@@ -72,6 +73,31 @@ std::string to_string(BootImplementation implementation) {
     }
     throw std::runtime_error("unknown boot implementation");
 }
+std::string to_string(BootStepKind step) {
+    switch (step) {
+    case BootStepKind::Raise: return "raise";
+    case BootStepKind::Rotate: return "rotate";
+    case BootStepKind::Conjugate: return "conjugate";
+    case BootStepKind::MulConst: return "mul_const";
+    case BootStepKind::MulScalar: return "mul_scalar";
+    case BootStepKind::SetScale: return "set_scale";
+    case BootStepKind::Rescale: return "rescale";
+    case BootStepKind::Linear: return "linear";
+    case BootStepKind::BsgsGroup: return "bsgs_group";
+    case BootStepKind::EvalMod: return "eval_mod";
+    case BootStepKind::Add: return "add";
+    case BootStepKind::Sub: return "sub";
+    }
+    throw std::runtime_error("unknown boot step");
+}
+std::string to_string(BootTransform transform) {
+    switch (transform) {
+    case BootTransform::None: return "none";
+    case BootTransform::CoeffToSlot: return "c2s";
+    case BootTransform::SlotToCoeff: return "s2c";
+    }
+    throw std::runtime_error("unknown boot transform");
+}
 std::string to_string(RequiredCapability capability) {
     switch (capability) {
     case RequiredCapability::Encode: return "encode";
@@ -80,6 +106,7 @@ std::string to_string(RequiredCapability capability) {
     case RequiredCapability::HostCompute: return "host_compute";
     case RequiredCapability::BootNative: return "boot_native";
     case RequiredCapability::BootDecryptReencrypt: return "boot_decrypt_reencrypt";
+    case RequiredCapability::BootSteps: return "boot_steps";
     }
     throw std::runtime_error("unknown required capability");
 }
@@ -113,7 +140,9 @@ void RuntimePlan::print(std::ostream &out) const {
             } else if (const auto *prepare = std::get_if<PreparePlaintextOp>(&inst.body)) {
                 out << '%' << prepare->output << " = PreparePlaintext\n";
             } else if (const auto *op = std::get_if<ComputeOp>(&inst.body)) {
-                out << '%' << op->output << " = " << to_string(op->kind) << '(';
+                out << '%' << op->output << " = " << to_string(op->kind);
+                if (const auto *step = std::get_if<BootStepAttrs>(&op->attrs)) out << '.' << to_string(step->step);
+                out << '(';
                 for (std::size_t i = 0; i < op->inputs.size(); ++i) { if (i) out << ','; out << '%' << op->inputs[i]; }
                 out << ") @ " << to_string(op->place);
                 if (op->reuse_input) out << " reuse_input=" << *op->reuse_input;

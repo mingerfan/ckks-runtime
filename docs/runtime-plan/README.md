@@ -9,6 +9,7 @@
 | 3 | V2 加 execution Encode 和 Fence；仅支持 `world_size=1` | [V3](v3/schema.json) |
 | 4 | V3 加 execution Device Prepare 和 Waterline 预算；Waterline 仅支持单 rank 的设备工作线程 | [V4 规范](v4.md) |
 | 5 | V4 指令；ValueDesc 和 Rescale 的 scale_log2 可为实际浮点对数，支持原生逐 Q 除模 | 本文与[二进制格式](binary.md) |
+| 6 | V5 加 `boot_step`：编译器把原生 Boot 展开成可单独放置的步 | [V6 规范](v6.md) |
 
 计划语义版本与文件表示分开：二进制容器版本和 bundle 存储版本见[二进制格式](binary.md)与[明文数据包](plaintext-bundle.md)。编译器默认导出二进制；下面用 JSON 展示字段，二进制记录具有相同的计划语义。
 
@@ -143,7 +144,7 @@ inline 数组非空，长度不能超过 `poly_degree / 2`。bundle content 必�
 }
 ```
 
-合法 op：`add_cc`、`add_cp`、`sub_cc`、`sub_cp`、`mul_cc`、`mul_cp`、`negate`、`rotate`、`rescale`、`mod_switch`、`relinearize`、`boot`。
+合法 op：`add_cc`、`add_cp`、`sub_cc`、`sub_cp`、`mul_cc`、`mul_cp`、`negate`、`rotate`、`rescale`、`mod_switch`、`relinearize`、`boot`，V6 另有 `boot_step`（规则见 [V6](v6.md)）。
 
 普通计算既可在 Host 也可在 Device，但输入、输出和指令 Place 必须完全相同，Api 也必须支持该位置。Runtime 不自动搬运。
 
@@ -195,7 +196,7 @@ Runtime 必须检查：
 - 计划使用的算子受支持；Rescale 降幅不超过 `max_levels_per_op`。
 - Boot profile 唯一，输入范围、implementation 和输出元信息一致。
 
-Runtime 从实际指令推导能力：Encode、Transfer、Replicate、Host compute、native Boot、decrypt/re-encrypt Boot；并推导 relin key、带 step 的 Galois key和 secret key。Api preflight 必须明确确认这些资源可用。
+Runtime 从实际指令推导能力：Encode、Transfer、Replicate、Host compute、native Boot、decrypt/re-encrypt Boot、展开的 Boot 步（`boot_steps`）；并推导 relin key、带 step 的 Galois key和 secret key。Boot 步用所属 profile 自带的密钥，不进入密钥需求。Api preflight 必须明确确认这些资源可用。
 
 ## 7. bundle 的分 rank 装载
 
@@ -311,7 +312,7 @@ RuntimeTiming 记录 Encode/read 次数、字节与时间、raw 读取上界，�
 
 ## 12. 版本与兼容
 
-`RuntimePlanReader::read_file` 按 `.json` 或 `.bin` 显式选择文件表示，随后按 `format_version` 检查 V1/V2/V3/V4。未知扩展名、版本、字段、算子和不匹配的能力直接报错；不会在解析失败后改用其他表示。V1 不能含 Release/reuse，V1/V2 不能含 Fence 或 execution Encode，旧版本不能含 Prepare。旧静态分批编译选项已删除，普通 Encode/Transfer 和显式 Fence 继续由统一执行器支持。
+`RuntimePlanReader::read_file` 按 `.json` 或 `.bin` 显式选择文件表示，随后按 `format_version` 检查 V1–V6。未知扩展名、版本、字段、算子和不匹配的能力直接报错；不会在解析失败后改用其他表示。V1 不能含 Release/reuse，V1/V2 不能含 Fence 或 execution Encode，旧版本不能含 Prepare，V6 之前不能含 `boot_step`。旧静态分批编译选项已删除，普通 Encode/Transfer 和显式 Fence 继续由统一执行器支持。
 
 计划语义版本、二进制容器版本、bundle 存储版本、target/capability 与 OperatorSpec id/version 是不同的兼容轴。文档与当前代码一起演进；修改执行语义或文件布局时明确更新相关版本、Schema、reader、导出器和样例，不通过删除规范文字掩盖兼容性变化。
 

@@ -22,6 +22,9 @@ struct VecMetadata {
     int components = 1;
 };
 
+// The PlanVerifier's rule: native scales reached along different Rescale paths
+// differ in the last bits of their log2, and are the same scale.
+bool same_scale_log2(double a, double b);
 bool operator==(const VecMetadata &a, const VecMetadata &b);
 
 struct VecPayload {

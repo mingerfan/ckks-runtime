@@ -312,8 +312,24 @@ inline DiffSummary diff_against_reference(const Context &context,
                 for (ValueId id : op->inputs) release(id);
                 continue;
             }
-            throw std::runtime_error(
-                "MLP reference experiment does not accept communication instructions");
+            if (const auto *action =
+                    std::get_if<CommAction>(&instruction.body)) {
+                if (action->inputs.size() != 1)
+                    throw std::runtime_error(
+                        "MLP reference experiment requires one communication input");
+                const auto transferred = reference.at(action->inputs.front());
+                for (ValueId output_id : action->outputs) {
+                    record_diff(report, summary, phase, instruction.ordinal,
+                                to_string(action->kind), output_id,
+                                find_value(plan, output_id), transferred, artifact,
+                                context.operator_spec.spec.poly_degree);
+                    if (uses[output_id] != 0)
+                        reference.emplace(output_id, transferred);
+                }
+                release(action->inputs.front());
+                continue;
+            }
+            throw std::runtime_error("unsupported MLP reference instruction");
         }
     };
     process_phase("initialization", plan.initialization);

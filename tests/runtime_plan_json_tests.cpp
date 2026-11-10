@@ -1,6 +1,7 @@
 #include "runtime/json_plan_reader.hpp"
 #include "runtime/plan_reader.hpp"
 #include "runtime/binary_plan_codec.hpp"
+#include "runtime/binary_plan_parallel.hpp"
 #include "runtime/binary_manifest_codec.hpp"
 #include "runtime/json_utils.hpp"
 #include "runtime/operator_spec_reader.hpp"
@@ -9,6 +10,7 @@
 #include "runtime/utils/sha256.hpp"
 #include "runtime/verifier.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <algorithm>
 #include <fstream>
@@ -16,6 +18,7 @@
 #include <cmath>
 #include <functional>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <sstream>
@@ -94,7 +97,7 @@ void compare_records(const RuntimePlan &plan, const json_utils::Json &source) {
     };
     require(ids_json(plan.external_inputs) == source.at("external_inputs"), "external inputs differ");
     require(ids_json(plan.final_outputs) == source.at("final_outputs"), "final outputs differ");
-    const char *compute_names[] = {"add_cc", "add_cp", "sub_cc", "sub_cp", "mul_cc", "mul_cp", "negate", "rotate", "rescale", "mod_switch", "relinearize", "boot"};
+    const char *compute_names[] = {"add_cc", "add_cp", "sub_cc", "sub_cp", "mul_cc", "mul_cp", "negate", "rotate", "rescale", "mod_switch", "relinearize", "boot", "boot_step"};
     const char *hint_names[] = {"auto", "point_to_point", "broadcast", "tree", "ring", "host_staged"};
     const auto check_phase = [&](const char *name, const std::vector<Instruction> &instructions) {
         Json records = Json::array();
@@ -423,6 +426,192 @@ void test_dacapo_operator_spec_v2_profiles() {
     expect_throw([&] { OperatorSpecReader::read_text(text); }, "must be set exactly");
 }
 
+// A V6 plan with one of every BootStep, on one device of the Dacapo GPU spec.
+std::string boot_step_plan_text(const LoadedOperatorSpec &spec, int format_version,
+                                const std::function<void(json_utils::Json &)> &edit = {}) {
+    using Json = json_utils::Json;
+    const Json host{{"kind", "host"}, {"rank", 0}};
+    const Json device{{"kind", "device"}, {"rank", 0}, {"index", 0}};
+    struct Level { int level; double scale; };
+    // ValueId -> what it holds; 1 is the input on Host, 14 the output back on Host.
+    const std::map<int, Level> values{
+        {1, {10, 40}}, {2, {10, 40}}, {3, {29, 45.5}}, {4, {29, 45.5}}, {5, {29, 45.5}},
+        {6, {29, 75.5}}, {7, {27, 45.25}}, {8, {27, 70.125}}, {9, {25, 45.0625}}, {10, {18, 45}},
+        {11, {18, 45}}, {12, {18, 45}}, {13, {18, 40}}, {14, {18, 40}}};
+    const std::string profile = spec.spec.boot_profiles.at(0).profile_id;
+    int ordinal = 0;
+    const auto step = [&](int output, std::vector<int> inputs, Json attrs) {
+        Json ids = Json::array();
+        for (int input : inputs) ids.push_back(std::to_string(input));
+        attrs["operator_profile"] = profile;
+        attrs["target_level"] = values.at(output).level;
+        attrs["target_scale_log2"] = values.at(output).scale;
+        return Json{{"ordinal", ordinal++}, {"kind", "compute"}, {"op", "boot_step"}, {"place", device},
+                    {"inputs", ids}, {"output", std::to_string(output)}, {"attrs", attrs}};
+    };
+    const auto transfer = [&](int id, int input, int output, const Json &source, const Json &destination) {
+        return Json{{"ordinal", ordinal++}, {"kind", "transfer"}, {"transfer_id", std::to_string(id)},
+                    {"hint", "point_to_point"}, {"inputs", {std::to_string(input)}},
+                    {"outputs", {std::to_string(output)}}, {"sources", {source}},
+                    {"destinations", {destination}}, {"output_kinds", {"ciphertext"}}};
+    };
+    Json execution = Json::array();
+    execution.push_back(transfer(1, 1, 2, host, device));
+    execution.push_back(step(3, {2}, {{"step", "raise"}}));
+    execution.push_back(step(4, {3}, {{"step", "rotate"}, {"steps", 5}}));
+    execution.push_back(step(5, {3, 4}, {{"step", "add"}}));
+    execution.push_back(step(6, {5}, {{"step", "mul_const"}, {"key", "c2s/0/3"}}));
+    execution.push_back(step(7, {6}, {{"step", "rescale"}, {"count", 2}}));
+    execution.push_back(step(8, {7}, {{"step", "bsgs_group"}, {"transform", "c2s"}, {"layer", 1}, {"group", 0}}));
+    execution.push_back(step(9, {8}, {{"step", "linear"}, {"transform", "s2c"}, {"layer", 0}}));
+    execution.push_back(step(10, {9}, {{"step", "eval_mod"}}));
+    execution.push_back(step(11, {10}, {{"step", "conjugate"}}));
+    execution.push_back(step(12, {11}, {{"step", "mul_scalar"}, {"multiplier", 8}}));
+    execution.push_back(step(13, {12}, {{"step", "set_scale"}}));
+    execution.push_back(transfer(2, 13, 14, device, host));
+    Json described = Json::array();
+    for (const auto &[id, value] : values)
+        described.push_back({{"id", std::to_string(id)}, {"kind", "ciphertext"},
+                             {"place", id == 1 || id == 14 ? host : device},
+                             {"context", spec.spec.context_id}, {"level", value.level},
+                             {"scale_log2", value.scale}, {"ntt", true}, {"components", 2}});
+    Json plan{{"format_version", format_version}, {"plan_id", "6001"},
+              {"target", {{"target_id", spec.spec.target_id}, {"capability_version", 1},
+                          {"operator_spec", {{"id", spec.spec.id}, {"version", spec.spec.version},
+                                             {"source_sha256", spec.source_sha256}}},
+                          {"world_size", 1}, {"device_counts", {1}}}},
+              {"values", described}, {"external_inputs", {"1"}}, {"initialization", Json::array()},
+              {"execution", execution}, {"finalization", Json::array()}, {"final_outputs", {"14"}}};
+    if (edit) edit(plan);
+    return plan.dump();
+}
+
+void test_boot_steps_v6() {
+    const auto spec = OperatorSpecReader::read_file(
+        (source_dir / "docs/operator-spec/v2/profiles/dacapo-heaan-gpu.v1.json").string());
+    const auto plan = RuntimePlanJsonReader::read_text(boot_step_plan_text(spec, 6)).plan;
+    const auto requirements = PlanVerifier::verify(plan, spec);
+    require(std::find(requirements.capabilities.begin(), requirements.capabilities.end(),
+                      RequiredCapability::BootSteps) != requirements.capabilities.end(),
+            "BootStep did not require the boot_steps capability");
+    // Steps switch keys of their profile, not of the plan.
+    require(requirements.keys.empty(), "BootStep must not ask the plan for keys");
+    const auto &group = std::get<BootStepAttrs>(std::get<ComputeOp>(plan.execution.at(6).body).attrs);
+    require(group.step == BootStepKind::BsgsGroup && group.transform == BootTransform::CoeffToSlot &&
+                group.layer == 1 && group.group == 0 && group.target_level == 27 &&
+                group.target_scale_log2 == 70.125 &&
+                group.operator_profile == spec.spec.boot_profiles.at(0).profile_id,
+            "bsgs_group attrs were not read");
+
+    // The binary form carries every field, through both readers.
+    auto copy = plan;
+    std::stringstream stream;
+    binary_io::write_plan(stream, copy);
+    const auto bytes = stream.str();
+    std::istringstream input(bytes);
+    for (const auto &decoded : {binary_io::read_plan(input, bytes.size()),
+                                binary_io::read_plan_parallel(bytes, 3)}) {
+        for (std::size_t i = 0; i < plan.execution.size(); ++i) {
+            const auto *expected = std::get_if<ComputeOp>(&plan.execution[i].body);
+            if (!expected) continue;
+            const auto &actual = std::get<ComputeOp>(decoded.execution.at(i).body);
+            require(actual.kind == expected->kind && actual.inputs == expected->inputs, "binary BootStep differs");
+            const auto &want = std::get<BootStepAttrs>(expected->attrs);
+            const auto &got = std::get<BootStepAttrs>(actual.attrs);
+            require(got.operator_profile == want.operator_profile && got.step == want.step &&
+                        got.target_level == want.target_level && got.target_scale_log2 == want.target_scale_log2 &&
+                        got.steps == want.steps && got.key == want.key && got.multiplier == want.multiplier &&
+                        got.count == want.count && got.transform == want.transform &&
+                        got.layer == want.layer && got.group == want.group,
+                    "binary BootStep attrs differ at " + std::to_string(i));
+        }
+        PlanVerifier::verify(decoded, spec);
+    }
+
+    // The vector mock passes the Boot's input through, as it treats a whole Boot.
+    const std::vector<double> message{0.5, -1.25, 3.0, 0.125};
+    const auto result = run_mock_cluster(plan, spec, {{1, make_cipher(message, spec.spec.context_id,
+                                                                       spec.spec.poly_degree, 10, 40)}},
+                                         {}, {}, DiffMode::FinalOnly, true);
+    const auto output = result.artifacts[0].values.at(14).value.materialize();
+    require(std::equal(message.begin(), message.end(), output.slots.begin()) &&
+                output.metadata.level == 18 && output.metadata.scale_log2 == 40,
+            "the mock did not carry the Boot's input through its steps");
+    require(result.artifacts[0].timing.boot_step_calls == 11 && result.artifacts[0].timing.boot_calls == 0,
+            "Boot steps were not timed apart from Boots");
+
+    expect_throw([&] { RuntimePlanJsonReader::read_text(boot_step_plan_text(spec, 5)); },
+                 "BootStep requires format version 6");
+    using Json = json_utils::Json;
+    const auto rejected = [&](const std::function<void(Json &)> &edit, const std::string &needle) {
+        expect_throw([&] { PlanVerifier::verify(RuntimePlanJsonReader::read_text(boot_step_plan_text(spec, 6, edit)).plan, spec); },
+                     needle);
+    };
+    const auto refused = [&](const std::function<void(Json &)> &edit, const std::string &needle) {
+        expect_throw([&] { RuntimePlanJsonReader::read_text(boot_step_plan_text(spec, 6, edit)); }, needle);
+    };
+    // An S2C-first Boot passes below the OperatorSpec's range before its
+    // raise; a value only Boot steps read may lie there, no other value may.
+    const auto below = [](int input_level) {
+        return [input_level](Json &p) {
+            p["values"][0]["level"] = p["values"][1]["level"] = input_level;
+            p["execution"][1]["attrs"] = {{"step", "rescale"}, {"count", input_level - 5},
+                                          {"operator_profile", p["execution"][1]["attrs"]["operator_profile"]},
+                                          {"target_level", 5}, {"target_scale_log2", 45.5}};
+            for (int i : {2, 3, 4, 5}) p["values"][i]["level"] = 5;
+            for (int i : {2, 3, 4}) p["execution"][i]["attrs"]["target_level"] = 5;
+            p["execution"][5]["attrs"].erase("count");
+            p["execution"][5]["attrs"]["step"] = "raise";
+            p["execution"][5]["attrs"]["target_level"] = 29;
+            p["values"][6]["level"] = p["values"][7]["level"] = 29;
+            p["execution"][6]["attrs"]["target_level"] = 29;
+        };
+    };
+    auto narrow = spec;
+    narrow.spec.level_lower_bound = 8;
+    PlanVerifier::verify(RuntimePlanJsonReader::read_text(boot_step_plan_text(spec, 6, below(10))).plan, narrow);
+    expect_throw([&] { PlanVerifier::verify(RuntimePlanJsonReader::read_text(boot_step_plan_text(spec, 6, below(7))).plan,
+                                            narrow); }, "outside OperatorSpec range");
+    // Moved to another card and back between two steps, it is still the Boot's own.
+    PlanVerifier::verify(RuntimePlanJsonReader::read_text(boot_step_plan_text(spec, 6, [&](Json &p) {
+        below(10)(p);
+        const Json first{{"kind", "device"}, {"rank", 0}, {"index", 0}};
+        const Json second{{"kind", "device"}, {"rank", 0}, {"index", 1}};
+        p["target"]["device_counts"] = {2};
+        Json there = p["values"][4], back = p["values"][5];
+        there["id"] = "15"; there["place"] = second;
+        back["id"] = "16";
+        p["values"][5]["place"] = second;
+        p["values"].push_back(there);
+        p["values"].push_back(back);
+        p["execution"][4]["place"] = second;
+        p["execution"][4]["inputs"] = {"15"};
+        p["execution"][5]["inputs"] = {"16"};
+        const auto move = [](const char *id, const char *input, const char *output, const Json &from, const Json &to) {
+            return Json{{"ordinal", 0}, {"kind", "transfer"}, {"transfer_id", id}, {"hint", "point_to_point"},
+                        {"inputs", {input}}, {"outputs", {output}}, {"sources", {from}}, {"destinations", {to}},
+                        {"output_kinds", {"ciphertext"}}};
+        };
+        p["execution"].insert(p["execution"].begin() + 5, move("10", "6", "16", second, first));
+        p["execution"].insert(p["execution"].begin() + 4, move("9", "5", "15", first, second));
+        for (std::size_t i = 0; i < p["execution"].size(); ++i) p["execution"][i]["ordinal"] = i;
+    })).plan, narrow);
+    refused([](Json &p) { p["execution"][2]["attrs"]["key"] = "c2s/0/1"; }, "unknown field 'key'");
+    refused([](Json &p) { p["execution"][1]["attrs"]["step"] = "bootstrap"; }, "unknown boot step");
+    refused([](Json &p) { p["execution"][11]["attrs"].erase("target_scale_log2"); }, "target_scale_log2");
+    rejected([](Json &p) { p["values"][6]["level"] = 28; p["execution"][5]["attrs"]["target_level"] = 28; },
+             "must drop exactly count levels");
+    rejected([](Json &p) { p["values"][3]["level"] = 28; p["execution"][2]["attrs"]["target_level"] = 28; },
+             "must keep the level");
+    rejected([](Json &p) { p["execution"][11]["attrs"]["target_scale_log2"] = 41; }, "states a level or scale");
+    rejected([](Json &p) { p["values"][4]["scale_log2"] = 46; p["execution"][3]["attrs"]["target_scale_log2"] = 46; },
+             "one level and scale");
+    rejected([](Json &p) { p["execution"][4]["attrs"]["operator_profile"] = "missing"; },
+             "unknown operator profile");
+    rejected([](Json &p) { p["execution"][2]["attrs"]["steps"] = 0; }, "do not belong");
+    rejected([](Json &p) { p["execution"][3]["inputs"] = {"4"}; }, "wrong input count");
+}
+
 void copy_fixture(const std::filesystem::path &source, const std::filesystem::path &destination) {
     std::filesystem::create_directories(destination.parent_path());
     std::filesystem::copy_file(source, destination, std::filesystem::copy_options::overwrite_existing);
@@ -591,7 +780,21 @@ void test_packed_bundle() {
     auto index = PlaintextBundleLoader::open(temp, reference, {}, 16384, false);
     expect_throw([&] { index.read(contents[0]); }, "content SHA-256 mismatch");
     index = {};
+    // A required blob of a pack is checked once, when the bundle is opened.
+    for (std::uint64_t budget : {std::uint64_t(0), std::uint64_t(packed.size())})
+        expect_throw([&] { PlaintextBundleLoader::open(temp, reference, contents, 16384, false, {budget}); },
+                     "content SHA-256 mismatch");
     write_pack(packed);
+    {
+        auto verified = PlaintextBundleLoader::open(temp, reference, contents, 16384, false);
+        require(verified.verify_seconds() > 0, "pack open did not report its blob verification");
+        require(PlaintextBundleLoader::open(temp, reference, {}, 16384, false).verify_seconds() == 0,
+                "pack open hashed blobs nobody requires");
+        // Already checked: a later read takes the bytes as they are.
+        write_pack(corrupt);
+        require(verified.read(contents[0]) != expected[0], "a blob checked at open was hashed again on read");
+        write_pack(packed);
+    }
     // Exercise V3 online Encode through RuntimeResources, including two runs
     // with different load modes and accounting separate from decoded slots.
     auto plan = RuntimePlanJsonReader::read_file(testdata("valid", "v005_bundle_reuse.json").string()).plan;
@@ -711,6 +914,7 @@ int main() {
         run_test("strict JSON and OperatorSpec constraints", test_strict_json_and_operator_spec);
         run_test("strict SAX container parsing", test_strict_sax_containers);
         run_test("Dacapo OperatorSpec V2 profiles", test_dacapo_operator_spec_v2_profiles);
+        run_test("V6 BootStep reading, verification and binary round trip", test_boot_steps_v6);
         run_test("Boot input scale contract", test_boot_input_scale_contract);
         run_test("rank-local bundle loading", test_rank_local_bundle_loading);
         run_test("packed bundle offsets, residency and V3 execution", test_packed_bundle);
