@@ -41,6 +41,7 @@ std::string to_string(ComputeKind k) {
     case ComputeKind::Negate: return "Negate"; case ComputeKind::Rotate: return "Rotate";
     case ComputeKind::Rescale: return "Rescale"; case ComputeKind::ModSwitch: return "ModSwitch";
     case ComputeKind::Relinearize: return "Relinearize"; case ComputeKind::Boot: return "Boot";
+    case ComputeKind::ApiCall: return "ApiCall";
     }
     throw std::runtime_error("unknown compute kind");
 }
@@ -116,6 +117,8 @@ void RuntimePlan::print(std::ostream &out) const {
                 out << '%' << op->output << " = " << to_string(op->kind) << '(';
                 for (std::size_t i = 0; i < op->inputs.size(); ++i) { if (i) out << ','; out << '%' << op->inputs[i]; }
                 out << ") @ " << to_string(op->place);
+                if (const auto *attrs = std::get_if<ApiCallAttrs>(&op->attrs))
+                    out << " callee=" << attrs->callee << " call_id=" << attrs->call_id;
                 if (op->reuse_input) out << " reuse_input=" << *op->reuse_input;
                 out << '\n';
             } else if (std::holds_alternative<FenceOp>(inst.body)) {

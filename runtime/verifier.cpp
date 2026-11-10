@@ -86,11 +86,27 @@ InputKinds expected_inputs(ComputeKind kind) {
     case ComputeKind::Negate: case ComputeKind::Rotate: case ComputeKind::Rescale:
     case ComputeKind::ModSwitch: case ComputeKind::Relinearize: case ComputeKind::Boot:
         return {{V::Ciphertext, V::Ciphertext}, 1};
+    case ComputeKind::ApiCall:
+        fail("ApiCall does not use arithmetic input rules");
     }
     fail("unknown compute operation");
 }
 
 void verify_compute_metadata(const ComputeOp &op, const DescMap &descs) {
+    if (op.kind == ComputeKind::ApiCall) {
+        const auto &output = lookup(descs, op.output, "compute output");
+        if (output.kind != ValueKind::Ciphertext) fail("compute output must be ciphertext");
+        if (output.place != op.place) fail("compute output Place mismatch");
+        const auto *attrs = std::get_if<ApiCallAttrs>(&op.attrs);
+        if (!attrs || attrs->callee.empty()) fail("ApiCall requires a non-empty callee");
+        for (ValueId id : op.inputs) {
+            const auto &input = lookup(descs, id, "ApiCall input");
+            if (input.kind != ValueKind::Ciphertext) fail("ApiCall input must be ciphertext");
+            if (input.place != op.place) fail("implicit cross-Place ApiCall operand " + std::to_string(id));
+            if (input.context != output.context) fail("ApiCall changes context");
+        }
+        return;
+    }
     const auto types = expected_inputs(op.kind);
     if (op.inputs.size() != types.count) fail(to_string(op.kind) + " has wrong input count");
     std::array<const ValueDesc *, 2> inputs{};
@@ -112,6 +128,8 @@ void verify_compute_metadata(const ComputeOp &op, const DescMap &descs) {
 
     const bool no_attrs = std::holds_alternative<std::monostate>(op.attrs);
     switch (op.kind) {
+    case ComputeKind::ApiCall:
+        fail("ApiCall does not use arithmetic metadata rules");
     case ComputeKind::AddCC: case ComputeKind::SubCC:
         if (!no_attrs) fail(to_string(op.kind) + " does not accept attrs");
         if (!same_scale(inputs[0]->scale_log2, inputs[1]->scale_log2) || inputs[0]->components != inputs[1]->components ||
@@ -199,7 +217,7 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                                       const LoadedOperatorSpec &loaded_spec,
                                       bool skip_artifact_digest_checks) {
     const auto &spec = loaded_spec.spec;
-    if (plan.format_version != 1 && plan.format_version != 2 && plan.format_version != 3 && plan.format_version != 4 && plan.format_version != 5) fail("unsupported format version");
+    if (plan.format_version != 1 && plan.format_version != 2 && plan.format_version != 3 && plan.format_version != 4 && plan.format_version != 5 && plan.format_version != 7) fail("unsupported format version");
     if (plan.format_version == 3 && plan.target.world_size != 1)
         fail("RuntimePlan V3 supports one rank only");
     if (plan.waterline) {
@@ -352,6 +370,10 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                     for (double v : payload->values) if (!std::isfinite(v)) fail("non-finite PreparePlaintext payload");
                 } else has_bundle_encode = true;
             } else if (const auto *op = std::get_if<ComputeOp>(&instruction.body)) {
+                if (op->kind == ComputeKind::ApiCall) {
+                    if (plan.format_version < 7) fail("ApiCall requires format version 7");
+                    if (op->reuse_input) fail("ApiCall does not support reuse_input");
+                }
                 if (op->reuse_input && plan.format_version == 1)
                     fail("instruction #" + std::to_string(instruction.ordinal) + " reuse_input requires format version 2");
                 check_place(plan, op->place);
@@ -391,6 +413,8 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                 }
                 verify_compute_metadata(*op, descs);
                 output_state.flags |= Computed;
+                // Prepared backends own opaque calls, including bootstrap/key/workspace requirements.
+                if (op->kind == ComputeKind::ApiCall) continue;
                 const auto support = spec.operators.find(op->kind);
                 if (support == spec.operators.end() || !support->second.supported)
                     fail(to_string(op->kind) + " is unsupported by OperatorSpec");

@@ -64,6 +64,7 @@ ComputeKind read_compute_kind(const Json &value, const std::string &path) {
     if (kind == "mod_switch") return ComputeKind::ModSwitch;
     if (kind == "relinearize") return ComputeKind::Relinearize;
     if (kind == "boot") return ComputeKind::Boot;
+    if (kind == "ApiCall") return ComputeKind::ApiCall;
     fail(doc, path, "unknown compute operation '" + kind + "'");
 }
 
@@ -160,11 +161,16 @@ std::vector<ValueKind> read_value_kinds(const Json &value, const std::string &pa
 
 bool compute_requires_attrs(ComputeKind kind) {
     return kind == ComputeKind::Rotate || kind == ComputeKind::Rescale ||
-           kind == ComputeKind::ModSwitch || kind == ComputeKind::Boot;
+           kind == ComputeKind::ModSwitch || kind == ComputeKind::Boot ||
+           kind == ComputeKind::ApiCall;
 }
 
 ComputeAttrs read_compute_attrs(ComputeKind kind, const Json &value, const std::string &path) {
     switch (kind) {
+    case ComputeKind::ApiCall:
+        require_members(value, doc, path, {"callee", "call_id"});
+        return ApiCallAttrs{read_string(value.at("callee"), doc, path + ".callee"),
+                            read_id(value.at("call_id"), doc, path + ".call_id")};
     case ComputeKind::Rotate:
         require_members(value, doc, path, {"steps"});
         return RotateAttrs{read_int(value.at("steps"), doc, path + ".steps",
@@ -221,6 +227,8 @@ Instruction read_compute(const Json &value, const std::string &path, std::uint32
     if (value.contains("reuse_input") && version == 1)
         fail(doc, path + ".reuse_input", "reuse_input requires format version 2");
     const ComputeKind kind = read_compute_kind(value.at("op"), path + ".op");
+    if (kind == ComputeKind::ApiCall && version < 7)
+        fail(doc, path + ".op", "ApiCall requires format version 7");
     if (compute_requires_attrs(kind))
         require_members(value, doc, path, {"ordinal", "kind", "op", "place", "inputs", "output", "attrs"}, {"reuse_input"});
     else
@@ -288,7 +296,7 @@ void read_metadata(const Json &root, RuntimePlan &plan) {
                      "initialization", "execution", "finalization", "final_outputs"},
                     {"plaintext_bundle", "waterline"});
     plan.format_version = static_cast<std::uint32_t>(read_nonnegative_int(root.at("format_version"), doc, "$.format_version"));
-    if (plan.format_version != 1 && plan.format_version != 2 && plan.format_version != 3 && plan.format_version != 4 && plan.format_version != 5)
+    if (plan.format_version != 1 && plan.format_version != 2 && plan.format_version != 3 && plan.format_version != 4 && plan.format_version != 5 && plan.format_version != 7)
         fail(doc, "$.format_version", "unsupported format version");
     if (root.contains("waterline")) {
         if (plan.format_version < 4) fail(doc, "$.waterline", "waterline requires V4 or newer");
@@ -326,10 +334,10 @@ LoadedRuntimePlan read_stream(std::istream &input, const std::string &document, 
     if (stats) *stats = {};
     const auto start = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     RuntimePlan plan;
-    // The version may be the last root field. Parse records using V4's schema
+    // The version may be the last root field. Parse using the newest schema
     // and retain only the first use of each version-dependent feature.
     std::array<std::string, 3> v1_errors, v2_errors, v3_errors;
-    std::string v4_scale_error;
+    std::string v4_scale_error, api_call_version_error;
     StrictJsonSax sax(document,
         {"values", "external_inputs", "initialization", "execution", "finalization", "final_outputs"},
         [&](const std::string &field, std::size_t index, Json &&record) {
@@ -343,7 +351,10 @@ LoadedRuntimePlan read_stream(std::istream &input, const std::string &document, 
                     auto &ids = field == "external_inputs" ? plan.external_inputs : plan.final_outputs;
                     ids.push_back(read_id(record, doc, "$"));
                 } else {
-                    auto instruction = read_instruction(record, "$", 4);
+                    auto instruction = read_instruction(record, "$", 7);
+                    if (const auto *compute = std::get_if<ComputeOp>(&instruction.body);
+                        compute && compute->kind == ComputeKind::ApiCall && api_call_version_error.empty())
+                        api_call_version_error = item_path("$." + field, index) + ": ApiCall requires format version 7";
                     if (const auto *compute = std::get_if<ComputeOp>(&instruction.body);
                         compute && compute->kind == ComputeKind::Rescale &&
                         !record.at("attrs").at("target_scale_log2").is_number_integer() && v4_scale_error.empty())
@@ -387,6 +398,8 @@ LoadedRuntimePlan read_stream(std::istream &input, const std::string &document, 
             if (!error.empty()) fail(document, "$", error);
     if (plan.format_version < 5 && !v4_scale_error.empty())
         fail(document, "$", v4_scale_error);
+    if (plan.format_version < 7 && !api_call_version_error.empty())
+        fail(document, "$", api_call_version_error);
     auto digest = buffer.source_sha256();
     if (stats) stats->parse_build_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()
                                           - stats->read_seconds - stats->hash_seconds;

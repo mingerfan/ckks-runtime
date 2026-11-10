@@ -120,16 +120,23 @@ template <bool R> void instruction(Archive<R> &a, Instruction &i, std::uint32_t 
         if constexpr (R)
             i.body = ComputeOp{};
         auto &op = std::get<ComputeOp>(i.body);
-        a.enumeration(op.kind, 11);
+        a.enumeration(op.kind, 13);
+        if (static_cast<int>(op.kind) == 12)
+            throw std::runtime_error("reserved binary compute kind 12");
+        if (op.kind == ComputeKind::ApiCall && version < 7)
+            throw std::runtime_error("binary ApiCall requires plan V7");
         a.sequence(op.inputs, 8, [&](ValueId &id) { a.number(id); });
         a.number(op.output);
         place(a, op.place);
-        std::uint8_t attrs = static_cast<std::uint8_t>(op.attrs.index());
+        // Attribute wire tag 5 is reserved for the separate V6 BootStep protocol.
+        std::uint8_t attrs = std::holds_alternative<ApiCallAttrs>(op.attrs)
+                                 ? 6 : static_cast<std::uint8_t>(op.attrs.index());
         a.number(attrs);
         const std::uint8_t expected = op.kind == ComputeKind::Rotate      ? 1
                                       : op.kind == ComputeKind::Rescale   ? 2
                                       : op.kind == ComputeKind::ModSwitch ? 3
                                       : op.kind == ComputeKind::Boot      ? 4
+                                      : op.kind == ComputeKind::ApiCall   ? 6
                                                                           : 0;
         if (attrs != expected)
             throw std::runtime_error("binary compute attrs mismatch");
@@ -174,6 +181,15 @@ template <bool R> void instruction(Archive<R> &a, Instruction &i, std::uint32_t 
             a.enumeration(v.implementation, 1);
             if (v.target_level < 0 || v.target_scale_log2 < 0 || v.target_components < 1)
                 throw std::runtime_error("invalid binary boot attrs");
+            break;
+        }
+        case 6: {
+            if constexpr (R)
+                op.attrs = ApiCallAttrs{};
+            auto &v = std::get<ApiCallAttrs>(op.attrs);
+            a.string_ref(v.callee);
+            a.number(v.call_id);
+            if (v.callee.empty()) throw std::runtime_error("binary ApiCall callee must not be empty");
             break;
         }
         }
@@ -258,6 +274,8 @@ inline Strings collect_strings(const RuntimePlan &p) {
             } else if (const auto *op = std::get_if<ComputeOp>(&i.body)) {
                 if (const auto *attrs = std::get_if<BootAttrs>(&op->attrs))
                     strings.add(attrs->operator_profile);
+                else if (const auto *attrs = std::get_if<ApiCallAttrs>(&op->attrs))
+                    strings.add(attrs->callee);
             }
         }
     return strings;

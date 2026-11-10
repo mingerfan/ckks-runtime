@@ -29,7 +29,9 @@ std::string to_string(const Place &place);
 
 enum class ComputeKind {
     AddCC, AddCP, SubCC, SubCP, MulCC, MulCP,
-    Negate, Rotate, Rescale, ModSwitch, Relinearize, Boot
+    Negate, Rotate, Rescale, ModSwitch, Relinearize, Boot,
+    // Wire value 12 is reserved for the separate V6 BootStep protocol.
+    ApiCall = 13
 };
 enum class CommKind { Transfer, Replicate };
 enum class CommHint { Auto, PointToPoint, Broadcast, Tree, Ring, HostStaged };
@@ -51,8 +53,13 @@ struct BootAttrs {
     std::string operator_profile;
     BootImplementation implementation = BootImplementation::Native;
 };
+// Opaque prepared backend call; the backend owns its numerical transformations.
+struct ApiCallAttrs {
+    std::string callee;
+    std::uint64_t call_id = 0;
+};
 using ComputeAttrs = std::variant<std::monostate, RotateAttrs, RescaleAttrs,
-                                  ModSwitchAttrs, BootAttrs>;
+                                  ModSwitchAttrs, BootAttrs, ApiCallAttrs>;
 
 struct InlineEncodePayload { std::vector<double> values; };
 struct BundleEncodePayload { std::string content; };
