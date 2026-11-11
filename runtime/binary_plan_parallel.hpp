@@ -69,7 +69,7 @@ inline RuntimePlan read_plan_parallel(std::string_view bytes, unsigned threads,
     a.magic(magic);
     std::string root;
     a.text(root);
-    auto p = RuntimePlanJsonReader::read_text(root).plan;
+    auto p = RuntimePlanJsonReader::read_binary_metadata_text(root);
     Strings strings;
     a.sequence(strings.values, 4, [&](std::string &s) { a.text(s); });
     struct Job {
@@ -87,7 +87,7 @@ inline RuntimePlan read_plan_parallel(std::string_view bytes, unsigned threads,
         if (count > (8ULL << 30) / typed_size) throw std::runtime_error("invalid binary array length");
         return static_cast<std::size_t>(count);
     };
-    const std::size_t value_width = p.format_version >= 5 ? 39 : 35;
+    const std::size_t value_width = value_record_width(p.format_version);
     const auto values_count = count_array(value_width, sizeof(ValueDesc));
     p.values.resize(values_count);
     for (std::size_t begin = 0; begin < values_count; begin += block_records) {
@@ -162,6 +162,7 @@ inline RuntimePlan read_plan_parallel(std::string_view bytes, unsigned threads,
     worker();
     for (auto &thread : workers) thread.join();
     if (error) std::rethrow_exception(error);
+    check_v8_version(p);
     if (decode_seconds) *decode_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();
     return p;
 }

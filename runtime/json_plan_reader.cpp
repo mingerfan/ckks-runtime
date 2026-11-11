@@ -40,6 +40,7 @@ ValueKind read_value_kind(const Json &value, const std::string &path) {
     const std::string kind = read_string(value, doc, path);
     if (kind == "plaintext") return ValueKind::Plaintext;
     if (kind == "ciphertext") return ValueKind::Ciphertext;
+    if (kind == "buffer") return ValueKind::Buffer;
     fail(doc, path, "unknown value kind '" + kind + "'");
 }
 
@@ -120,16 +121,30 @@ TargetConfig read_target(const Json &value, const std::string &path) {
 }
 
 ValueDesc read_value_desc(const Json &value, const std::string &path) {
-    require_members(value, doc, path,
-                    {"id", "kind", "place", "context", "level", "scale_log2", "ntt", "components"});
-    return {read_id(value.at("id"), doc, path + ".id"),
-            read_value_kind(value.at("kind"), path + ".kind"),
-            read_place(value.at("place"), path + ".place"),
-            read_string(value.at("context"), doc, path + ".context"),
-            read_nonnegative_int(value.at("level"), doc, path + ".level"),
-            read_scale(value.at("scale_log2"), path + ".scale_log2"),
-            read_bool(value.at("ntt"), doc, path + ".ntt"),
-            read_positive_int(value.at("components"), doc, path + ".components")};
+    if (!value.is_object() || !value.contains("kind")) fail(doc, path, "missing required field 'kind'");
+    const auto kind = read_value_kind(value.at("kind"), path + ".kind");
+    if (kind == ValueKind::Buffer)
+        require_members(value, doc, path,
+                        {"id", "kind", "place", "context", "level", "scale_log2", "ntt", "components",
+                         "buffer_bytes", "buffer_layout"});
+    else
+        require_members(value, doc, path,
+                        {"id", "kind", "place", "context", "level", "scale_log2", "ntt", "components"});
+    ValueDesc result{read_id(value.at("id"), doc, path + ".id"), kind,
+                     read_place(value.at("place"), path + ".place"),
+                     read_string(value.at("context"), doc, path + ".context"),
+                     read_nonnegative_int(value.at("level"), doc, path + ".level"),
+                     read_scale(value.at("scale_log2"), path + ".scale_log2"),
+                     read_bool(value.at("ntt"), doc, path + ".ntt"),
+                     read_nonnegative_int(value.at("components"), doc, path + ".components"), 0, {}};
+    if (kind == ValueKind::Buffer) {
+        result.buffer_bytes = read_id(value.at("buffer_bytes"), doc, path + ".buffer_bytes");
+        result.buffer_layout = read_string(value.at("buffer_layout"), doc, path + ".buffer_layout");
+        if (result.level != 0 || result.scale_log2 != 0 || result.ntt || result.components != 0)
+            fail(doc, path, "Buffer requires zero crypto placeholders (level=0, scale_log2=0, ntt=false, components=0)");
+    } else if (result.components < 1)
+        fail(doc, path + ".components", "integer is outside the supported range");
+    return result;
 }
 
 std::vector<ValueId> read_ids(const Json &value, const std::string &path) {
@@ -154,8 +169,11 @@ std::vector<ValueKind> read_value_kinds(const Json &value, const std::string &pa
     if (!value.is_array()) fail(doc, path, "expected array");
     std::vector<ValueKind> result;
     result.reserve(value.size());
-    for (std::size_t i = 0; i < value.size(); ++i)
-        result.push_back(read_value_kind(value[i], item_path(path, i)));
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        const auto kind = read_value_kind(value[i], item_path(path, i));
+        if (kind == ValueKind::Buffer) fail(doc, item_path(path, i), "Buffer cannot be communicated");
+        result.push_back(kind);
+    }
     return result;
 }
 
@@ -296,7 +314,7 @@ void read_metadata(const Json &root, RuntimePlan &plan) {
                      "initialization", "execution", "finalization", "final_outputs"},
                     {"plaintext_bundle", "waterline"});
     plan.format_version = static_cast<std::uint32_t>(read_nonnegative_int(root.at("format_version"), doc, "$.format_version"));
-    if (plan.format_version != 1 && plan.format_version != 2 && plan.format_version != 3 && plan.format_version != 4 && plan.format_version != 5 && plan.format_version != 7)
+    if (plan.format_version != 1 && plan.format_version != 2 && plan.format_version != 3 && plan.format_version != 4 && plan.format_version != 5 && plan.format_version != 7 && plan.format_version != 8)
         fail(doc, "$.format_version", "unsupported format version");
     if (root.contains("waterline")) {
         if (plan.format_version < 4) fail(doc, "$.waterline", "waterline requires V4 or newer");
@@ -337,13 +355,15 @@ LoadedRuntimePlan read_stream(std::istream &input, const std::string &document, 
     // The version may be the last root field. Parse using the newest schema
     // and retain only the first use of each version-dependent feature.
     std::array<std::string, 3> v1_errors, v2_errors, v3_errors;
-    std::string v4_scale_error, api_call_version_error;
+    std::string v4_scale_error, api_call_version_error, buffer_version_error;
     StrictJsonSax sax(document,
         {"values", "external_inputs", "initialization", "execution", "finalization", "final_outputs"},
         [&](const std::string &field, std::size_t index, Json &&record) {
             try {
                 if (field == "values") {
                     plan.values.push_back(read_value_desc(record, "$"));
+                    if (plan.values.back().kind == ValueKind::Buffer && buffer_version_error.empty())
+                        buffer_version_error = item_path("$.values", index) + ": Buffer requires format version 8";
                     if (!record.at("scale_log2").is_number_integer() && v4_scale_error.empty())
                         v4_scale_error = item_path("$.values", index) + ".scale_log2: expected integer; floating scales require V5";
                 }
@@ -351,7 +371,7 @@ LoadedRuntimePlan read_stream(std::istream &input, const std::string &document, 
                     auto &ids = field == "external_inputs" ? plan.external_inputs : plan.final_outputs;
                     ids.push_back(read_id(record, doc, "$"));
                 } else {
-                    auto instruction = read_instruction(record, "$", 7);
+                    auto instruction = read_instruction(record, "$", 8);
                     if (const auto *compute = std::get_if<ComputeOp>(&instruction.body);
                         compute && compute->kind == ComputeKind::ApiCall && api_call_version_error.empty())
                         api_call_version_error = item_path("$." + field, index) + ": ApiCall requires format version 7";
@@ -400,6 +420,13 @@ LoadedRuntimePlan read_stream(std::istream &input, const std::string &document, 
         fail(document, "$", v4_scale_error);
     if (plan.format_version < 7 && !api_call_version_error.empty())
         fail(document, "$", api_call_version_error);
+    if (plan.format_version < 8 && !buffer_version_error.empty())
+        fail(document, "$", buffer_version_error);
+    const bool requires_v8 = plan_requires_v8(plan);
+    if (plan.format_version < 8 && requires_v8)
+        fail(document, "$", "Device ciphertext external inputs require format version 8");
+    if (plan.format_version == 8 && !requires_v8)
+        fail(document, "$", "format version 8 requires Buffer values or external Device ciphertext");
     auto digest = buffer.source_sha256();
     if (stats) stats->parse_build_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()
                                           - stats->read_seconds - stats->hash_seconds;
@@ -429,6 +456,16 @@ LoadedRuntimePlan RuntimePlanJsonReader::read_file(const std::string &path, Json
     std::ifstream input(path, std::ios::binary);
     if (!input) throw std::runtime_error("cannot open file: " + path);
     return read_stream(input, path, stats);
+}
+
+RuntimePlan RuntimePlanJsonReader::read_binary_metadata_text(std::string_view text) {
+    const auto root = json_utils::parse(text, "binary plan metadata");
+    RuntimePlan plan;
+    read_metadata(root, plan);
+    for (const char *field : {"values", "external_inputs", "initialization", "execution", "finalization", "final_outputs"})
+        if (!root.at(field).empty())
+            fail("binary plan metadata", std::string("$.") + field, "record array must be empty");
+    return plan;
 }
 
 } // namespace fhegpu

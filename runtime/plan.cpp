@@ -3,6 +3,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_set>
 
 namespace fhegpu {
 
@@ -31,7 +32,14 @@ std::string to_string(const Place &p) {
     return os.str();
 }
 
-std::string to_string(ValueKind k) { return k == ValueKind::Plaintext ? "Plaintext" : "Ciphertext"; }
+std::string to_string(ValueKind k) {
+    switch (k) {
+    case ValueKind::Plaintext: return "Plaintext";
+    case ValueKind::Ciphertext: return "Ciphertext";
+    case ValueKind::Buffer: return "Buffer";
+    }
+    throw std::runtime_error("unknown value kind");
+}
 
 std::string to_string(ComputeKind k) {
     switch (k) {
@@ -89,6 +97,15 @@ std::string to_string(KeyKind kind) {
     throw std::runtime_error("unknown key kind");
 }
 
+bool plan_requires_v8(const RuntimePlan &plan) {
+    const std::unordered_set<ValueId> external(plan.external_inputs.begin(), plan.external_inputs.end());
+    for (const auto &value : plan.values)
+        if (value.kind == ValueKind::Buffer ||
+            (value.kind == ValueKind::Ciphertext && value.place.kind == PlaceKind::Device && external.count(value.id)))
+            return true;
+    return false;
+}
+
 void RuntimePlan::print(std::ostream &out) const {
     out << "RuntimePlan(version=" << format_version << ", id=" << plan_id
         << ", target=" << target.target_id << ", capability=" << target.capability_version
@@ -100,7 +117,10 @@ void RuntimePlan::print(std::ostream &out) const {
         out << "  %" << v.id << " : " << to_string(v.kind) << " @ " << to_string(v.place)
             << " context=" << v.context << " level=" << v.level
             << " scale_log2=" << v.scale_log2 << " ntt=" << v.ntt
-            << " components=" << v.components << '\n';
+            << " components=" << v.components;
+        if (v.kind == ValueKind::Buffer)
+            out << " buffer_bytes=" << v.buffer_bytes << " buffer_layout=" << v.buffer_layout;
+        out << '\n';
     }
     const auto print_phase = [&](const char *name, const std::vector<Instruction> &list) {
         out << name << ":\n";

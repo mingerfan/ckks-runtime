@@ -11,6 +11,7 @@
 | 5 | V4 指令；ValueDesc 和 Rescale 的 scale_log2 可为实际浮点对数，支持原生逐 Q 除模 | 本文与[二进制格式](binary.md) |
 | 6 | 保留给独立的 BootStep 协议；当前 reader 拒绝 | — |
 | 7 | V5 加准备好的后端 API 调用 `ApiCall`，支持零输入与不透明的物理元信息变换 | [V7 规范](v7.md) |
+| 8 | V7 加 `Buffer` 和已驻留 Device 的外部密文；计划必须至少使用其中一项 | [V8 规范](v8.md) |
 
 计划语义版本与文件表示分开：二进制容器版本和 bundle 存储版本见[二进制格式](binary.md)与[明文数据包](plaintext-bundle.md)。编译器默认导出二进制；下面用 JSON 展示字段，二进制记录具有相同的计划语义。
 
@@ -20,10 +21,10 @@ RuntimePlan 是编译器交给 Runtime 的最终执行文件。它写清楚 SSA 
 
 - UTF-8，无 BOM；顶层必须是 object。
 - 未知字段、缺字段、同一 object 内的重复 key 都直接拒绝。
-- `plan_id`、ValueId、TransferId 和 V7 ApiCall 的 `call_id` 使用十进制字符串，必须匹配 `^(0|[1-9][0-9]*)$`，范围是 uint64。
-- level、rank、index、ordinal 等整数使用 JSON integer，受对应字段的 int32 范围约束。V1–V4 的 scale 必须取非负整数值；V5/V7 的 ValueDesc `scale_log2` 和 Rescale `target_scale_log2` 使用有限 float64，范围 `[0,1023]`。Boot profile 的固定输出 scale 仍为整数。
+- `plan_id`、ValueId、TransferId、V7/V8 ApiCall 的 `call_id` 和 V8 Buffer 的 `buffer_bytes` 使用十进制**字符串**，必须匹配 `^(0|[1-9][0-9]*)$`，范围是 uint64；`buffer_bytes:"0"` 合法。
+- level、rank、index、ordinal 等整数使用 JSON integer，受对应字段的 int32 范围约束。V1–V4 的 scale 必须取非负整数值；V5/V7/V8 的 ValueDesc `scale_log2` 和 Rescale `target_scale_log2` 使用有限 float64，范围 `[0,1023]`。Boot profile 的固定输出 scale 仍为整数。
 - inline Encode/Prepare 的 `payload.values` 与 V4 `waterline.device_fractions` 可以出现浮点数。载荷必须能转换成有限 float64；正零和负零在交给 Api 前都转成正零。fraction 必须严格介于 0 和 1。
-- 枚举使用规范列出的固定字符串；普通 op 为小写，V7 的 `op:"ApiCall"` 大小写固定。`callee` 是外部调用名，不是固定枚举。
+- 枚举使用规范列出的固定字符串；普通 op 为小写，V7/V8 的 `op:"ApiCall"` 大小写固定。`callee` 是外部调用名，不是固定枚举。
 
 ## 2. 顶层结构
 
@@ -97,13 +98,14 @@ ValueDesc：
 }
 ```
 
-- plaintext 的 `components` 必须为 1；ciphertext 至少为 2。
-- `context`、level 范围和 scale 的模数预算必须符合 OperatorSpec。
+- plaintext 的 `components` 必须为 1；ciphertext 至少为 2。两者的 JSON 结构不变，禁止出现 `buffer_bytes` 或 `buffer_layout`，即使值为零或空串也拒绝。
+- CT/PT 的 `context`、level 范围和 scale 的模数预算必须符合 OperatorSpec。
+- V8 新增 `ValueKind::Buffer`，JSON 为 `kind:"buffer"`。它必须带 `buffer_bytes`（规范 uint64 十进制字符串，允许零）和非空字符串 `buffer_layout`；`context` 必须是同一 OperatorSpec 中实际存在的 context，`level=0`、`scale_log2=0`、`ntt=false`、`components=0`。完整规则见 [V8](v8.md)。
 - `values` 必须恰好覆盖所有实际出现的 ValueId，未使用的描述也拒绝。
-- external input 必须在 Host，由调用方提供完整 CKKS 值。进入 Device 必须经过显式通信。
+- V1–V5/V7 的 external input 必须在 Host，进入 Device 必须经过显式通信。V8 还允许调用方直接提供已驻留指定 Device 的 ciphertext；rank、device、context 和完整 CKKS 描述必须匹配，Runtime 不补搬运或转换。plaintext 外部输入仍只能在 Host。Buffer 只能在计划内部由 ApiCall 产生和消费，不能列入 `external_inputs` 或 `final_outputs`。
 
-V5/V7 的 `scale_log2` 是实际 `log2(Δ)`，不是模数位宽近似的名义账本。
-`rescale_mode=native` 要求 V5 或 V7，以及 OperatorSpec 中的真实 `context.rns_moduli`：
+V5/V7/V8 的 CT/PT `scale_log2` 是实际 `log2(Δ)`，不是模数位宽近似的名义账本。
+`rescale_mode=native` 要求 V5、V7 或 V8，以及 OperatorSpec 中的真实 `context.rns_moduli`：
 删除 `qL` 后，`L'=L-1`、`scale_log2'=scale_log2-log2(qL)`。
 Verifier 独立校验实际模数和结果；Poseidon GPU 再校验该模数链与上下文完全一致。
 乘法的实际 scale 对数相加，ModSwitch/通信保持 scale，加法要求实际 scale 对齐。
@@ -145,7 +147,7 @@ inline 数组非空，长度不能超过 `poly_degree / 2`。bundle content 必�
 }
 ```
 
-普通算术 op：`add_cc`、`add_cp`、`sub_cc`、`sub_cp`、`mul_cc`、`mul_cp`、`negate`、`rotate`、`rescale`、`mod_switch`、`relinearize`、`boot`。V7 另支持 `ApiCall`，字段及后端约定见 [V7](v7.md)；它不使用下面的普通算术元信息规则。
+普通算术 op：`add_cc`、`add_cp`、`sub_cc`、`sub_cp`、`mul_cc`、`mul_cp`、`negate`、`rotate`、`rescale`、`mod_switch`、`relinearize`、`boot`。V7/V8 另支持 `ApiCall`，字段及后端约定见 [V7](v7.md) 和 [V8](v8.md)；它不使用下面的普通算术元信息规则。
 
 普通计算既可在 Host 也可在 Device，但输入、输出和指令 Place 必须完全相同，Api 也必须支持该位置。Runtime 不自动搬运。
 
@@ -164,7 +166,7 @@ inline 数组非空，长度不能超过 `poly_degree / 2`。bundle content 必�
 | relinearize | components 从 3 变 2，其余不变 |
 | boot | 输出 level、scale、components 等于 attrs，并匹配 OperatorSpec profile |
 
-所有普通算术计算都保持 context 和 NTT 状态。ApiCall 只要求输入输出同 context、同 Place，物理变换由专用 Api 实现。需要 attrs 的 op 缺 attrs，或不需要 attrs 的 op 出现 attrs，都拒绝。
+所有普通算术计算都保持 context 和 NTT 状态。ApiCall 只要求输入输出同 context、同 Place，物理变换由专用 Api 实现；V7 的输入输出只能是 CT，V8 可以是 CT 或 Buffer，不能是 PT，零输入仍合法。Encode/Prepare 不能生成 Buffer，普通算术和通信不能接收或生成 Buffer。需要 attrs 的 op 缺 attrs，或不需要 attrs 的 op 出现 attrs，都拒绝。
 
 | op | attrs 字段 |
 | --- | --- |
@@ -172,7 +174,7 @@ inline 数组非空，长度不能超过 `poly_degree / 2`。bundle content 必�
 | rescale | `target_level`、`target_scale_log2` |
 | mod_switch | `target_level` |
 | boot | `target_level`、`target_scale_log2`、`target_components`、`operator_profile`、`implementation` |
-| ApiCall（V7） | `callee`、`call_id`，详见 [V7](v7.md) |
+| ApiCall（V7/V8） | `callee`、`call_id`，详见 [V7](v7.md) 和 [V8](v8.md) |
 | 其他 | 不允许 attrs |
 
 Rotate 的 `steps` 先按 `poly_degree / 2` 个 slot 取模，负数转成等价正 step。规范化结果为 0 时拒绝。Runtime 用规范化 step 请求具体 Galois key，不接受只有“某种 Galois key”的模糊声明。
@@ -185,7 +187,7 @@ Boot 的 `implementation` 是 `native` 或 `decrypt_reencrypt`。后者只能在
 
 hint 合法值为 `auto`、`point_to_point`、`broadcast`、`tree`、`ring`、`host_staged`。hint 只是实现建议，不限制它与 Transfer/Replicate 的组合。Api 可以使用等价实现，但必须完成计划规定的逻辑通信。
 
-通信只改变 id 和 Place，不能改变 kind、context、level、scale、NTT 或 components。
+通信只改变 id 和 Place，不能改变 kind、context、level、scale、NTT 或 components。Transfer/Replicate 只支持 CT/PT，不支持 Buffer。
 
 ## 6. OperatorSpec 和启动要求
 
@@ -198,7 +200,7 @@ Runtime 必须检查：
 - 计划使用的普通算术算子受支持；Rescale 降幅不超过 `max_levels_per_op`。
 - 普通 Boot profile 唯一，输入范围、implementation 和输出元信息一致；ApiCall 不查算术支持条目或 Boot profile。
 
-Runtime 从普通指令推导能力：Encode、Transfer、Replicate、Host compute、native Boot、decrypt/re-encrypt Boot；并推导 relin key、带 step 的 Galois key和 secret key。Api preflight 必须明确确认这些资源可用。ApiCall 所需的外部 registry、原生 Boot、密钥和工作区不由通用层推导，由实现该调用的专用 Api 在启动时检查，见 [V7](v7.md)。
+Runtime 从普通指令推导能力：Encode、Transfer、Replicate、Host compute、native Boot、decrypt/re-encrypt Boot；并推导 relin key、带 step 的 Galois key和 secret key。Api preflight 必须明确确认这些资源可用。ApiCall 所需的外部 registry、原生 Boot、密钥、工作区及 Buffer 布局能力不由通用层推导，由实现该调用的专用 Api 在启动时检查，见 [V7](v7.md) 和 [V8](v8.md)。完整原生 Boot 仍是不透明的 ApiCall，不展开成 BootStep，也不改用解密再加密。
 
 ## 7. bundle 的分 rank 装载
 
@@ -219,9 +221,9 @@ V1/V2 在启动时装载本 rank 实际执行的 bundle Encode 载荷；V3/V4 �
 
 `skip_artifact_digest_checks=true` 只跳过三类比较：rank 间计划原始字节摘要、OperatorSpec 原始字节摘要、manifest 原始字节摘要。它不跳过结构、id/version、SSA、元信息、能力、密钥、载荷长度或 Api 值校验，也不关闭 JSON manifest 路径的 blob content 校验。二进制路径的摘要行为见上文。所有 rank 的开关必须一致，每个 rank 都要打印明确警告。
 
-Api 的 `validate_value` 必须检查 kind、context、poly degree、level、scale、NTT 和 components。任何一项不符都立即终止。
+Api 的 `validate_value` 对 CT/PT 必须检查 kind、context、poly degree、level、scale、NTT 和 components；对 Buffer 必须检查实际对象与描述的 kind、Place/context、字节数和布局相符。后端还须明确支持该布局和调用能力，任何不符都立即报错。通用 Runtime 仍保存 `Api::Value` 并调用现有 `compute`/`validate_value` 接口；后端可在自己的 Value variant 中加入 Buffer，不需要执行器专用 Buffer API。
 
-## 9. Release（V2–V5、V7）
+## 9. Release（V2–V5、V7/V8）
 
 ```json
 {"ordinal": 3, "kind": "release", "value": "7"}
@@ -244,8 +246,9 @@ API 成功接手计算或传输后，Runtime 清掉本次调用的临时输入�
 保留值表项。未提交的其他线程仍能取到数据，已提交的异步工作由 API 保留。
 已释放且不再使用的通信输出晚到时直接丢弃，不重新放入值表。
 Release 会调用非阻塞的 `collect_completed()`；整次运行收尾仍调用 `drain()`。
+Buffer 使用相同的 SSA 和 Release 生命周期：共享的 hoist Buffer 可以供两个后续 ApiCall 使用，在最后一次使用后 Release，不需要专用释放指令，见 [V8 示例](v8.md)。
 
-## 10. reuse_input（V2–V5、V7 的普通算术 op）
+## 10. reuse_input（V2–V5、V7/V8 的普通算术 op）
 
 ```json
 {
@@ -314,7 +317,11 @@ RuntimeTiming 记录 Encode/read 次数、字节与时间、raw 读取上界，�
 
 ## 12. 版本与兼容
 
-`RuntimePlanReader::read_file` 按 `.json` 或 `.bin` 显式选择文件表示，随后按 `format_version` 检查 V1–V5 或 V7；保留的 V6 仍拒绝。未知扩展名、版本、字段、算子和不匹配的能力直接报错；不会在解析失败后改用其他表示。V1 不能含 Release/reuse，V1/V2 不能含 Fence 或 execution Encode，V1–V3 不能含 Prepare，V1–V5 不能含 ApiCall。旧计划继续按原版本读取，不自动改成 V7。旧静态分批编译选项已删除，普通 Encode/Transfer 和显式 Fence 继续由统一执行器支持。
+`RuntimePlanReader::read_file` 按 `.json` 或 `.bin` 显式选择文件表示，随后按 `format_version` 检查 V1–V5、V7 或 V8；保留的 V6 仍拒绝。未知扩展名、版本、字段、算子和不匹配的能力直接报错；不会在解析失败后改用其他表示。V1 不能含 Release/reuse，V1/V2 不能含 Fence 或 execution Encode，V1–V3 不能含 Prepare，V1–V5 不能含 ApiCall，V1–V5、V7 不能含 Buffer。
+
+完整 JSON/二进制计划当且仅当至少含一个 Buffer，或 `external_inputs` 引用了 Device ciphertext 时使用 V8；两项都没有的 V8 计划直接拒绝，低于 V8 的计划不能使用这两项。没有 Buffer、外部输入也全在 Host 时沿用原有版本选择规则；只有内部 Device 值不会触发 V8。二进制 metadata 的空数组骨架单独解析，不是完整计划；版本条件针对装配后的完整计划检查。
+
+旧计划继续按原版本读取，不自动改成 V8。旧静态分批编译选项已删除，普通 Encode/Transfer 和显式 Fence 继续由统一执行器支持。
 
 计划语义版本、二进制容器版本、bundle 存储版本、target/capability 与 OperatorSpec id/version 是不同的兼容轴。文档与当前代码一起演进；修改执行语义或文件布局时明确更新相关版本、Schema、reader、导出器和样例，不通过删除规范文字掩盖兼容性变化。
 

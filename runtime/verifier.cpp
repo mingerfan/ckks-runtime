@@ -95,13 +95,15 @@ InputKinds expected_inputs(ComputeKind kind) {
 void verify_compute_metadata(const ComputeOp &op, const DescMap &descs) {
     if (op.kind == ComputeKind::ApiCall) {
         const auto &output = lookup(descs, op.output, "compute output");
-        if (output.kind != ValueKind::Ciphertext) fail("compute output must be ciphertext");
+        if (output.kind != ValueKind::Ciphertext && output.kind != ValueKind::Buffer)
+            fail("compute output must be ciphertext or Buffer for ApiCall");
         if (output.place != op.place) fail("compute output Place mismatch");
         const auto *attrs = std::get_if<ApiCallAttrs>(&op.attrs);
         if (!attrs || attrs->callee.empty()) fail("ApiCall requires a non-empty callee");
         for (ValueId id : op.inputs) {
             const auto &input = lookup(descs, id, "ApiCall input");
-            if (input.kind != ValueKind::Ciphertext) fail("ApiCall input must be ciphertext");
+            if (input.kind != ValueKind::Ciphertext && input.kind != ValueKind::Buffer)
+                fail("ApiCall input must be ciphertext or Buffer");
             if (input.place != op.place) fail("implicit cross-Place ApiCall operand " + std::to_string(id));
             if (input.context != output.context) fail("ApiCall changes context");
         }
@@ -217,7 +219,7 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                                       const LoadedOperatorSpec &loaded_spec,
                                       bool skip_artifact_digest_checks) {
     const auto &spec = loaded_spec.spec;
-    if (plan.format_version != 1 && plan.format_version != 2 && plan.format_version != 3 && plan.format_version != 4 && plan.format_version != 5 && plan.format_version != 7) fail("unsupported format version");
+    if (plan.format_version != 1 && plan.format_version != 2 && plan.format_version != 3 && plan.format_version != 4 && plan.format_version != 5 && plan.format_version != 7 && plan.format_version != 8) fail("unsupported format version");
     if (plan.format_version == 3 && plan.target.world_size != 1)
         fail("RuntimePlan V3 supports one rank only");
     if (plan.waterline) {
@@ -257,6 +259,14 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
     for (const auto &value : plan.values) {
         check_place(plan, value.place);
         if (value.context != spec.context_id) fail("value context does not match OperatorSpec");
+        if (value.kind == ValueKind::Buffer) {
+            if (plan.format_version < 8) fail("Buffer requires format version 8");
+            if (value.level != 0 || value.scale_log2 != 0 || value.ntt || value.components != 0 || value.buffer_layout.empty())
+                fail("Buffer requires zero crypto placeholders and non-empty buffer_layout");
+            continue;
+        }
+        if (value.kind != ValueKind::Plaintext && value.kind != ValueKind::Ciphertext) fail("unknown Value kind");
+        if (value.buffer_bytes != 0 || !value.buffer_layout.empty()) fail("non-Buffer value has buffer metadata");
         if (value.level < spec.level_lower_bound || value.level > spec.level_upper_bound)
             fail("value level is outside OperatorSpec range");
         if (!std::isfinite(value.scale_log2) || value.scale_log2 < 0 ||
@@ -269,6 +279,9 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
         if (value.kind == ValueKind::Ciphertext && value.components < 2)
             fail("ciphertext components must be at least two");
     }
+
+    if (plan.format_version == 8 && !plan_requires_v8(plan))
+        fail("format version 8 requires Buffer values or external Device ciphertext");
 
     enum Flag : unsigned char { Defined = 1, Mentioned = 2, Computed = 4, Returned = 8,
                                Released = 16, Overwritten = 32, Final = 64 };
@@ -283,7 +296,10 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
         const auto &value = lookup(descs, id, "external input");
         auto &s = state(id, "external input");
         mention(s);
-        if (value.place.kind != PlaceKind::Host) fail("external input must be placed on Host (IO-2)");
+        if (value.kind == ValueKind::Buffer) fail("Buffer cannot be an external input; it must be produced by ApiCall");
+        if (value.place.kind != PlaceKind::Host &&
+            !(plan.format_version == 8 && value.kind == ValueKind::Ciphertext && value.place.kind == PlaceKind::Device))
+            fail("external input must be placed on Host (IO-2); only V8 ciphertext may be supplied on Device");
         if (s.flags & Defined) fail("duplicate external input " + std::to_string(id));
         s.flags |= Defined;
     }
@@ -473,6 +489,7 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                 mention(state(action->inputs[0], "communication source"));
                 check_available(action->inputs[0], instruction);
                 const auto &source = lookup(descs, action->inputs[0], "communication source");
+                if (source.kind == ValueKind::Buffer) fail("Buffer cannot be communicated; use ApiCall");
                 check_place(plan, action->sources[0]);
                 if (source.place != action->sources[0]) fail("communication source Place mismatch");
                 const std::size_t count = action->outputs.size();
@@ -486,6 +503,8 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
                     if (action->destinations[i] == source.place) fail("communication destination equals source Place");
                     if (count > 1 && !destinations.insert(action->destinations[i]).second) fail("duplicate communication destination");
                     const auto &output = lookup(descs, action->outputs[i], "communication output");
+                    if (output.kind == ValueKind::Buffer || action->output_types[i] == ValueKind::Buffer)
+                        fail("Buffer cannot be communicated; use ApiCall");
                     auto &s = state(output.id, "communication output");
                     mention(s);
                     if (output.place != action->destinations[i]) fail("communication output/destination mapping mismatch");
@@ -521,7 +540,8 @@ PlanRequirements PlanVerifier::verify(const RuntimePlan &plan,
         fail("plaintext_bundle must be present exactly when bundle Encode is used");
     if (plan.final_outputs.empty()) fail("final_outputs must not be empty");
     for (ValueId id : plan.final_outputs) {
-        lookup(descs, id, "final output");
+        if (lookup(descs, id, "final output").kind == ValueKind::Buffer)
+            fail("Buffer cannot be a final output; it must be consumed by ApiCall");
         auto &s = state(id, "final output");
         mention(s);
         if (!(s.flags & Defined)) fail("final output is undefined");

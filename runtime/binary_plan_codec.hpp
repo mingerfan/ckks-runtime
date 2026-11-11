@@ -4,6 +4,9 @@
 
 namespace fhegpu::binary_io {
 inline Json metadata(const RuntimePlan &p) {
+    if (p.format_version != 1 && p.format_version != 2 && p.format_version != 3 &&
+        p.format_version != 4 && p.format_version != 5 && p.format_version != 7 && p.format_version != 8)
+        throw std::runtime_error("unsupported plan format version");
     Json result{{"format_version", p.format_version},
                 {"plan_id", std::to_string(p.plan_id)},
                 {"target",
@@ -239,21 +242,39 @@ template <bool R> void instruction(Archive<R> &a, Instruction &i, std::uint32_t 
     }
 }
 
+inline std::size_t value_record_width(std::uint32_t version) {
+    return version >= 8 ? 51 : version >= 5 ? 39 : 35;
+}
+
 template <bool R> void value_record(Archive<R> &a, ValueDesc &v, std::uint32_t version) {
-        a.number(v.id);
-        a.enumeration(v.kind, 1);
-        place(a, v.place);
-        a.string_ref(v.context);
-        a.number(v.level);
-        scale_record(a, v.scale_log2, version);
-        a.boolean(v.ntt);
-        a.number(v.components);
+    if constexpr (!R)
+        if (v.kind == ValueKind::Buffer && version < 8)
+            throw std::runtime_error("binary Buffer requires plan V8");
+    a.number(v.id);
+    a.enumeration(v.kind, version >= 8 ? 2 : 1);
+    place(a, v.place);
+    a.string_ref(v.context);
+    a.number(v.level);
+    scale_record(a, v.scale_log2, version);
+    a.boolean(v.ntt);
+    a.number(v.components);
+    if (version >= 8) {
+        a.number(v.buffer_bytes);
+        a.string_ref(v.buffer_layout);
+    }
+    if (v.kind == ValueKind::Buffer) {
+        if (v.level != 0 || v.scale_log2 != 0 || v.ntt || v.components != 0 || v.buffer_layout.empty())
+            throw std::runtime_error("invalid binary Buffer metadata: expected zero crypto placeholders and non-empty buffer_layout");
+    } else {
         if (v.level < 0 || v.scale_log2 < 0 || v.components < 1)
             throw std::runtime_error("invalid binary value metadata");
+        if (v.buffer_bytes != 0 || !v.buffer_layout.empty())
+            throw std::runtime_error("non-Buffer value has buffer metadata");
+    }
 }
 
 template <bool R> void plan_records(Archive<R> &a, RuntimePlan &p) {
-    a.sequence(p.values, p.format_version >= 5 ? 39 : 35, [&](ValueDesc &v) { value_record(a, v, p.format_version); });
+    a.sequence(p.values, value_record_width(p.format_version), [&](ValueDesc &v) { value_record(a, v, p.format_version); });
     a.sequence(p.external_inputs, 8, [&](ValueId &v) { a.number(v); });
     for (auto *phase : {&p.initialization, &p.execution, &p.finalization})
         a.sequence(*phase, 9, [&](Instruction &i) { instruction(a, i, p.format_version); });
@@ -262,8 +283,10 @@ template <bool R> void plan_records(Archive<R> &a, RuntimePlan &p) {
 
 inline Strings collect_strings(const RuntimePlan &p) {
     Strings strings;
-    for (const auto &v : p.values)
+    for (const auto &v : p.values) {
         strings.add(v.context);
+        if (p.format_version >= 8) strings.add(v.buffer_layout);
+    }
     for (const auto *phase : {&p.initialization, &p.execution, &p.finalization})
         for (const auto &i : *phase) {
             if (const auto *op = std::get_if<EncodeOp>(&i.body)) {
@@ -281,7 +304,19 @@ inline Strings collect_strings(const RuntimePlan &p) {
     return strings;
 }
 
+inline void check_v8_version(const RuntimePlan &p) {
+    const bool requires_v8 = plan_requires_v8(p);
+    if (requires_v8 && p.format_version != 8) {
+        if (std::any_of(p.values.begin(), p.values.end(), [](const ValueDesc &v) { return v.kind == ValueKind::Buffer; }))
+            throw std::runtime_error("binary Buffer requires plan V8");
+        throw std::runtime_error("Device ciphertext external inputs require plan V8");
+    }
+    if (!requires_v8 && p.format_version == 8)
+        throw std::runtime_error("format version 8 requires Buffer values or external Device ciphertext");
+}
+
 inline void write_plan(std::ostream &out, RuntimePlan &p, const char *magic = "CKKSPL01") {
+    check_v8_version(p);
     Archive<false> a(out);
     a.magic(magic);
     auto root = metadata(p).dump();
@@ -297,10 +332,11 @@ inline RuntimePlan read_plan(std::istream &in, std::uint64_t size, const char *m
     a.magic(magic);
     std::string root;
     a.text(root);
-    auto p = RuntimePlanJsonReader::read_text(root).plan;
+    auto p = RuntimePlanJsonReader::read_binary_metadata_text(root);
     a.sequence(a.strings.values, 4, [&](std::string &s) { a.text(s); });
     plan_records(a, p);
     a.finish();
+    check_v8_version(p);
     return p;
 }
 

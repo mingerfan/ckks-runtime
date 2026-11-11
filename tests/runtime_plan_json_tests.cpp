@@ -254,6 +254,7 @@ void test_invalid_samples() {
         {"i001_unknown_format_version.json", "unsupported format version"},
         {"i002_float_scale_log2.json", "expected integer"},
         {"i008_unknown_field.json", "unknown field 'comment'"},
+        {"i010_device_external_input.json", "Device ciphertext external inputs require format version 8"},
     };
     for (const auto &item : reader_cases)
         expect_throw([&] { RuntimePlanJsonReader::read_file(testdata("invalid", item.first).string()); }, item.second);
@@ -265,7 +266,6 @@ void test_invalid_samples() {
         {"i006_boot_target_desc_mismatch.json", "Boot metadata rule"},
         {"i007_use_before_define.json", "use-before-definition"},
         {"i009_place_mismatch.json", "cross-Place"},
-        {"i010_device_external_input.json", "external input must be placed on Host"},
         {"i011_operator_spec_digest_mismatch.json", "source SHA-256 mismatch"},
         {"i013_encode_outside_initialization.json", "only allowed in initialization"},
         {"i014_rotate_normalizes_to_zero.json", "becomes zero"},

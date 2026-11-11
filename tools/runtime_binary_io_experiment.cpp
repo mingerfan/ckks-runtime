@@ -43,15 +43,21 @@ static Json projection(const RuntimePlan &p) {
                                    "negate", "rotate", "rescale", "mod_switch", "relinearize", "boot"};
     const char *hint_names[] = {"auto", "point_to_point", "broadcast", "tree", "ring", "host_staged"};
     Json root = expio::metadata(p);
-    for (const auto &v : p.values)
+    for (const auto &v : p.values) {
         root["values"].push_back({{"id", std::to_string(v.id)},
-                                  {"kind", v.kind == ValueKind::Plaintext ? "plaintext" : "ciphertext"},
+                                  {"kind", v.kind == ValueKind::Plaintext ? "plaintext" :
+                                           v.kind == ValueKind::Buffer ? "buffer" : "ciphertext"},
                                   {"place", place_json(v.place)},
                                   {"context", v.context},
                                   {"level", v.level},
                                   {"scale_log2", v.scale_log2},
                                   {"ntt", v.ntt},
                                   {"components", v.components}});
+        if (v.kind == ValueKind::Buffer) {
+            root["values"].back()["buffer_bytes"] = std::to_string(v.buffer_bytes);
+            root["values"].back()["buffer_layout"] = v.buffer_layout;
+        }
+    }
     root["external_inputs"] = ids_json(p.external_inputs);
     root["final_outputs"] = ids_json(p.final_outputs);
     const char *names[] = {"initialization", "execution", "finalization"};
@@ -68,7 +74,8 @@ static Json projection(const RuntimePlan &p) {
                     r["payload"] = {{"kind", "bundle"}, {"content", std::get<BundleEncodePayload>(v->payload).content}};
             } else if (const auto *v = std::get_if<ComputeOp>(&i.body)) {
                 r.update({{"kind", "compute"},
-                          {"op", compute_names[static_cast<std::size_t>(v->kind)]},
+                          {"op", v->kind == ComputeKind::ApiCall ? "ApiCall" :
+                                 compute_names[static_cast<std::size_t>(v->kind)]},
                           {"inputs", ids_json(v->inputs)},
                           {"output", std::to_string(v->output)},
                           {"place", place_json(v->place)}});
@@ -86,6 +93,8 @@ static Json projection(const RuntimePlan &p) {
                                   {"target_components", a->target_components},
                                   {"operator_profile", a->operator_profile},
                                   {"implementation", to_string(a->implementation)}};
+                if (const auto *a = std::get_if<ApiCallAttrs>(&v->attrs))
+                    r["attrs"] = {{"callee", a->callee}, {"call_id", std::to_string(a->call_id)}};
             } else if (const auto *v = std::get_if<CommAction>(&i.body)) {
                 Json sources = Json::array(), destinations = Json::array(), types = Json::array();
                 for (const auto &p : v->sources)
@@ -129,6 +138,10 @@ static bool attrs_equal(const ComputeAttrs &a, const ComputeAttrs &b) {
         return std::tie(x.target_level, x.target_scale_log2, x.target_components, x.operator_profile, x.implementation) ==
                std::tie(y.target_level, y.target_scale_log2, y.target_components, y.operator_profile, y.implementation);
     }
+    case 5: {
+        const auto &x = std::get<ApiCallAttrs>(a), &y = std::get<ApiCallAttrs>(b);
+        return std::tie(x.callee, x.call_id) == std::tie(y.callee, y.call_id);
+    }
     default: throw std::runtime_error("unknown comparison attrs");
     }
 }
@@ -168,8 +181,8 @@ static void compare_plans(const RuntimePlan &a, const RuntimePlan &b) {
         throw std::runtime_error("roundtrip metadata/inputs/outputs/value count mismatch");
     for (std::size_t i = 0; i < a.values.size(); ++i) {
         const auto &x = a.values[i], &y = b.values[i];
-        if (std::tie(x.id, x.kind, x.place, x.context, x.level, x.scale_log2, x.ntt, x.components) !=
-            std::tie(y.id, y.kind, y.place, y.context, y.level, y.scale_log2, y.ntt, y.components))
+        if (std::tie(x.id, x.kind, x.place, x.context, x.level, x.scale_log2, x.ntt, x.components, x.buffer_bytes, x.buffer_layout) !=
+            std::tie(y.id, y.kind, y.place, y.context, y.level, y.scale_log2, y.ntt, y.components, y.buffer_bytes, y.buffer_layout))
             throw std::runtime_error("roundtrip value mismatch at " + std::to_string(i));
     }
     const std::vector<Instruction> *left[] = {&a.initialization, &a.execution, &a.finalization};
@@ -312,7 +325,7 @@ static void self_test(const std::filesystem::path &source, const std::filesystem
         std::uint64_t count = 0;
         cursor.number(count);
         const auto value_offset = static_cast<std::size_t>(cursor.cursor() - bytes.data());
-        cursor.skip(count * 35);
+        cursor.skip(count * binary_io::value_record_width(loaded.plan.format_version));
         expio::skip_sequence(cursor, 8);
         cursor.number(count);
         if (!count) cursor.number(count); // empty initialization -> execution

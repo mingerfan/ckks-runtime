@@ -38,6 +38,13 @@ namespace fhegpu {
 namespace detail {
 
 template <class Api, class = void>
+struct HasPlanValidation : std::false_type {};
+
+template <class Api>
+struct HasPlanValidation<Api, std::void_t<decltype(std::declval<Api &>().validate_plan(
+    std::declval<const RuntimePlan &>()))>> : std::true_type {};
+
+template <class Api, class = void>
 struct HasPostedOutputs : std::false_type {};
 
 template <class Api>
@@ -192,6 +199,7 @@ public:
             }
             const PlanRequirements requirements = PlanVerifier::verify(
                 *plan_, resources.operator_spec, resources.skip_artifact_digest_checks);
+            if constexpr(detail::HasPlanValidation<Api>::value) api_.validate_plan(*plan_);
             PlanVerifier::verify_runtime_target(*plan_, rank_, world_size_, local_devices_);
             if (plan_->waterline && device_execution_mode_ != DeviceExecutionMode::PerDeviceWorkers)
                 throw std::runtime_error("Waterline uses the per-device executor; select PerDeviceWorkers");

@@ -2,7 +2,7 @@
 
 这是面向多设备 CKKS 推理的执行器。编译器确定计算位置和数据搬运，Runtime 验证并执行计划，具体计算与通信由 Api 提供。
 
-当前支持 RuntimePlan V1/V2/V3/V4、inline/bundle Encode、Host/Device compute、Transfer/Replicate、Release、受支持算子的原位执行、显式 Fence 与按需明文装载。[V4 Waterline](docs/runtime-plan/v4.md) 使用 Device Prepare 和完整消费者组准入；CPU/GPU 完整 Encode 与简单 Auto 选择复用同一设备工作线程执行器，不插自动批末 Fence。计划读取入口支持二进制和 JSON；Dacapo 默认导出二进制计划和 pack bundle。Vec/Mock/MPI 提供参考后端，真实 CPU/GPU 后端在 Poseidon 中实现。
+当前支持 RuntimePlan V1–V5、V7 和 V8（V6 保留并拒绝）、inline/bundle Encode、Host/Device compute、Transfer/Replicate、Release、受支持算子的原位执行、显式 Fence 与按需明文装载。V7 提供不透明 ApiCall；V8 提供带字节大小的独立 Buffer 值及已驻留 Device 的外部密文。[V4 Waterline](docs/runtime-plan/v4.md) 使用 Device Prepare 和完整消费者组准入；CPU/GPU 完整 Encode 与简单 Auto 选择复用同一设备工作线程执行器，不插自动批末 Fence。计划读取入口支持二进制和 JSON；Dacapo 默认导出二进制计划和 pack bundle。Vec/Mock/MPI 提供参考后端，真实 CPU/GPU 后端在 Poseidon 中实现。
 
 `SequentialRuntime` 的默认模式仍为 `Sequential`。选择 `PerDeviceWorkers` 且 `local_devices=0` 时，设备 worker 数量保持为零，额外的 Host 队列由一个计算 worker 执行；`device_worker_count` 应保留为零。纯 CPU 的 initialization、execution、finalization 都复用该执行器，不要求 Waterline。各队列严格按计划顺序执行，输入未发布时等待队首任务，CPU Api 同步返回即完成。
 

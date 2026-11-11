@@ -13,7 +13,7 @@ namespace fhegpu {
 using ValueId = std::uint64_t;
 using TransferId = std::uint64_t;
 
-enum class ValueKind { Plaintext, Ciphertext };
+enum class ValueKind { Plaintext = 0, Ciphertext = 1, Buffer = 2 };
 enum class PlaceKind { Host, Device };
 
 struct Place {
@@ -131,6 +131,9 @@ struct ValueDesc {
     double scale_log2 = 0;
     bool ntt = true;
     int components = 2;
+    // Buffer uses zero crypto placeholders and an explicit backend storage layout.
+    std::uint64_t buffer_bytes = 0;
+    std::string buffer_layout{};
 };
 
 struct OperatorSpecRef {
@@ -184,6 +187,9 @@ struct RuntimePlan {
 
     void print(std::ostream &out) const;
 };
+
+// V8 is selected by Buffer values or Device-resident external ciphertexts.
+bool plan_requires_v8(const RuntimePlan &plan);
 
 struct LoadedRuntimePlan {
     RuntimePlan plan;
